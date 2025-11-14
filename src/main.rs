@@ -11,7 +11,7 @@ use midnight_circuits::{
     hash::poseidon::{PoseidonChip, PoseidonState, constants::PoseidonField},
     instructions::{
         ArithInstructions, AssertionInstructions, AssignmentInstructions, ControlFlowInstructions,
-        ConversionInstructions, PublicInputInstructions, hash::HashCPU,
+        ConversionInstructions, DecompositionInstructions, PublicInputInstructions, hash::HashCPU,
     },
     testing_utils::plonk_api::filecoin_srs,
     types::{AssignedBit, AssignedNative, AssignedNativePoint, Instantiable},
@@ -234,10 +234,10 @@ impl Relation for Spend2Output2 {
         let (pk_sx, pk_sy) = (pk_fields[0].clone(), pk_fields[1].clone());
 
         // Assign each UTXO's fields exactly once
-        let old1_asg = assign_utxo(std_lib, layouter, &old1_val, AMOUNT_BITS)?;
-        let old2_asg = assign_utxo(std_lib, layouter, &old2_val, AMOUNT_BITS)?;
-        let new1_asg = assign_utxo(std_lib, layouter, &new1_val, AMOUNT_BITS)?;
-        let new2_asg = assign_utxo(std_lib, layouter, &new2_val, AMOUNT_BITS)?;
+        let old1_asg = assign_utxo(std_lib, layouter, &old1_val)?;
+        let old2_asg = assign_utxo(std_lib, layouter, &old2_val)?;
+        let new1_asg = assign_utxo(std_lib, layouter, &new1_val)?;
+        let new2_asg = assign_utxo(std_lib, layouter, &new2_val)?;
 
         // old commitments (must match sender pk)
         let old_c1 = compute_commitment_from_parts(std_lib, layouter, &old1_asg, &pk_sx, &pk_sy)?;
@@ -316,17 +316,16 @@ fn assign_utxo<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
     utxo_val: &Value<Utxo>,
-    amount_bits: u32,
 ) -> Result<AssignedUtxo, Error> {
     let id = std_lib.assign(layouter, utxo_val.clone().map(|u| u.asset_id))?;
     let amount_f = std_lib.assign(layouter, utxo_val.clone().map(|u| F::from_u128(u.amount)))?;
     let randomness = std_lib.assign(layouter, utxo_val.clone().map(|u| u.randomness))?;
     let big = std_lib.biguint();
-    let amount_big = big.assign_biguint(
-        layouter,
-        utxo_val.clone().map(|u| BigUint::from(u.amount)),
-        amount_bits,
-    )?;
+
+    let bits_f =
+        std_lib.assigned_to_le_bits(layouter, &amount_f, Some(AMOUNT_BITS as usize), true)?;
+    let amount_big = big.from_le_bits(layouter, &bits_f)?;
+
     Ok(AssignedUtxo {
         id,
         amount_f,

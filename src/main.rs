@@ -183,10 +183,10 @@ impl TreeState {
 pub struct Spend2Output2;
 
 impl Relation for Spend2Output2 {
-    // Single public input: Poseidon hash of (root, pk_x, pk_y, old_c1, old_c2, new_c1, new_c2, nf1, nf2)
+    // Single public input: Poseidon hash of (root, pk_x, pk_y, new_c1, new_c2, nf1, nf2)
     type Instance = F;
 
-    // Witness unchanged (includes everything needed to recompute the values that used to be public)
+    // Witness unchanged (includes everything needed to recompute values that are no longer public)
     type Witness = (
         MerklePath<F>,
         MerklePath<F>,
@@ -266,16 +266,18 @@ impl Relation for Spend2Output2 {
             std_lib, layouter, &old1_asg, &old2_asg, &new1_asg, &new2_asg,
         )?;
 
-        // ---- Single public input: Poseidon hash of the original public inputs ----
-        // Sponge the nine values in groups of 3 using the same 3-arity Poseidon as elsewhere.
+        // ---- Single public input: Poseidon hash without old_c1/old_c2 ----
+        // Sponge the seven values using the same 3-arity Poseidon as elsewhere:
+        // (root, pk_x, pk_y) -> acc1
+        // (acc1, new_c1, new_c2) -> acc2
+        // (acc2, nf1,  nf2)      -> instance_hash
         let acc1 = std_lib.poseidon(layouter, &[root1.clone(), pk_sx.clone(), pk_sy.clone()])?;
-        let acc2 = std_lib.poseidon(layouter, &[acc1, old_c1.clone(), old_c2.clone()])?;
-        let acc3 = std_lib.poseidon(layouter, &[acc2, new_c1.clone(), new_c2.clone()])?;
-        let instance_hash = std_lib.poseidon(layouter, &[acc3, nf1.clone(), nf2.clone()])?;
+        let acc2 = std_lib.poseidon(layouter, &[acc1, new_c1.clone(), new_c2.clone()])?;
+        let instance_hash = std_lib.poseidon(layouter, &[acc2, nf1.clone(), nf2.clone()])?;
 
         // Expose only this hash as the single public input
         std_lib.constrain_as_public_input(layouter, &instance_hash)?;
-        // -------------------------------------------------------------------------
+        // -----------------------------------------------------------------
 
         Ok(())
     }
@@ -438,16 +440,14 @@ fn host_nullify(commit: F, pk_x: F, pk_y: F) -> F {
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h, pk_y, F::ZERO])
 }
 
-// Poseidon sponge (3-arity) over the nine original public inputs:
-// (root, pk_x, pk_y) -> acc1
-// (acc1, old_c1, old_c2) -> acc2
-// (acc2, new_c1, new_c2) -> acc3
-// (acc3, nf1,  nf2)  -> final hash
-fn host_instance_hash(items: [F; 9]) -> F {
+// Poseidon sponge (3-arity) over the seven public items (old_c* removed):
+// (root, pk_x, pk_y)           -> acc1
+// (acc1, new_c1, new_c2)       -> acc2
+// (acc2, nf1,  nf2)            -> final hash
+fn host_instance_hash(items: [F; 7]) -> F {
     let acc1 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[items[0], items[1], items[2]]);
     let acc2 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc1, items[3], items[4]]);
-    let acc3 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc2, items[5], items[6]]);
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc3, items[7], items[8]])
+    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc2, items[5], items[6]])
 }
 
 // -------------------- Multiple accounts & randomized transfers --------------------
@@ -629,13 +629,11 @@ fn main() {
         let nf1 = host_nullify(old1.commit, sender.pk_x, sender.pk_y);
         let nf2 = host_nullify(old2.commit, sender.pk_x, sender.pk_y);
 
-        // Compute single public instance hash (Poseidon sponge over original public inputs)
+        // Compute single public instance hash (Poseidon sponge without old commitments)
         let instance: F = host_instance_hash([
             root_before,
             sender.pk_x,
             sender.pk_y,
-            old1.commit,
-            old2.commit,
             new1_commit,
             new2_commit,
             nf1,

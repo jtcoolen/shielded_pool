@@ -11,7 +11,8 @@ use midnight_circuits::{
     hash::poseidon::{PoseidonChip, PoseidonState, constants::PoseidonField},
     instructions::{
         ArithInstructions, AssertionInstructions, AssignmentInstructions, ControlFlowInstructions,
-        ConversionInstructions, DecompositionInstructions, PublicInputInstructions, hash::HashCPU,
+        ConversionInstructions, DecompositionInstructions, EccInstructions,
+        PublicInputInstructions, hash::HashCPU,
     },
     testing_utils::plonk_api::filecoin_srs,
     types::{AssignedBit, AssignedNative, AssignedNativePoint, Instantiable},
@@ -183,14 +184,17 @@ impl TreeState {
 pub struct Spend2Output2;
 
 impl Relation for Spend2Output2 {
-    // Single public input: Poseidon hash of (root, pk_x, pk_y, new_c1, new_c2, nf1, nf2)
+    // Single public input: Poseidon hash of (root, pk'_x, pk'_y, new_c1, new_c2, nf1, nf2)
+    // where pk' = pk + [alpha]G is a per-transaction blinded key
     type Instance = F;
 
-    // Witness unchanged (includes everything needed to recompute values that are no longer public)
+    // Witness unchanged except we add the blinding factor alpha
+    // (includes everything needed to recompute values that are no longer public)
     type Witness = (
         MerklePath<F>,
         MerklePath<F>,
-        JubjubScalar,
+        JubjubScalar, // sk
+        JubjubScalar, // alpha (blinding factor)
         Utxo,
         Utxo,
         Utxo,
@@ -212,17 +216,20 @@ impl Relation for Spend2Output2 {
         witness: Value<Self::Witness>,
     ) -> Result<(), Error> {
         // Extract witness components (Values only; assignments happen once below)
-        let mp1_val = witness.clone().map(|(mp1, _, _, _, _, _, _, _, _)| mp1);
-        let mp2_val = witness.clone().map(|(_, mp2, _, _, _, _, _, _, _)| mp2);
-        let sk_val = witness.clone().map(|(_, _, sk, _, _, _, _, _, _)| sk);
-        let old1_val = witness.clone().map(|(_, _, _, o1, _, _, _, _, _)| o1);
-        let old2_val = witness.clone().map(|(_, _, _, _, o2, _, _, _, _)| o2);
-        let new1_val = witness.clone().map(|(_, _, _, _, _, n1, _, _, _)| n1);
-        let new2_val = witness.clone().map(|(_, _, _, _, _, _, n2, _, _)| n2);
-        let pk1x_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _)| k1.0);
-        let pk1y_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _)| k1.1);
-        let pk2x_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2.0);
-        let pk2y_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2.1);
+        let mp1_val = witness.clone().map(|(mp1, _, _, _, _, _, _, _, _, _)| mp1);
+        let mp2_val = witness.clone().map(|(_, mp2, _, _, _, _, _, _, _, _)| mp2);
+        let sk_val = witness.clone().map(|(_, _, sk, _, _, _, _, _, _, _)| sk);
+        let alpha_val = witness
+            .clone()
+            .map(|(_, _, _, alpha, _, _, _, _, _, _)| alpha);
+        let old1_val = witness.clone().map(|(_, _, _, _, o1, _, _, _, _, _)| o1);
+        let old2_val = witness.clone().map(|(_, _, _, _, _, o2, _, _, _, _)| o2);
+        let new1_val = witness.clone().map(|(_, _, _, _, _, _, n1, _, _, _)| n1);
+        let new2_val = witness.clone().map(|(_, _, _, _, _, _, _, n2, _, _)| n2);
+        let pk1x_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k1, _)| k1.0);
+        let pk1y_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k1, _)| k1.1);
+        let pk2x_val = witness.clone().map(|(_, _, _, _, _, _, _, _, _, k2)| k2.0);
+        let pk2y_val = witness.clone().map(|(_, _, _, _, _, _, _, _, _, k2)| k2.1);
 
         // Assign sender secret once, derive sender pk once
         let sk: AssignedScalarOfNativeCurve<Jubjub> = std_lib.jubjub().assign(layouter, sk_val)?;
@@ -230,8 +237,16 @@ impl Relation for Spend2Output2 {
             .jubjub()
             .assign_fixed(layouter, JubjubSubgroup::generator())?;
         let pk_sender = std_lib.jubjub().mul(layouter, &sk, &generator)?;
-        let pk_fields = std_lib.jubjub().as_public_input(layouter, &pk_sender)?;
-        let (pk_sx, pk_sy) = (pk_fields[0].clone(), pk_fields[1].clone());
+        let pk_sender_fields = std_lib.jubjub().as_public_input(layouter, &pk_sender)?;
+        let (pk_sx, pk_sy) = (pk_sender_fields[0].clone(), pk_sender_fields[1].clone());
+
+        // Blinded key: pk' = pk + [alpha]G  (used publicly; authorization proven inside)
+        let alpha: AssignedScalarOfNativeCurve<Jubjub> =
+            std_lib.jubjub().assign(layouter, alpha_val)?;
+        let blind = std_lib.jubjub().mul(layouter, &alpha, &generator)?;
+        let pk_blinded = std_lib.jubjub().add(layouter, &pk_sender, &blind)?;
+        let pk_blinded_fields = std_lib.jubjub().as_public_input(layouter, &pk_blinded)?;
+        let (pk_bx, pk_by) = (pk_blinded_fields[0].clone(), pk_blinded_fields[1].clone());
 
         // Assign each UTXO's fields exactly once
         let old1_asg = assign_utxo(std_lib, layouter, &old1_val)?;
@@ -239,7 +254,7 @@ impl Relation for Spend2Output2 {
         let new1_asg = assign_utxo(std_lib, layouter, &new1_val)?;
         let new2_asg = assign_utxo(std_lib, layouter, &new2_val)?;
 
-        // old commitments (must match sender pk)
+        // old commitments (must match UNBLINDED sender pk)
         let old_c1 = compute_commitment_from_parts(std_lib, layouter, &old1_asg, &pk_sx, &pk_sy)?;
         let old_c2 = compute_commitment_from_parts(std_lib, layouter, &old2_asg, &pk_sx, &pk_sy)?;
 
@@ -248,7 +263,7 @@ impl Relation for Spend2Output2 {
         let root2 = compute_merkle_root(std_lib, layouter, mp2_val, old_c2.clone())?;
         std_lib.assert_equal(layouter, &root1, &root2)?;
 
-        // Nullifiers (bound to sender pk)
+        // Nullifiers (BOUND TO UNBLINDED sender pk to prevent double-spends)
         let nf1 = compute_nullifier(std_lib, layouter, &old_c1, &pk_sx, &pk_sy)?;
         let nf2 = compute_nullifier(std_lib, layouter, &old_c2, &pk_sx, &pk_sy)?;
 
@@ -266,12 +281,12 @@ impl Relation for Spend2Output2 {
             std_lib, layouter, &old1_asg, &old2_asg, &new1_asg, &new2_asg,
         )?;
 
-        // ---- Single public input: Poseidon hash without old_c1/old_c2 ----
+        // ---- Single public input: Poseidon hash using BLINDED pk ----
         // Sponge the seven values using the same 3-arity Poseidon as elsewhere:
-        // (root, pk_x, pk_y) -> acc1
+        // (root, pk'_x, pk'_y) -> acc1
         // (acc1, new_c1, new_c2) -> acc2
         // (acc2, nf1,  nf2)      -> instance_hash
-        let acc1 = std_lib.poseidon(layouter, &[root1.clone(), pk_sx.clone(), pk_sy.clone()])?;
+        let acc1 = std_lib.poseidon(layouter, &[root1.clone(), pk_bx.clone(), pk_by.clone()])?;
         let acc2 = std_lib.poseidon(layouter, &[acc1, new_c1.clone(), new_c2.clone()])?;
         let instance_hash = std_lib.poseidon(layouter, &[acc2, nf1.clone(), nf2.clone()])?;
 
@@ -471,7 +486,7 @@ struct Account {
 }
 
 fn main() {
-    const K: u32 = 13;
+    const K: u32 = 14;
     const NUM_ACCOUNTS: usize = 4;
     const NUM_SEED_DEPOSITS_PER_ACCOUNT: usize = 3;
     const NUM_TRANSFERS: usize = 120;
@@ -625,26 +640,35 @@ fn main() {
             new2.randomness,
         );
 
-        // Nullifiers (bound to sender)
+        // Nullifiers (bound to UNBLINDED sender key to maintain uniqueness)
         let nf1 = host_nullify(old1.commit, sender.pk_x, sender.pk_y);
         let nf2 = host_nullify(old2.commit, sender.pk_x, sender.pk_y);
 
-        // Compute single public instance hash (Poseidon sponge without old commitments)
+        // Per-transaction blinding factor and blinded key pk' = pk + [alpha]G
+        let alpha = JubjubScalar::random(&mut OsRng);
+        let blind_point = JubjubSubgroup::generator() * alpha;
+        let pk_blinded_point = sender.pk_point + blind_point;
+        let pkb_fields = AssignedNativePoint::<Jubjub>::as_public_input(&pk_blinded_point);
+        let pk_bx = pkb_fields[0];
+        let pk_by = pkb_fields[1];
+
+        // Compute single public instance hash (Poseidon sponge without old commitments) using BLINDED pk
         let instance: F = host_instance_hash([
             root_before,
-            sender.pk_x,
-            sender.pk_y,
+            pk_bx,
+            pk_by,
             new1_commit,
             new2_commit,
             nf1,
             nf2,
         ]);
 
-        // Witness carries recipient keys for outputs (unchanged)
+        // Witness carries alpha and recipient keys for outputs (unchanged)
         let witness = (
             mp1,
             mp2,
             sender.sk,
+            alpha, // blinding factor
             old1.utxo.clone(),
             old2.utxo.clone(),
             new1.clone(),

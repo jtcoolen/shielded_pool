@@ -5,6 +5,7 @@ use ff::{Field, PrimeField};
 use group::Group;
 
 use midnight_circuits::{
+    biguint::AssignedBigUint,
     compact_std_lib::{self, Relation, ZkStdLib, ZkStdLibArch},
     ecc::native::AssignedScalarOfNativeCurve,
     hash::poseidon::{PoseidonChip, PoseidonState, constants::PoseidonField},
@@ -21,12 +22,15 @@ use midnight_proofs::{
     circuit::{Layouter, Value},
     plonk::Error,
 };
+use num_bigint::BigUint;
 use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
 
 const TREE_HEIGHT: usize = 64;
 const UTXO_COMMIT_TAG: u64 = 0x0001;
 const UTXO_NULLIFY_TAG: u64 = 0x0002;
+const AMOUNT_BITS: u32 = 128; // 128-bit integers for amounts
+const AMOUNT_GEN_BITS: u32 = 120; // generate up to 120 bits to avoid u128 overflow on sums
 
 // Merkle path structure
 #[derive(Clone, Debug)]
@@ -53,7 +57,7 @@ impl<Fp: PoseidonField> MerklePath<Fp> {
 #[derive(Clone, Debug)]
 pub struct Utxo {
     pub asset_id: F,
-    pub amount: F,
+    pub amount: u128, // 128-bit host-side amount
     pub randomness: F,
 }
 
@@ -207,7 +211,7 @@ impl Relation for Spend2Output2 {
         _instance: Value<Self::Instance>,
         witness: Value<Self::Witness>,
     ) -> Result<(), Error> {
-        // Extract witness components
+        // Extract witness components (Values only; assignments happen once below)
         let mp1_val = witness.clone().map(|(mp1, _, _, _, _, _, _, _, _)| mp1);
         let mp2_val = witness.clone().map(|(_, mp2, _, _, _, _, _, _, _)| mp2);
         let sk_val = witness.clone().map(|(_, _, sk, _, _, _, _, _, _)| sk);
@@ -220,7 +224,7 @@ impl Relation for Spend2Output2 {
         let pk2x_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2.0);
         let pk2y_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2.1);
 
-        // Prove knowledge of sender sk and derive sender pk
+        // Assign sender secret once, derive sender pk once
         let sk: AssignedScalarOfNativeCurve<Jubjub> = std_lib.jubjub().assign(layouter, sk_val)?;
         let generator = std_lib
             .jubjub()
@@ -229,9 +233,15 @@ impl Relation for Spend2Output2 {
         let pk_fields = std_lib.jubjub().as_public_input(layouter, &pk_sender)?;
         let (pk_sx, pk_sy) = (pk_fields[0].clone(), pk_fields[1].clone());
 
+        // Assign each UTXO's fields exactly once
+        let old1_asg = assign_utxo(std_lib, layouter, &old1_val, AMOUNT_BITS)?;
+        let old2_asg = assign_utxo(std_lib, layouter, &old2_val, AMOUNT_BITS)?;
+        let new1_asg = assign_utxo(std_lib, layouter, &new1_val, AMOUNT_BITS)?;
+        let new2_asg = assign_utxo(std_lib, layouter, &new2_val, AMOUNT_BITS)?;
+
         // old commitments (must match sender pk)
-        let old_c1 = compute_commitment(std_lib, layouter, &old1_val, &pk_sx, &pk_sy)?;
-        let old_c2 = compute_commitment(std_lib, layouter, &old2_val, &pk_sx, &pk_sy)?;
+        let old_c1 = compute_commitment_from_parts(std_lib, layouter, &old1_asg, &pk_sx, &pk_sy)?;
+        let old_c2 = compute_commitment_from_parts(std_lib, layouter, &old2_asg, &pk_sx, &pk_sy)?;
 
         // Verify Merkle proofs and check roots match
         let root1 = compute_merkle_root(std_lib, layouter, mp1_val, old_c1.clone())?;
@@ -242,18 +252,18 @@ impl Relation for Spend2Output2 {
         let nf1 = compute_nullifier(std_lib, layouter, &old_c1, &pk_sx, &pk_sy)?;
         let nf2 = compute_nullifier(std_lib, layouter, &old_c2, &pk_sx, &pk_sy)?;
 
-        // New outputs: use provided recipient (pk_out*) coordinates
+        // New outputs: use provided recipient (pk_out*) coordinates (assigned once)
         let pk1x = std_lib.assign(layouter, pk1x_val)?;
         let pk1y = std_lib.assign(layouter, pk1y_val)?;
         let pk2x = std_lib.assign(layouter, pk2x_val)?;
         let pk2y = std_lib.assign(layouter, pk2y_val)?;
 
-        let new_c1 = compute_commitment(std_lib, layouter, &new1_val, &pk1x, &pk1y)?;
-        let new_c2 = compute_commitment(std_lib, layouter, &new2_val, &pk2x, &pk2y)?;
+        let new_c1 = compute_commitment_from_parts(std_lib, layouter, &new1_asg, &pk1x, &pk1y)?;
+        let new_c2 = compute_commitment_from_parts(std_lib, layouter, &new2_asg, &pk2x, &pk2y)?;
 
-        // Value conservation (same asset id)
-        check_value_conservation(
-            std_lib, layouter, &old1_val, &old2_val, &new1_val, &new2_val,
+        // Value conservation (same asset id + 128-bit amounts using BigUint gadget)
+        check_value_conservation_assigned(
+            std_lib, layouter, &old1_asg, &old2_asg, &new1_asg, &new2_asg,
         )?;
 
         // ---- Single public input: Poseidon hash of the original public inputs ----
@@ -279,7 +289,7 @@ impl Relation for Spend2Output2 {
             secp256k1: false,
             bls12_381: false,
             base64: false,
-            nr_pow2range_cols: 1,
+            nr_pow2range_cols: 1, // BigUint gadget uses pow2range; 1 column is fine here
             automaton: false,
         }
     }
@@ -292,21 +302,54 @@ impl Relation for Spend2Output2 {
     }
 }
 
-// Helpers (unchanged)
-fn compute_commitment<L: Layouter<F>>(
+// A small helper carrying the once-assigned UTXO components used across the circuit.
+#[derive(Clone)]
+struct AssignedUtxo {
+    id: AssignedNative<F>,
+    amount_f: AssignedNative<F>,    // amount as a field (for hashing)
+    amount_big: AssignedBigUint<F>, // amount as BigUint (for 128-bit arithmetic)
+    randomness: AssignedNative<F>,
+}
+
+// Assign UTXO fields exactly once (both field & BigUint representations)
+fn assign_utxo<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
     utxo_val: &Value<Utxo>,
+    amount_bits: u32,
+) -> Result<AssignedUtxo, Error> {
+    let id = std_lib.assign(layouter, utxo_val.clone().map(|u| u.asset_id))?;
+    let amount_f = std_lib.assign(layouter, utxo_val.clone().map(|u| F::from_u128(u.amount)))?;
+    let randomness = std_lib.assign(layouter, utxo_val.clone().map(|u| u.randomness))?;
+    let big = std_lib.biguint();
+    let amount_big = big.assign_biguint(
+        layouter,
+        utxo_val.clone().map(|u| BigUint::from(u.amount)),
+        amount_bits,
+    )?;
+    Ok(AssignedUtxo {
+        id,
+        amount_f,
+        amount_big,
+        randomness,
+    })
+}
+
+// Helpers (amounts are already assigned; we never re-assign the same witness)
+fn compute_commitment_from_parts<L: Layouter<F>>(
+    std_lib: &ZkStdLib,
+    layouter: &mut L,
+    utxo: &AssignedUtxo,
     pk_x: &AssignedNative<F>,
     pk_y: &AssignedNative<F>,
 ) -> Result<AssignedNative<F>, Error> {
-    let id = std_lib.assign(layouter, utxo_val.clone().map(|u| u.asset_id))?;
-    let amt = std_lib.assign(layouter, utxo_val.clone().map(|u| u.amount))?;
-    let rand = std_lib.assign(layouter, utxo_val.clone().map(|u| u.randomness))?;
     let tag = std_lib.assign_fixed(layouter, F::from(UTXO_COMMIT_TAG))?;
     let zero = std_lib.assign_fixed(layouter, F::ZERO)?;
-    let h1 = std_lib.poseidon(layouter, &[tag, id, amt])?;
-    let h2 = std_lib.poseidon(layouter, &[pk_x.clone(), pk_y.clone(), rand])?;
+    let h1 = std_lib.poseidon(layouter, &[tag, utxo.id.clone(), utxo.amount_f.clone()])?;
+    let h2 = std_lib.poseidon(
+        layouter,
+        &[pk_x.clone(), pk_y.clone(), utxo.randomness.clone()],
+    )?;
     std_lib.poseidon(layouter, &[h1, h2, zero])
 }
 
@@ -361,34 +404,32 @@ fn compute_merkle_root<L: Layouter<F>>(
         })
 }
 
-fn check_value_conservation<L: Layouter<F>>(
+// 128-bit amount conservation and asset-id equality using already-assigned components.
+fn check_value_conservation_assigned<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
-    old1: &Value<Utxo>,
-    old2: &Value<Utxo>,
-    new1: &Value<Utxo>,
-    new2: &Value<Utxo>,
+    in1: &AssignedUtxo,
+    in2: &AssignedUtxo,
+    out1: &AssignedUtxo,
+    out2: &AssignedUtxo,
 ) -> Result<(), Error> {
-    let in1_id: AssignedNative<F> = std_lib.assign(layouter, old1.clone().map(|u| u.asset_id))?;
-    let in2_id: AssignedNative<F> = std_lib.assign(layouter, old2.clone().map(|u| u.asset_id))?;
-    let out1_id: AssignedNative<F> = std_lib.assign(layouter, new1.clone().map(|u| u.asset_id))?;
-    let out2_id: AssignedNative<F> = std_lib.assign(layouter, new2.clone().map(|u| u.asset_id))?;
-    std_lib.assert_equal(layouter, &in1_id, &in2_id)?;
-    std_lib.assert_equal(layouter, &in1_id, &out1_id)?;
-    std_lib.assert_equal(layouter, &in1_id, &out2_id)?;
-    let in1_amt = std_lib.assign(layouter, old1.clone().map(|u| u.amount))?;
-    let in2_amt = std_lib.assign(layouter, old2.clone().map(|u| u.amount))?;
-    let out1_amt = std_lib.assign(layouter, new1.clone().map(|u| u.amount))?;
-    let out2_amt = std_lib.assign(layouter, new2.clone().map(|u| u.amount))?;
-    let sum_in = std_lib.add(layouter, &in1_amt, &in2_amt)?;
-    let sum_out = std_lib.add(layouter, &out1_amt, &out2_amt)?;
-    std_lib.assert_equal(layouter, &sum_in, &sum_out)
+    // All asset IDs equal (no re-assigning)
+    std_lib.assert_equal(layouter, &in1.id, &in2.id)?;
+    std_lib.assert_equal(layouter, &in1.id, &out1.id)?;
+    std_lib.assert_equal(layouter, &in1.id, &out2.id)?;
+
+    // Amount conservation with 128-bit integers (no re-assigning)
+    let big = std_lib.biguint();
+    let sum_in = big.add(layouter, &in1.amount_big, &in2.amount_big)?;
+    let sum_out = big.add(layouter, &out1.amount_big, &out2.amount_big)?;
+    big.assert_equal(layouter, &sum_in, &sum_out)
 }
 
 // Host-side helpers
-fn host_commit(id: F, amt: F, pk_x: F, pk_y: F, rand: F) -> F {
+fn host_commit(id: F, amt_u128: u128, pk_x: F, pk_y: F, rand: F) -> F {
     let tag = F::from(UTXO_COMMIT_TAG);
-    let h1 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[tag, id, amt]);
+    let amt_f = F::from_u128(amt_u128);
+    let h1 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[tag, id, amt_f]);
     let h2 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[pk_x, pk_y, rand]);
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h1, h2, F::ZERO])
 }
@@ -464,10 +505,12 @@ fn main() {
         })
         .collect();
 
-    // Seed deposits: random amounts, credited to each account
+    // Seed deposits: random (<=120-bit) amounts, credited to each account
     for acc in &mut accounts {
         for _ in 0..NUM_SEED_DEPOSITS_PER_ACCOUNT {
-            let amt = F::random(&mut rng);
+            // generate <=120-bit to avoid u128 overflow on sums
+            let hi: u128 = rng.r#gen::<u128>() >> (128 - AMOUNT_GEN_BITS);
+            let amt: u128 = hi;
             let utxo = Utxo {
                 asset_id,
                 amount: amt,
@@ -548,10 +591,14 @@ fn main() {
         assert_eq!(root_before, mp1.compute_root());
         assert_eq!(root_before, mp2.compute_root());
 
-        // Random split to recipients
-        let total = old1.utxo.amount + old2.utxo.amount;
-        let out1_amt = F::random(&mut rng);
-        let out2_amt = total - out1_amt;
+        // Random split to recipients: out1 in [0..=total]
+        let total: u128 = old1.utxo.amount + old2.utxo.amount;
+        let out1_amt: u128 = if total == 0 {
+            0
+        } else {
+            rng.gen_range(0..=total)
+        };
+        let out2_amt: u128 = total - out1_amt;
 
         let new1 = Utxo {
             asset_id,
@@ -664,13 +711,13 @@ fn main() {
 
     // (Optional) show balances per account (sum of unspent amounts)
     for acc in &accounts {
-        let bal: F = acc
+        let bal: u128 = acc
             .wallet
             .iter()
             .filter(|n| !n.spent)
-            .fold(F::ZERO, |s, n| s + n.utxo.amount);
+            .fold(0u128, |s, n| s.saturating_add(n.utxo.amount));
         println!(
-            "Account {} unspent notes: {}, balance {:?}",
+            "Account {} unspent notes: {}, balance {}",
             acc.id,
             acc.wallet.iter().filter(|n| !n.spent).count(),
             bal

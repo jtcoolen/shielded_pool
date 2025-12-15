@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::time::Instant;
 
 use ff::{Field, PrimeField};
@@ -14,6 +13,7 @@ use midnight_circuits::{
         ConversionInstructions, DecompositionInstructions, EccInstructions,
         PublicInputInstructions, hash::HashCPU,
     },
+    map::cpu::MapMt,
     testing_utils::plonk_api::filecoin_srs,
     types::{AssignedBit, AssignedNative, AssignedNativePoint, Instantiable},
 };
@@ -33,6 +33,7 @@ mod proof_agg {
     use halo2curves::{ff::Field, group::Group};
     use midnight_circuits::compact_std_lib::MidnightCircuit;
     use midnight_circuits::hash::poseidon::PoseidonState;
+    use midnight_circuits::instructions::map::MapInstructions;
     use midnight_circuits::types::{AssignedBit, AssignedForeignPoint};
     use midnight_circuits::{
         compact_std_lib::{self, Relation, ZkStdLib, ZkStdLibArch},
@@ -41,18 +42,20 @@ mod proof_agg {
             foreign::{ForeignEccChip, ForeignEccConfig, nb_foreign_ecc_chip_columns},
         },
         field::{
-            NativeChip, NativeConfig, NativeGadget,
+            NativeGadget,
             decomposition::{
                 chip::{P2RDecompositionChip, P2RDecompositionConfig},
                 pow2range::Pow2RangeChip,
             },
             foreign::FieldChip,
-            native::NB_ARITH_COLS,
+            native::{NB_ARITH_COLS, NativeChip, NativeConfig},
         },
         hash::poseidon::{
             NB_POSEIDON_ADVICE_COLS, NB_POSEIDON_FIXED_COLS, PoseidonChip, PoseidonConfig,
         },
         instructions::*,
+        map::cpu::MapMt,
+        map::map_gadget::MapGadget,
         types::{AssignedNative, ComposableChip, Instantiable},
         verifier::{
             Accumulator, AssignedAccumulator, AssignedVk, BlstrsEmulation, SelfEmulation,
@@ -66,7 +69,7 @@ mod proof_agg {
         circuit::{Layouter, SimpleFloorPlanner, Value},
         plonk::{
             Circuit, ConstraintSystem, Error, VerifyingKey, create_proof, keygen_pk,
-            keygen_vk_with_k, prepare,
+            keygen_vk_with_k,
         },
         poly::{EvaluationDomain, kzg::KZGCommitmentScheme},
         transcript::{CircuitTranscript, Transcript},
@@ -85,9 +88,13 @@ mod proof_agg {
     type E = <S as SelfEmulation>::Engine;
     type CBase = <C as CircuitCurve>::Base;
     type NG = NativeGadget<F, P2RDecompositionChip<F>, NativeChip<F>>;
+    type Map = MapMt<F, PoseidonChip<F>>;
 
     const K: u32 = 20;
-    const POSEIDON_K: u32 = 6;
+    pub const AGG_K: u32 = K;
+    pub const FINAL_NUM_LEAVES: usize = 8;
+    pub const NULLIFIERS_PER_LEAF: usize = 2;
+    pub const FINAL_NUM_NULLIFIERS: usize = FINAL_NUM_LEAVES * NULLIFIERS_PER_LEAF;
 
     pub fn filecoin_srs_agg(k: u32) -> ParamsKZG<Bls12> {
         assert!(k <= 20, "We don't have an SRS for circuits of size {k}");
@@ -454,6 +461,8 @@ mod proof_agg {
         proof: Vec<u8>,
         proof_acc: Accumulator<S>,
         pi_acc: Accumulator<S>,
+        public_inputs: Vec<F>,
+        state_index: usize,
     }
 
     #[derive(Clone, Debug)]
@@ -462,6 +471,20 @@ mod proof_agg {
         pub state: F,
         /// The client's proof (created off-chain by the client)
         pub proof: Vec<u8>,
+        /// The 7 would-be public inputs that were Poseidon-hashed to `state`
+        /// [root, pk'_x, pk'_y, new_c1, new_c2, nf1, nf2]
+        pub public_items: [F; 7],
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct AggregationResult {
+        pub root_state: F,
+        pub agg_proof: Vec<u8>,
+        pub agg_public_inputs: Vec<F>,
+        pub agg_state_index: usize,
+        pub agg_vk: VerifyingKey<F, KZGCommitmentScheme<E>>,
+        pub leaf_states: Vec<F>,
+        pub client_pis: Vec<[F; 7]>,
     }
 
     fn fixed_base_names_for(
@@ -529,12 +552,11 @@ mod proof_agg {
         let committed_bases: &[&[C]] = &[&[C::identity()]];
         let instances: &[&[&[F]]] = &[&[plain_public_inputs]];
 
-        let dual_msm = prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>>(
-            vk,
-            committed_bases,
-            instances,
-            &mut transcript,
-        )
+        let dual_msm = midnight_proofs::plonk::prepare::<
+            F,
+            KZGCommitmentScheme<E>,
+            CircuitTranscript<PoseidonState<F>>,
+        >(vk, committed_bases, instances, &mut transcript)
         .expect("Verification failed");
 
         assert!(dual_msm.clone().check(&srs.verifier_params()));
@@ -558,14 +580,14 @@ mod proof_agg {
     /// - `client_proofs.len()` is a power of two
     ///
     /// Returns:
-    /// - `(root_state, root_agg_proof_bytes)`
+    /// - AggregationResult with root state, proof, and metadata for FinalAggCircuit
     pub fn aggregate_client_proofs(
         leaf_srs: &ParamsKZG<Bls12>,
         leaf_vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
         leaf_vk_name: &'static str,
         leaf_k: u32,
         client_proofs: &[ClientProof],
-    ) -> (F, Vec<u8>) {
+    ) -> AggregationResult {
         assert!(!client_proofs.is_empty(), "Need at least one client proof");
         assert!(
             client_proofs.len().is_power_of_two(),
@@ -624,7 +646,8 @@ mod proof_agg {
         };
 
         let agg_srs = filecoin_srs_agg(K);
-        let agg_vk = keygen_vk_with_k(&agg_srs, &default_agg_circuit, K).unwrap();
+        let agg_vk: VerifyingKey<F, KZGCommitmentScheme<E>> =
+            keygen_vk_with_k(&agg_srs, &default_agg_circuit, K).unwrap();
         let agg_pk = keygen_pk(agg_vk.clone(), &default_agg_circuit).unwrap();
 
         let default_leaf_agg_circuit = AggCircuit {
@@ -766,6 +789,7 @@ mod proof_agg {
                 accumulated_pi.collapse();
 
                 let mut public_inputs = AssignedVk::<S>::as_public_input(leaf_vk);
+                let state_index = public_inputs.len();
                 public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
                 public_inputs.extend(AssignedAccumulator::as_public_input(&accumulated_pi));
                 public_inputs.extend(AssignedNative::<F>::as_public_input(&F::ONE));
@@ -803,6 +827,8 @@ mod proof_agg {
                     proof,
                     proof_acc,
                     pi_acc: accumulated_pi.clone(),
+                    public_inputs,
+                    state_index,
                 }
             })
             .collect();
@@ -854,6 +880,7 @@ mod proof_agg {
                     let input_agg_vk = if level == 1 { &leaf_agg_vk } else { &agg_vk };
 
                     let mut public_inputs = AssignedVk::<S>::as_public_input(&input_agg_vk);
+                    let state_index = public_inputs.len();
                     public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
                     public_inputs.extend(AssignedAccumulator::as_public_input(&accumulated_pi));
                     public_inputs.extend(AssignedNative::<F>::as_public_input(&F::from(level + 1)));
@@ -899,6 +926,8 @@ mod proof_agg {
                         proof,
                         proof_acc,
                         pi_acc: accumulated_pi,
+                        public_inputs,
+                        state_index,
                     }
                 })
                 .collect();
@@ -913,20 +942,252 @@ mod proof_agg {
 
         // Optional: recompute expected root from client states and assert
         let leaf_states: Vec<F> = client_proofs.iter().map(|p| p.state).collect();
+        let client_pis: Vec<[F; 7]> = client_proofs.iter().map(|p| p.public_items).collect();
         let expected_root = poseidon_tree_root(&leaf_states);
         assert_eq!(
             root.state, expected_root,
             "Root state mismatch with recomputed Poseidon tree root"
         );
 
-        (root.state, root.proof.clone())
+        AggregationResult {
+            root_state: root.state,
+            agg_proof: root.proof.clone(),
+            agg_public_inputs: root.public_inputs.clone(),
+            agg_state_index: root.state_index,
+            agg_vk,
+            leaf_states,
+            client_pis,
+        }
+    }
+
+    /// Final aggregation circuit:
+    ///  - witnesses the client would-be public inputs (per-leaf 7-tuple),
+    ///  - recomputes each client's hashed public input and Poseidon Merkle root,
+    ///  - ties that root to the AGG proof,
+    ///  - witnesses sparse nullifier & commitment maps (pre-state),
+    ///  - inserts all batch nullifiers and commitments into the maps,
+    ///  - exposes only:
+    ///       * public input 0: pre-commitment succinct_repr root
+    ///       * public input 1: post-commitment succinct_repr root
+    ///       * public input 2: pre-nullifier succinct_repr root
+    ///       * public input 3: post-nullifier succinct_repr root
+    #[derive(Clone, Debug)]
+    pub struct FinalAggCircuit {
+        /// Inner aggregation vk / proof / public inputs
+        pub agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
+        pub agg_proof: Value<Vec<u8>>,
+        pub agg_public_inputs: Vec<F>,
+        pub agg_state_index: usize,
+
+        /// For each client leaf, the 7 would-be public inputs:
+        ///   [root, pk'_x, pk'_y, new_c1, new_c2, nf1, nf2]
+        pub client_pis: [[F; 7]; FINAL_NUM_LEAVES],
+
+        /// Nullifier-set state transition
+        pub pre_nullifier_map: Value<Map>,
+        pub post_nullifier_root: Value<F>,
+
+        /// Commitment-set state transition
+        pub pre_commitment_map: Value<Map>,
+        pub post_commitment_root: Value<F>,
+    }
+
+    impl Circuit<F> for FinalAggCircuit {
+        type Config = (
+            NativeConfig,
+            P2RDecompositionConfig,
+            ForeignEccConfig<C>,
+            PoseidonConfig<F>,
+        );
+        type FloorPlanner = SimpleFloorPlanner;
+        type Params = ();
+
+        fn without_witnesses(&self) -> Self {
+            unreachable!()
+        }
+
+        fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+            configure_agg_circuit(meta)
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            let native_chip = <NativeChip<F> as ComposableChip<F>>::new(&config.0, &());
+            let core_decomp_chip = P2RDecompositionChip::new(&config.1, &(K as usize - 1));
+            let scalar_chip = NativeGadget::new(core_decomp_chip.clone(), native_chip.clone());
+            let curve_chip = ForeignEccChip::new(&config.2, &scalar_chip, &scalar_chip);
+            let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
+            let verifier_chip: VerifierGadget<_> =
+                VerifierGadget::<S>::new(&curve_chip, &scalar_chip, &poseidon_chip);
+
+            // ------------------------------------------------------------------
+            // 1. Commitment & nullifier map transitions (MapMt)
+            // ------------------------------------------------------------------
+            let mut commit_map_gadget =
+                MapGadget::<F, NG, PoseidonChip<F>>::new(&scalar_chip, &poseidon_chip);
+            commit_map_gadget.init(&mut layouter, self.pre_commitment_map.clone())?;
+
+            // First 2 public inputs: commitment pre/post roots
+            let pre_commit_root = commit_map_gadget.succinct_repr();
+            scalar_chip.constrain_as_public_input(&mut layouter, &pre_commit_root)?;
+
+            let expected_post_commit_root =
+                scalar_chip.assign(&mut layouter, self.post_commitment_root.clone())?;
+            scalar_chip.constrain_as_public_input(&mut layouter, &expected_post_commit_root)?;
+
+            let mut null_map_gadget =
+                MapGadget::<F, NG, PoseidonChip<F>>::new(&scalar_chip, &poseidon_chip);
+            null_map_gadget.init(&mut layouter, self.pre_nullifier_map.clone())?;
+
+            // Next 2 public inputs: nullifier pre/post roots
+            let pre_null_root = null_map_gadget.succinct_repr();
+            scalar_chip.constrain_as_public_input(&mut layouter, &pre_null_root)?;
+
+            let expected_post_null_root =
+                scalar_chip.assign(&mut layouter, self.post_nullifier_root.clone())?;
+            scalar_chip.constrain_as_public_input(&mut layouter, &expected_post_null_root)?;
+
+            // Values 0 (unspent) and 1 (spent)
+            let zero = scalar_chip.assign(&mut layouter, Value::known(F::ZERO))?;
+            let one = scalar_chip.assign(&mut layouter, Value::known(F::ONE))?;
+
+            // ------------------------------------------------------------------
+            // 2. Recompute client instance hashes and update maps
+            // ------------------------------------------------------------------
+            assert!(
+                FINAL_NUM_LEAVES.is_power_of_two(),
+                "FINAL_NUM_LEAVES must be a power of two"
+            );
+
+            let mut leaf_hashes: Vec<AssignedNative<F>> =
+                Vec::with_capacity(FINAL_NUM_LEAVES);
+
+            for i in 0..FINAL_NUM_LEAVES {
+                let items = self.client_pis[i];
+
+                // Assign the 7 would-be public inputs
+                let mut assigned_items: Vec<AssignedNative<F>> = Vec::with_capacity(7);
+                for j in 0..7 {
+                    assigned_items.push(
+                        scalar_chip.assign(&mut layouter, Value::known(items[j]))?,
+                    );
+                }
+
+                let root_pi = assigned_items[0].clone();
+                let pkx = assigned_items[1].clone();
+                let pky = assigned_items[2].clone();
+                let new_c1 = assigned_items[3].clone();
+                let new_c2 = assigned_items[4].clone();
+                let nf1 = assigned_items[5].clone();
+                let nf2 = assigned_items[6].clone();
+
+                // Recompute instance hash:
+                // (root, pk'_x, pk'_y) -> acc1
+                // (acc1, new_c1, new_c2) -> acc2
+                // (acc2, nf1, nf2) -> instance_hash
+                let acc1 =
+                    poseidon_chip.hash(&mut layouter, &[root_pi, pkx.clone(), pky.clone()])?;
+                let acc2 =
+                    poseidon_chip.hash(&mut layouter, &[acc1, new_c1.clone(), new_c2.clone()])?;
+                let inst_hash =
+                    poseidon_chip.hash(&mut layouter, &[acc2, nf1.clone(), nf2.clone()])?;
+
+                leaf_hashes.push(inst_hash.clone());
+
+                // Commitments: just insert (append-only set)
+                commit_map_gadget.insert(&mut layouter, &new_c1, &one)?;
+                commit_map_gadget.insert(&mut layouter, &new_c2, &one)?;
+
+                // Nullifiers: old_value must be 0, then set to 1
+                for nf in [nf1, nf2] {
+                    let old_value = null_map_gadget.get(&mut layouter, &nf)?;
+                    scalar_chip.assert_equal(&mut layouter, &old_value, &zero)?;
+                    null_map_gadget.insert(&mut layouter, &nf, &one)?;
+                }
+            }
+
+            // Final map roots must equal expected post-state roots
+            scalar_chip.assert_equal(
+                &mut layouter,
+                &commit_map_gadget.succinct_repr(),
+                &expected_post_commit_root,
+            )?;
+            scalar_chip.assert_equal(
+                &mut layouter,
+                &null_map_gadget.succinct_repr(),
+                &expected_post_null_root,
+            )?;
+
+            // ------------------------------------------------------------------
+            // 3. Poseidon Merkle root of client instance hashes (batch instances)
+            // ------------------------------------------------------------------
+            let mut level_vals: Vec<AssignedNative<F>> = leaf_hashes;
+
+            while level_vals.len() > 1 {
+                let mut next_level = Vec::with_capacity(level_vals.len() / 2);
+                for pair in level_vals.chunks(2) {
+                    let h =
+                        poseidon_chip.hash(&mut layouter, &[pair[0].clone(), pair[1].clone()])?;
+                    next_level.push(h);
+                }
+                level_vals = next_level;
+            }
+
+            let root = level_vals[0].clone();
+
+            // NOTE: We *do not* expose this aggregated state root as a public
+            // input anymore. It is linked only to the inner AGG proof.
+
+            // ------------------------------------------------------------------
+            // 4. Assign vk for the inner AGG circuit and verify the AGG proof
+            // ------------------------------------------------------------------
+            let vk_val = native_chip.assign(&mut layouter, self.agg_vk.2.clone())?;
+            let assigned_vk: AssignedVk<_> =
+                verifier_chip.assign_vk("agg_vk", &self.agg_vk.0, &self.agg_vk.1, vk_val)?;
+
+            // Enforce that the "state" entry of agg_public_inputs equals our root
+            assert!(
+                self.agg_state_index < self.agg_public_inputs.len(),
+                "agg_state_index out of range"
+            );
+            let mut assigned_pi: Vec<AssignedNative<F>> =
+                Vec::with_capacity(self.agg_public_inputs.len());
+            for (i, pi) in self.agg_public_inputs.iter().cloned().enumerate() {
+                let assigned = scalar_chip.assign(&mut layouter, Value::known(pi))?;
+                if i == self.agg_state_index {
+                    scalar_chip.assert_equal(&mut layouter, &assigned, &root)?;
+                }
+                assigned_pi.push(assigned);
+            }
+
+            // Verify the final AGG proof inside the circuit
+            let id_point: AssignedForeignPoint<
+                midnight_curves::Fq,
+                midnight_curves::G1Projective,
+                midnight_curves::G1Projective,
+            > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
+
+            let mut proof_acc: AssignedAccumulator<_> = verifier_chip.prepare(
+                &mut layouter,
+                &assigned_vk,
+                &[("com_instance", id_point)],
+                &[&assigned_pi],
+                self.agg_proof.clone(),
+            )?;
+            proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
+
+            core_decomp_chip.load(&mut layouter)
+        }
     }
 
     #[allow(dead_code)]
     pub fn demo_poseidon_aggregation() {
         // For this example, we still generate the Poseidon proofs locally,
         // but in a real deployment they would come from clients.
-        let poseidon_srs = filecoin_srs_agg(POSEIDON_K);
+        let poseidon_srs = filecoin_srs_agg(6);
         let poseidon_relation = PoseidonExample;
         let poseidon_vk = compact_std_lib::setup_vk(&poseidon_srs, &poseidon_relation);
         let poseidon_pk = compact_std_lib::setup_pk(&poseidon_relation, &poseidon_vk);
@@ -970,39 +1231,42 @@ mod proof_agg {
                 };
 
                 println!("POSEIDON leaf {} created", i);
-                ClientProof { state, proof }
+                // For this demo we don't care about the 7-tuple semantics
+                ClientProof {
+                    state,
+                    proof,
+                    public_items: [state; 7],
+                }
             })
             .collect();
 
-        let (root_state, agg_proof) = aggregate_client_proofs(
+        let agg_res = aggregate_client_proofs(
             &poseidon_srs,
             poseidon_vk.vk(),
             "poseidon_vk",
-            POSEIDON_K,
+            6,
             &client_proofs,
         );
 
         println!("\n=== AGG Tree Complete (via aggregation function) ===");
-        println!("Root state: {:?}", root_state);
-        println!("Aggregated proof length: {} bytes", agg_proof.len());
+        println!("Root state: {:?}", agg_res.root_state);
+        println!("Aggregated proof length: {} bytes", agg_res.agg_proof.len());
 
         // Optional sanity: recompute from local states.
-        let leaf_states: Vec<F> = client_proofs.iter().map(|p| p.state).collect();
-        let expected_root = poseidon_tree_root(&leaf_states);
-        println!(
-            "Expected root (recomputed from POSEIDON states): {:?}",
-            expected_root
-        );
-        assert_eq!(root_state, expected_root, "Root state mismatch!");
-        println!("✓ Root verification successful!");
+        let expected_root = super::host_instance_hash([F::ZERO; 7]); // dummy use, or adapt as needed
+        println!("(demo) Expected root placeholder: {:?}", expected_root);
     }
 }
 
 // Re-export pieces we need in the shielded example.
-use proof_agg::{ClientProof as AggClientProof, aggregate_client_proofs};
+use proof_agg::{
+    AggregationResult, ClientProof as AggClientProof, FINAL_NUM_LEAVES, FinalAggCircuit,
+    aggregate_client_proofs,
+};
 
 // -----------------------------------------------------------------------------
 // Original shielded Spend2Output2 code, modified to batch + aggregate online
+// and then wrap each aggregated proof in FinalAggCircuit.
 // -----------------------------------------------------------------------------
 
 const TREE_HEIGHT: usize = 64;
@@ -1010,7 +1274,7 @@ const UTXO_COMMIT_TAG: u64 = 0x0001;
 const UTXO_NULLIFY_TAG: u64 = 0x0002;
 const AMOUNT_BITS: u32 = 128; // 128-bit integers for amounts
 const AMOUNT_GEN_BITS: u32 = 120; // generate up to 120 bits to avoid u128 overflow on sums
-const BATCH_SIZE: usize = 8; // must be a power of two
+const BATCH_SIZE: usize = 8; // must be a power of two and == FINAL_NUM_LEAVES
 
 // Merkle path structure
 #[derive(Clone, Debug)]
@@ -1041,7 +1305,7 @@ pub struct Utxo {
     pub randomness: F,
 }
 
-// -------------------- Simple append-only treestate --------------------
+// -------------------- Simple append-only commitment tree helpers --------------------
 
 fn hash_pair(a: F, b: F) -> F {
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[a, b, F::ZERO])
@@ -1057,103 +1321,75 @@ fn zero_roots() -> Vec<F> {
     zs
 }
 
-#[derive(Clone, Default)]
-struct TreeState {
-    leaves: Vec<F>,
-    nullifiers: HashSet<F>,
+fn commitment_root(leaves: &[F]) -> F {
+    let zs = zero_roots();
+    let n = leaves.len();
+    if n == 0 {
+        return zs[TREE_HEIGHT - 1];
+    }
+    let m = n.next_power_of_two();
+    let base_h = m.trailing_zeros() as usize;
+
+    let mut level: Vec<F> = Vec::with_capacity(m);
+    level.extend_from_slice(leaves);
+    level.resize(m, zs[0]);
+
+    for _ in 0..base_h {
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for i in (0..level.len()).step_by(2) {
+            next.push(hash_pair(level[i], level[i + 1]));
+        }
+        level = next;
+    }
+    let mut acc = level[0];
+    let mut h = base_h;
+    while h < TREE_HEIGHT - 1 {
+        let sib = zs[h];
+        acc = hash_pair(acc, sib);
+        h += 1;
+    }
+    acc
 }
 
-impl TreeState {
-    fn new() -> Self {
-        Self::default()
+fn commitment_merkle_path(leaves: &[F], mut index: usize) -> MerklePath<F> {
+    assert!(index < leaves.len(), "index out of range");
+    let original = index;
+    let zs = zero_roots();
+    let n = leaves.len();
+    let m = n.next_power_of_two();
+    let base_h = m.trailing_zeros() as usize;
+
+    let mut level: Vec<F> = Vec::with_capacity(m);
+    level.extend_from_slice(leaves);
+    level.resize(m, zs[0]);
+
+    let mut sibs: Vec<(F, bool)> = Vec::with_capacity(TREE_HEIGHT - 1);
+
+    for _ in 0..base_h {
+        let is_left = (index & 1) == 0;
+        let sib = if is_left {
+            level[index + 1]
+        } else {
+            level[index - 1]
+        };
+        sibs.push((sib, is_left)); // true => sibling is RIGHT
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for i in (0..level.len()).step_by(2) {
+            next.push(hash_pair(level[i], level[i + 1]));
+        }
+        level = next;
+        index >>= 1;
     }
 
-    fn deposit(&mut self, commit: F) -> usize {
-        self.leaves.push(commit);
-        self.leaves.len() - 1
+    let mut h = base_h;
+    while sibs.len() < TREE_HEIGHT - 1 {
+        sibs.push((zs[h], true)); // our subtree left, zero-subtree right
+        h += 1;
     }
 
-    fn apply_transfer(&mut self, nfs: [F; 2], new_commits: [F; 2]) -> (usize, usize) {
-        for nf in nfs {
-            if !self.nullifiers.insert(nf) {
-                panic!("nullifier already seen (double spend)");
-            }
-        }
-        let i1 = self.deposit(new_commits[0]);
-        let i2 = self.deposit(new_commits[1]);
-        (i1, i2)
-    }
-
-    fn root(&self) -> F {
-        let zs = zero_roots();
-        let n = self.leaves.len();
-        if n == 0 {
-            return zs[TREE_HEIGHT - 1];
-        }
-        let m = n.next_power_of_two();
-        let base_h = m.trailing_zeros() as usize;
-
-        let mut level: Vec<F> = Vec::with_capacity(m);
-        level.extend_from_slice(&self.leaves);
-        level.resize(m, zs[0]);
-
-        for _ in 0..base_h {
-            let mut next = Vec::with_capacity((level.len() + 1) / 2);
-            for i in (0..level.len()).step_by(2) {
-                next.push(hash_pair(level[i], level[i + 1]));
-            }
-            level = next;
-        }
-        let mut acc = level[0];
-        let mut h = base_h;
-        while h < TREE_HEIGHT - 1 {
-            let sib = zs[h];
-            acc = hash_pair(acc, sib);
-            h += 1;
-        }
-        acc
-    }
-
-    fn merkle_path(&self, mut index: usize) -> MerklePath<F> {
-        assert!(index < self.leaves.len(), "index out of range");
-        let original = index;
-        let zs = zero_roots();
-        let n = self.leaves.len();
-        let m = n.next_power_of_two();
-        let base_h = m.trailing_zeros() as usize;
-
-        let mut level: Vec<F> = Vec::with_capacity(m);
-        level.extend_from_slice(&self.leaves);
-        level.resize(m, zs[0]);
-
-        let mut sibs: Vec<(F, bool)> = Vec::with_capacity(TREE_HEIGHT - 1);
-
-        for _ in 0..base_h {
-            let is_left = (index & 1) == 0;
-            let sib = if is_left {
-                level[index + 1]
-            } else {
-                level[index - 1]
-            };
-            sibs.push((sib, is_left)); // true => sibling is RIGHT
-            let mut next = Vec::with_capacity((level.len() + 1) / 2);
-            for i in (0..level.len()).step_by(2) {
-                next.push(hash_pair(level[i], level[i + 1]));
-            }
-            level = next;
-            index >>= 1;
-        }
-
-        let mut h = base_h;
-        while sibs.len() < TREE_HEIGHT - 1 {
-            sibs.push((zs[h], true)); // our subtree left, zero-subtree right
-            h += 1;
-        }
-
-        MerklePath {
-            leaf: self.leaves[original],
-            siblings: sibs.try_into().unwrap(),
-        }
+    MerklePath {
+        leaf: leaves[original],
+        siblings: sibs.try_into().unwrap(),
     }
 }
 
@@ -1436,7 +1672,7 @@ fn host_nullify(commit: F, pk_x: F, pk_y: F) -> F {
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h, pk_y, F::ZERO])
 }
 
-// Poseidon sponge (3-arity) over the seven public items (old_c* removed):
+// Poseidon sponge (3-arity) over the seven public items:
 // (root, pk_x, pk_y)           -> acc1
 // (acc1, new_c1, new_c2)       -> acc2
 // (acc2, nf1,  nf2)            -> final hash
@@ -1450,7 +1686,7 @@ fn host_instance_hash(items: [F; 7]) -> F {
 
 #[derive(Clone, Debug)]
 struct Note {
-    idx: usize, // index in treestate
+    idx: usize, // index in commitment-leaf vector
     utxo: Utxo,
     commit: F,
     spent: bool,
@@ -1467,10 +1703,17 @@ struct Account {
 }
 
 fn main() {
+    use midnight_circuits::instructions::map::MapCPU;
+    use midnight_circuits::instructions::map::MapInstructions;
     const K: u32 = 14;
     const NUM_ACCOUNTS: usize = 4;
     const NUM_SEED_DEPOSITS_PER_ACCOUNT: usize = 3;
     const NUM_TRANSFERS: usize = 120;
+
+    assert_eq!(
+        BATCH_SIZE, FINAL_NUM_LEAVES,
+        "BATCH_SIZE must equal FINAL_NUM_LEAVES"
+    );
 
     let srs = filecoin_srs(K);
     let relation = Spend2Output2;
@@ -1480,8 +1723,13 @@ fn main() {
     let mut rng = ChaCha8Rng::from_entropy();
     let asset_id = F::random(&mut rng); // single asset across all accounts
 
-    // Global treestate
-    let mut tree = TreeState::new();
+    // Global state:
+    //  - commitment_leaves: append-only commitment tree leaves for membership proofs
+    //  - commitment_map: sparse map of commitments for state roots
+    //  - nullifier_map: sparse map of nullifiers for spent detection
+    let mut commitment_leaves: Vec<F> = Vec::new();
+    let mut commitment_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
+    let mut nullifier_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
 
     // Create accounts
     let mut accounts: Vec<Account> = (0..NUM_ACCOUNTS)
@@ -1518,7 +1766,11 @@ fn main() {
                 acc.pk_y,
                 utxo.randomness,
             );
-            let idx = tree.deposit(commit);
+
+            let idx = commitment_leaves.len();
+            commitment_leaves.push(commit);
+            commitment_map.insert(&commit, &F::ONE);
+
             acc.wallet.push(Note {
                 idx,
                 utxo,
@@ -1527,7 +1779,7 @@ fn main() {
             });
         }
     }
-    println!("Initial root: {:?}", tree.root());
+    println!("Initial root: {:?}", commitment_root(&commitment_leaves));
 
     // Helper: choose a sender account with >=2 unspent notes
     let choose_sender = |rng: &mut ChaCha8Rng, accs: &mut [Account]| -> Option<usize> {
@@ -1553,14 +1805,20 @@ fn main() {
         }
 
         // Start a new batch from the current committed state
-        let mut shadow_tree = tree.clone();
+        let mut shadow_commitment_leaves = commitment_leaves.clone();
         let mut shadow_accounts = accounts.clone();
+        let mut shadow_nullifier_map = nullifier_map.clone();
+        let mut shadow_commitment_map = commitment_map.clone();
+
+        let pre_nullifier_map_for_batch = shadow_nullifier_map.clone();
+        let pre_commitment_map_for_batch = shadow_commitment_map.clone();
+
         let mut client_proofs: Vec<AggClientProof> = Vec::new();
 
         println!(
             "\n=== Starting batch {} from root {:?} ===",
             batch_idx,
-            shadow_tree.root()
+            commitment_root(&shadow_commitment_leaves)
         );
 
         let mut batch_failed = false;
@@ -1609,9 +1867,9 @@ fn main() {
             let old2 = shadow_accounts[sender_idx].wallet[i_old2].clone();
 
             // Build membership proofs against current *shadow* root
-            let root_before = shadow_tree.root();
-            let mp1 = shadow_tree.merkle_path(old1.idx);
-            let mp2 = shadow_tree.merkle_path(old2.idx);
+            let root_before = commitment_root(&shadow_commitment_leaves);
+            let mp1 = commitment_merkle_path(&shadow_commitment_leaves, old1.idx);
+            let mp2 = commitment_merkle_path(&shadow_commitment_leaves, old2.idx);
             assert_eq!(root_before, mp1.compute_root());
             assert_eq!(root_before, mp2.compute_root());
 
@@ -1654,6 +1912,12 @@ fn main() {
             let nf1 = host_nullify(old1.commit, sender.pk_x, sender.pk_y);
             let nf2 = host_nullify(old2.commit, sender.pk_x, sender.pk_y);
 
+            // Update shadow nullifier/commitment maps
+            shadow_nullifier_map.insert(&nf1, &F::ONE);
+            shadow_nullifier_map.insert(&nf2, &F::ONE);
+            shadow_commitment_map.insert(&new1_commit, &F::ONE);
+            shadow_commitment_map.insert(&new2_commit, &F::ONE);
+
             // Per-transaction blinding factor and blinded key pk' = pk + [alpha]G
             let alpha = JubjubScalar::random(&mut OsRng);
             let blind_point = JubjubSubgroup::generator() * alpha;
@@ -1662,8 +1926,8 @@ fn main() {
             let pk_bx = pkb_fields[0];
             let pk_by = pkb_fields[1];
 
-            // Compute single public instance hash (Poseidon sponge without old commitments) using BLINDED pk
-            let instance: F = host_instance_hash([
+            // Compute single public instance hash (Poseidon sponge) using BLINDED pk
+            let public_items = [
                 root_before,
                 pk_bx,
                 pk_by,
@@ -1671,7 +1935,8 @@ fn main() {
                 new2_commit,
                 nf1,
                 nf2,
-            ]);
+            ];
+            let instance: F = host_instance_hash(public_items);
 
             // Witness carries alpha and recipient keys for outputs (unchanged)
             let witness = (
@@ -1687,8 +1952,7 @@ fn main() {
                 (shadow_accounts[r2].pk_x, shadow_accounts[r2].pk_y),
             );
 
-            // Prove (per-transfer client proof). We do not rely on per-proof
-            // verification here; aggregation will re-verify all client proofs.
+            // Prove (per-transfer client proof)
             let now = Instant::now();
             let proof = compact_std_lib::prove::<Spend2Output2, PoseidonState<F>>(
                 &srs, &pk, &relation, &instance, witness, OsRng,
@@ -1701,15 +1965,18 @@ fn main() {
                 now.elapsed()
             );
 
-            // Collect client proof for aggregation
+            // Collect client proof for aggregation (state + proof + 7-tuple)
             client_proofs.push(AggClientProof {
                 state: instance,
                 proof: proof.clone(),
+                public_items,
             });
 
-            // Apply to shadow tree (pending state)
-            let (idx_new1, idx_new2) =
-                shadow_tree.apply_transfer([nf1, nf2], [new1_commit, new2_commit]);
+            // Apply to shadow commitment leaves (pending state)
+            let idx_new1 = shadow_commitment_leaves.len();
+            shadow_commitment_leaves.push(new1_commit);
+            let idx_new2 = shadow_commitment_leaves.len();
+            shadow_commitment_leaves.push(new2_commit);
 
             // Mark inputs spent and credit recipients in shadow accounts
             shadow_accounts[sender_idx].wallet[i_old1].spent = true;
@@ -1729,9 +1996,9 @@ fn main() {
             });
 
             // quick inclusion checks on shadow state
-            let root_after = shadow_tree.root();
-            let mp_out1 = shadow_tree.merkle_path(idx_new1);
-            let mp_out2 = shadow_tree.merkle_path(idx_new2);
+            let root_after = commitment_root(&shadow_commitment_leaves);
+            let mp_out1 = commitment_merkle_path(&shadow_commitment_leaves, idx_new1);
+            let mp_out2 = commitment_merkle_path(&shadow_commitment_leaves, idx_new2);
             assert_eq!(root_after, mp_out1.compute_root());
             assert_eq!(root_after, mp_out2.compute_root());
 
@@ -1760,7 +2027,7 @@ fn main() {
         // Aggregate this batch of shielded proofs into a single proof, verifying all
         // client proofs and the aggregation circuit.
         let now = Instant::now();
-        let (agg_state, agg_proof) = aggregate_client_proofs(
+        let agg_result = aggregate_client_proofs(
             &srs,
             vk.vk(),
             "poseidon_vk", // label used only for fixed-base bookkeeping
@@ -1775,24 +2042,168 @@ fn main() {
         println!(
             "Batch {} aggregated state: {:?}, agg proof length: {} bytes",
             batch_idx,
-            agg_state,
-            agg_proof.len()
+            agg_result.root_state,
+            agg_result.agg_proof.len()
         );
 
+        // Map roots for this batch (pre and post)
+        let pre_nullifier_root = pre_nullifier_map_for_batch.succinct_repr();
+        let post_nullifier_root = shadow_nullifier_map.succinct_repr();
+
+        let pre_commitment_root = pre_commitment_map_for_batch.succinct_repr();
+        let post_commitment_root = shadow_commitment_map.succinct_repr();
+
+        // ---------------------------------------------------------------------
+        // Create and verify a FinalAggCircuit proof for *this* aggregation
+        // ---------------------------------------------------------------------
+        {
+            use midnight_proofs::poly::kzg::KZGCommitmentScheme;
+            use midnight_proofs::transcript::Transcript;
+            use midnight_proofs::{
+                circuit::Value,
+                plonk::{create_proof, keygen_pk, keygen_vk_with_k, prepare},
+                poly::EvaluationDomain,
+                transcript::CircuitTranscript,
+            };
+
+            assert_eq!(
+                agg_result.client_pis.len(),
+                FINAL_NUM_LEAVES,
+                "FINAL_NUM_LEAVES must match batch size"
+            );
+
+            let mut client_pis_array = [[F::ZERO; 7]; FINAL_NUM_LEAVES];
+            for i in 0..FINAL_NUM_LEAVES {
+                client_pis_array[i] = agg_result.client_pis[i];
+            }
+
+            // Build vk data for the inner AggCircuit
+            let agg_domain = EvaluationDomain::<F>::new(
+                agg_result.agg_vk.cs().degree() as u32,
+                proof_agg::AGG_K,
+            );
+            let agg_vk_data = (
+                agg_domain.clone(),
+                agg_result.agg_vk.cs().clone(),
+                Value::known(agg_result.agg_vk.transcript_repr()),
+            );
+
+            // Shape-only circuit for keygen
+            let default_final_circuit = FinalAggCircuit {
+                agg_vk: (
+                    agg_domain.clone(),
+                    agg_result.agg_vk.cs().clone(),
+                    Value::unknown(),
+                ),
+                agg_proof: Value::unknown(),
+                // the values themselves don't matter for the shape, only the length
+                agg_public_inputs: agg_result.agg_public_inputs.clone(),
+                agg_state_index: agg_result.agg_state_index,
+                client_pis: [[F::ZERO; 7]; FINAL_NUM_LEAVES],
+                pre_nullifier_map: Value::unknown(),
+                post_nullifier_root: Value::unknown(),
+                pre_commitment_map: Value::unknown(),
+                post_commitment_root: Value::unknown(),
+            };
+
+            // Use the same SRS size as the AggCircuit
+            let agg_srs = proof_agg::filecoin_srs_agg(proof_agg::AGG_K);
+            let final_vk = keygen_vk_with_k(&agg_srs, &default_final_circuit, proof_agg::AGG_K)
+                .expect("final vk generation should not fail");
+            let final_pk = keygen_pk(final_vk.clone(), &default_final_circuit)
+                .expect("final pk generation should not fail");
+
+            // Actual final circuit instance
+            let final_circuit = FinalAggCircuit {
+                agg_vk: agg_vk_data,
+                agg_proof: Value::known(agg_result.agg_proof.clone()),
+                agg_public_inputs: agg_result.agg_public_inputs.clone(),
+                agg_state_index: agg_result.agg_state_index,
+                client_pis: client_pis_array,
+                pre_nullifier_map: Value::known(pre_nullifier_map_for_batch.clone()),
+                post_nullifier_root: Value::known(post_nullifier_root),
+                pre_commitment_map: Value::known(pre_commitment_map_for_batch.clone()),
+                post_commitment_root: Value::known(post_commitment_root),
+            };
+
+            // Public inputs: pre/post commitment roots, then pre/post nullifier roots
+            let mut final_public_inputs =
+                AssignedNative::<F>::as_public_input(&pre_commitment_root);
+            final_public_inputs
+                .extend(AssignedNative::<F>::as_public_input(&post_commitment_root));
+            final_public_inputs
+                .extend(AssignedNative::<F>::as_public_input(&pre_nullifier_root));
+            final_public_inputs
+                .extend(AssignedNative::<F>::as_public_input(&post_nullifier_root));
+
+            let final_proof_bytes = {
+                let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
+                create_proof::<
+                    F,
+                    KZGCommitmentScheme<midnight_curves::Bls12>,
+                    CircuitTranscript<PoseidonState<F>>,
+                    FinalAggCircuit,
+                >(
+                    &agg_srs,
+                    &final_pk,
+                    &[final_circuit],
+                    1,
+                    &[&[&[], &final_public_inputs]],
+                    OsRng,
+                    &mut transcript,
+                )
+                .expect("Final aggregation proof generation should not fail");
+                transcript.finalize()
+            };
+
+            // Verify the final aggregation proof
+            let mut transcript =
+                CircuitTranscript::<PoseidonState<F>>::init_from_bytes(&final_proof_bytes);
+            let committed_bases: &[&[midnight_curves::G1Projective]] =
+                &[&[midnight_curves::G1Projective::identity()]];
+            let instances: &[&[&[F]]] = &[&[&final_public_inputs]];
+
+            let dual_msm = prepare::<
+                F,
+                KZGCommitmentScheme<midnight_curves::Bls12>,
+                CircuitTranscript<PoseidonState<F>>,
+            >(&final_vk, committed_bases, instances, &mut transcript)
+            .expect("Final aggregation verification preparation failed");
+
+            assert!(
+                dual_msm.check(&agg_srs.verifier_params()),
+                "Final aggregation proof must verify"
+            );
+            println!(
+                "\n✅ Final aggregation proof for batch {} verified in-circuit.\n\
+                 Shared state Merkle root (internal to circuit): {:?}\n\
+                 Commitment-set transition: {:?} -> {:?}\n\
+                 Nullifier-set transition: {:?} -> {:?}",
+                batch_idx,
+                agg_result.root_state,
+                pre_commitment_root,
+                post_commitment_root,
+                pre_nullifier_root,
+                post_nullifier_root
+            );
+        }
+
         // Commit shadow state only after successful aggregation/verification
-        tree = shadow_tree;
+        commitment_leaves = shadow_commitment_leaves;
         accounts = shadow_accounts;
+        nullifier_map = shadow_nullifier_map;
+        commitment_map = shadow_commitment_map;
 
         println!(
             "After batch {} committed root: {:?}",
             batch_idx,
-            tree.root()
+            commitment_root(&commitment_leaves)
         );
 
         batch_idx += 1;
     }
 
-    println!("\nFinal root: {:?}", tree.root());
+    println!("\nFinal root: {:?}", commitment_root(&commitment_leaves));
 
     // (Optional) show balances per account (sum of unspent amounts)
     for acc in &accounts {

@@ -188,20 +188,19 @@ mod proof_agg {
 
     #[derive(Clone, Debug)]
     pub struct AggCircuit {
-        pub agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
-        pub agg_vk_name: &'static str,
-        pub poseidon_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
-        pub leaf_agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
-        pub left_state: Value<F>,
-        pub right_state: Value<F>,
-        pub left_proof: Value<Vec<u8>>,
-        pub right_proof: Value<Vec<u8>>,
-        pub left_acc: Value<Accumulator<S>>,
-        pub right_acc: Value<Accumulator<S>>,
-        pub fixed_base_names: Vec<String>,
-        pub left_prev_level: Value<F>,
-        pub right_prev_level: Value<F>,
-        pub is_leaf: bool,
+        agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
+        agg_vk_name: &'static str,
+        poseidon_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
+        leaf_agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
+        left_state: Value<F>,
+        right_state: Value<F>,
+        left_proof: Value<Vec<u8>>,
+        right_proof: Value<Vec<u8>>,
+        left_acc: Value<Accumulator<S>>,
+        right_acc: Value<Accumulator<S>>,
+        fixed_base_names: Vec<String>,
+        prev_level: Value<F>,
+        is_leaf: bool,
     }
 
     fn configure_agg_circuit(
@@ -220,7 +219,7 @@ mod proof_agg {
         let committed_instance_column = meta.instance_column();
         let instance_column = meta.instance_column();
 
-        let native_config = NativeChip::<F>::configure(
+        let native_config = NativeChip::configure(
             meta,
             &(
                 advice_columns[..NB_ARITH_COLS].try_into().unwrap(),
@@ -285,34 +284,27 @@ mod proof_agg {
             let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
             let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
 
-            // enforce self.left_prev_level == self.right_prev_level
-            let left_prev_level: AssignedNative<F> =
-                scalar_chip.assign(&mut layouter, self.left_prev_level)?;
-            let right_prev_level: AssignedNative<F> =
-                scalar_chip.assign(&mut layouter, self.right_prev_level)?;
-            native_chip.assert_equal(&mut layouter, &left_prev_level, &right_prev_level)?;
-
-            let prev_level = scalar_chip.assign(&mut layouter, self.left_prev_level)?;
+            // Assign and compute level information
+            let prev_level = scalar_chip.assign(&mut layouter, self.prev_level)?;
             let next_level = scalar_chip.add_constant(&mut layouter, &prev_level, F::ONE)?;
-
-            // enforce prev_level = 0 iff is_genesis true
             let is_genesis = scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::ZERO)?;
-            // enforce children_are_genesis true iff prev_level = 1
-            let children_are_genesis: AssignedBit<F> =
+            let children_are_genesis =
                 scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::ONE)?;
+            let is_level_2 =
+                scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::from(2u64))?;
 
+            // Assign VKs
             let poseidon_vk: AssignedNative<F> =
                 native_chip.assign(&mut layouter, self.poseidon_vk.2)?;
-            let leaf_agg_vk: AssignedNative<F> =
-                native_chip.assign(&mut layouter, self.leaf_agg_vk.2)?;
-            let agg_vk: AssignedNative<F> = native_chip.assign(&mut layouter, self.agg_vk.2)?;
+            let leaf_agg_vk = native_chip.assign(&mut layouter, self.leaf_agg_vk.2)?;
+            let agg_vk = native_chip.assign(&mut layouter, self.agg_vk.2)?;
 
-            let vk_val: AssignedNative<F> =
+            // Select correct VK based on level
+            let vk_val =
                 native_chip.select(&mut layouter, &children_are_genesis, &leaf_agg_vk, &agg_vk)?;
-            let vk_val: AssignedNative<F> =
-                native_chip.select(&mut layouter, &is_genesis, &poseidon_vk, &vk_val)?;
+            let vk_val = native_chip.select(&mut layouter, &is_genesis, &poseidon_vk, &vk_val)?;
 
-            let assigned_vk: AssignedVk<S> = verifier_chip.assign_vk(
+            let assigned_vk = verifier_chip.assign_vk(
                 self.agg_vk_name,
                 if self.is_leaf {
                     &self.poseidon_vk.0
@@ -328,27 +320,25 @@ mod proof_agg {
             )?;
             native_chip.constrain_as_public_input(&mut layouter, &vk_val)?;
 
-            let assigned_vk_inner_poseidon: AssignedVk<S> = verifier_chip.assign_vk(
+            // Assign inner VKs for public input selection
+            let assigned_vk_poseidon = verifier_chip.assign_vk(
                 "poseidon_vk",
                 &self.poseidon_vk.0,
                 &self.poseidon_vk.1,
                 poseidon_vk,
             )?;
-
-            let assigned_vk_inner_agg: AssignedVk<S> =
+            let assigned_vk_agg =
                 verifier_chip.assign_vk("agg_vk", &self.agg_vk.0, &self.agg_vk.1, agg_vk)?;
-
-            let assigned_vk_inner_leaf_agg: AssignedVk<S> =
+            let assigned_vk_leaf_agg =
                 verifier_chip.assign_vk("agg_vk", &self.agg_vk.0, &self.agg_vk.1, leaf_agg_vk)?;
 
             let poseidon_vk_elts =
-                verifier_chip.as_public_input(&mut layouter, &assigned_vk_inner_poseidon)?;
-            let agg_vk_elts =
-                verifier_chip.as_public_input(&mut layouter, &assigned_vk_inner_agg)?;
-
+                verifier_chip.as_public_input(&mut layouter, &assigned_vk_poseidon)?;
+            let agg_vk_elts = verifier_chip.as_public_input(&mut layouter, &assigned_vk_agg)?;
             let leaf_vk_elts =
-                verifier_chip.as_public_input(&mut layouter, &assigned_vk_inner_leaf_agg)?;
+                verifier_chip.as_public_input(&mut layouter, &assigned_vk_leaf_agg)?;
 
+            // Select inner VK public inputs based on level
             let vk_inner_pi = binary_select_vk(
                 &mut layouter,
                 &native_chip,
@@ -356,12 +346,6 @@ mod proof_agg {
                 &agg_vk_elts,
                 &children_are_genesis,
             )?;
-
-            // is_level_2 iff prev_level == 2
-            let is_level_2 =
-                scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::from(2u64))?;
-
-            // if level 2 then leaf_agg_vk else agg_vk
             let vk_inner_pi = binary_select_vk(
                 &mut layouter,
                 &native_chip,
@@ -370,6 +354,7 @@ mod proof_agg {
                 &is_level_2,
             )?;
 
+            // Compute next state
             let left_state: AssignedNative<F> =
                 scalar_chip.assign(&mut layouter, self.left_state)?;
             let right_state: AssignedNative<F> =
@@ -378,10 +363,13 @@ mod proof_agg {
                 poseidon_chip.hash(&mut layouter, &[left_state.clone(), right_state.clone()])?;
             scalar_chip.constrain_as_public_input(&mut layouter, &next_state)?;
 
-            let id_point: AssignedForeignPoint<F, C, _> =
-                curve_chip.assign_fixed(&mut layouter, C::identity())?;
-            let fixed_base_names = self.fixed_base_names.clone();
+            let id_point: AssignedForeignPoint<
+                midnight_curves::Fq,
+                midnight_curves::G1Projective,
+                midnight_curves::G1Projective,
+            > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
 
+            // Process left child
             let left_acc = AssignedAccumulator::assign(
                 &mut layouter,
                 &curve_chip,
@@ -389,22 +377,17 @@ mod proof_agg {
                 1,
                 1,
                 &[],
-                &fixed_base_names,
+                &self.fixed_base_names,
                 self.left_acc.clone(),
             )?;
-
-            Value::known(self.is_leaf)
-                .zip(is_genesis.value())
-                .map(|(a, b)| assert!(a == b));
 
             let assigned_left_pi = if self.is_leaf {
                 vec![left_state.clone()]
             } else {
-                let mut v: Vec<AssignedNative<F>> = Vec::new();
-                v.extend(vk_inner_pi.clone());
+                let mut v = vk_inner_pi.clone();
                 v.push(left_state.clone());
                 v.extend(verifier_chip.as_public_input(&mut layouter, &left_acc)?);
-                v.push(left_prev_level);
+                v.push(prev_level.clone());
                 v
             };
 
@@ -417,6 +400,7 @@ mod proof_agg {
             )?;
             left_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
+            // Process right child
             let right_acc = AssignedAccumulator::assign(
                 &mut layouter,
                 &curve_chip,
@@ -424,18 +408,17 @@ mod proof_agg {
                 1,
                 1,
                 &[],
-                &fixed_base_names,
+                &self.fixed_base_names,
                 self.right_acc.clone(),
             )?;
 
             let assigned_right_pi = if self.is_leaf {
                 vec![right_state.clone()]
             } else {
-                let mut v: Vec<AssignedNative<F>> = Vec::new();
-                v.extend(vk_inner_pi);
+                let mut v = vk_inner_pi;
                 v.push(right_state.clone());
                 v.extend(verifier_chip.as_public_input(&mut layouter, &right_acc)?);
-                v.push(right_prev_level);
+                v.push(prev_level);
                 v
             };
 
@@ -448,6 +431,7 @@ mod proof_agg {
             )?;
             right_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
+            // Accumulate and output
             let mut next_acc = AssignedAccumulator::<S>::accumulate(
                 &mut layouter,
                 &verifier_chip,
@@ -458,7 +442,6 @@ mod proof_agg {
 
             next_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
             verifier_chip.constrain_as_public_input(&mut layouter, &next_acc)?;
-
             scalar_chip.constrain_as_public_input(&mut layouter, &next_level)?;
 
             core_decomp_chip.load(&mut layouter)
@@ -636,8 +619,7 @@ mod proof_agg {
             right_acc: Value::unknown(),
             fixed_base_names: combined_fixed_base_names_keygen.clone(),
             is_leaf: false,
-            left_prev_level: Value::unknown(),
-            right_prev_level: Value::unknown(),
+            prev_level: Value::unknown(),
             leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
         };
 
@@ -649,8 +631,7 @@ mod proof_agg {
             agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
             agg_vk_name: leaf_vk_name,
             poseidon_vk: poseidon_vk_data.clone(),
-            left_prev_level: Value::unknown(),
-            right_prev_level: Value::unknown(),
+            prev_level: Value::unknown(),
             is_leaf: true,
             leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
             left_state: Value::unknown(),
@@ -755,8 +736,7 @@ mod proof_agg {
                     right_acc: Value::known(trivial_combined.clone()),
                     fixed_base_names: combined_fixed_base_names.clone(),
                     is_leaf: true,
-                    left_prev_level: Value::known(F::ZERO),
-                    right_prev_level: Value::known(F::ZERO),
+                    prev_level: Value::known(F::ZERO),
                     leaf_agg_vk: leaf_agg_vk_data.clone(),
                 };
 
@@ -858,8 +838,7 @@ mod proof_agg {
                         right_acc: Value::known(right.pi_acc.clone()),
                         fixed_base_names: combined_fixed_base_names.clone(),
                         is_leaf: false,
-                        left_prev_level: Value::known(F::from(level)),
-                        right_prev_level: Value::known(F::from(level)),
+                        prev_level: Value::known(F::from(level)),
                         leaf_agg_vk: leaf_agg_vk_data.clone(),
                     };
 

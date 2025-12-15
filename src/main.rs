@@ -33,7 +33,7 @@ mod proof_agg {
     use halo2curves::{ff::Field, group::Group};
     use midnight_circuits::compact_std_lib::MidnightCircuit;
     use midnight_circuits::hash::poseidon::PoseidonState;
-    use midnight_circuits::types::{AssignedBit, AssignedForeignPoint, InnerValue};
+    use midnight_circuits::types::{AssignedBit, AssignedForeignPoint};
     use midnight_circuits::{
         compact_std_lib::{self, Relation, ZkStdLib, ZkStdLibArch},
         ecc::{
@@ -1245,6 +1245,8 @@ impl Relation for Spend2Output2 {
         // Nullifiers (BOUND TO UNBLINDED sender pk to prevent double-spends)
         let nf1 = compute_nullifier(std_lib, layouter, &old_c1, &pk_sx, &pk_sy)?;
         let nf2 = compute_nullifier(std_lib, layouter, &old_c2, &pk_sx, &pk_sy)?;
+        // ensure nf1 != nf2
+        std_lib.assert_not_equal(layouter, &nf1, &nf2)?;
 
         // New outputs: use provided recipient (pk_out*) coordinates (assigned once)
         let pk1x = std_lib.assign(layouter, pk1x_val)?;

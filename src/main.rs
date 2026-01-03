@@ -11,7 +11,7 @@ use midnight_circuits::{
     instructions::{
         AssertionInstructions, AssignmentInstructions, ControlFlowInstructions,
         ConversionInstructions, DecompositionInstructions, EccInstructions,
-        PublicInputInstructions, hash::HashCPU,
+        PublicInputInstructions, hash::HashCPU, map::MapInstructions,
     },
     map::cpu::MapMt,
     types::{AssignedBit, AssignedNative, AssignedNativePoint, Instantiable},
@@ -1462,6 +1462,7 @@ mod proof_agg {
 }
 
 // Re-export pieces we need in the shielded example.
+use midnight_circuits::instructions::map::MapCPU;
 use proof_agg::{
     AggAccumulator, ClientProof as AggClientProof, FINAL_NUM_LEAVES, FinalAggCircuit,
     accumulator_as_public_input, aggregate_client_proofs,
@@ -1470,37 +1471,15 @@ use proof_agg::{
 use crate::proof_agg::filecoin_srs_agg;
 
 // -----------------------------------------------------------------------------
-// Original shielded Spend2Output2 code, modified to batch + aggregate online
-// and then wrap each aggregated proof in FinalAggCircuit.
+// Original shielded Spend2Output2 code, modified so client circuits use the SAME
+// MapMt commitment state as the batch transition (no hand-rolled Merkle paths).
 // -----------------------------------------------------------------------------
 
-const TREE_HEIGHT: usize = 64;
 const UTXO_COMMIT_TAG: u64 = 0x0001;
 const UTXO_NULLIFY_TAG: u64 = 0x0002;
 const AMOUNT_BITS: u32 = 128; // 128-bit integers for amounts
 const AMOUNT_GEN_BITS: u32 = 120; // generate up to 120 bits to avoid u128 overflow on sums
 const BATCH_SIZE: usize = 8; // must be a power of two and == FINAL_NUM_LEAVES
-
-// Merkle path structure
-#[derive(Clone, Debug)]
-pub struct MerklePath<Fp: PrimeField> {
-    pub leaf: Fp,
-    pub siblings: [(Fp, bool); TREE_HEIGHT - 1], // bool: true = sibling is on the RIGHT
-}
-
-impl<Fp: PoseidonField> MerklePath<Fp> {
-    fn compute_root(&self) -> Fp {
-        self.siblings
-            .iter()
-            .fold(self.leaf, |acc, (sib, is_right)| {
-                if *is_right {
-                    <PoseidonChip<Fp> as HashCPU<Fp, Fp>>::hash(&[acc, *sib, Fp::ZERO])
-                } else {
-                    <PoseidonChip<Fp> as HashCPU<Fp, Fp>>::hash(&[*sib, acc, Fp::ZERO])
-                }
-            })
-    }
-}
 
 // UTXO structure
 #[derive(Clone, Debug)]
@@ -1508,94 +1487,6 @@ pub struct Utxo {
     pub asset_id: F,
     pub amount: u128, // 128-bit host-side amount
     pub randomness: F,
-}
-
-// -------------------- Simple append-only commitment tree helpers --------------------
-
-fn hash_pair(a: F, b: F) -> F {
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[a, b, F::ZERO])
-}
-
-fn zero_roots() -> Vec<F> {
-    let mut zs = Vec::with_capacity(TREE_HEIGHT);
-    zs.push(F::ZERO);
-    for _ in 1..TREE_HEIGHT {
-        let prev = *zs.last().unwrap();
-        zs.push(hash_pair(prev, prev));
-    }
-    zs
-}
-
-fn commitment_root(leaves: &[F]) -> F {
-    let zs = zero_roots();
-    let n = leaves.len();
-    if n == 0 {
-        return zs[TREE_HEIGHT - 1];
-    }
-    let m = n.next_power_of_two();
-    let base_h = m.trailing_zeros() as usize;
-
-    let mut level: Vec<F> = Vec::with_capacity(m);
-    level.extend_from_slice(leaves);
-    level.resize(m, zs[0]);
-
-    for _ in 0..base_h {
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
-        for i in (0..level.len()).step_by(2) {
-            next.push(hash_pair(level[i], level[i + 1]));
-        }
-        level = next;
-    }
-    let mut acc = level[0];
-    let mut h = base_h;
-    while h < TREE_HEIGHT - 1 {
-        let sib = zs[h];
-        acc = hash_pair(acc, sib);
-        h += 1;
-    }
-    acc
-}
-
-fn commitment_merkle_path(leaves: &[F], mut index: usize) -> MerklePath<F> {
-    assert!(index < leaves.len(), "index out of range");
-    let original = index;
-    let zs = zero_roots();
-    let n = leaves.len();
-    let m = n.next_power_of_two();
-    let base_h = m.trailing_zeros() as usize;
-
-    let mut level: Vec<F> = Vec::with_capacity(m);
-    level.extend_from_slice(leaves);
-    level.resize(m, zs[0]);
-
-    let mut sibs: Vec<(F, bool)> = Vec::with_capacity(TREE_HEIGHT - 1);
-
-    for _ in 0..base_h {
-        let is_left = (index & 1) == 0;
-        let sib = if is_left {
-            level[index + 1]
-        } else {
-            level[index - 1]
-        };
-        sibs.push((sib, is_left)); // true => sibling is RIGHT
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
-        for i in (0..level.len()).step_by(2) {
-            next.push(hash_pair(level[i], level[i + 1]));
-        }
-        level = next;
-        index >>= 1;
-    }
-
-    let mut h = base_h;
-    while sibs.len() < TREE_HEIGHT - 1 {
-        sibs.push((zs[h], true)); // our subtree left, zero-subtree right
-        h += 1;
-    }
-
-    MerklePath {
-        leaf: leaves[original],
-        siblings: sibs.try_into().unwrap(),
-    }
 }
 
 // -------------------- Circuit relation (single public instance = Poseidon hash) --------------------
@@ -1606,11 +1497,13 @@ pub struct Spend2Output2;
 impl Relation for Spend2Output2 {
     type Instance = F;
 
+    // PATCH: replace the two Merkle paths with a single pre-state commitment map witness.
+    // The circuit proves membership of the two consumed commitments via MapGadget::get,
+    // and uses commit_map.succinct_repr() as the "root" hashed into the instance.
     type Witness = (
-        MerklePath<F>,
-        MerklePath<F>,
-        JubjubScalar, // sk
-        JubjubScalar, // alpha (blinding factor)
+        MapMt<F, PoseidonChip<F>>, // pre-state commitment map
+        JubjubScalar,              // sk
+        JubjubScalar,              // alpha (blinding factor)
         Utxo,
         Utxo,
         Utxo,
@@ -1631,20 +1524,20 @@ impl Relation for Spend2Output2 {
         witness: Value<Self::Witness>,
     ) -> Result<(), Error> {
         // Extract witness components (Values only; assignments happen once below)
-        let mp1_val = witness.clone().map(|(mp1, _, _, _, _, _, _, _, _, _)| mp1);
-        let mp2_val = witness.clone().map(|(_, mp2, _, _, _, _, _, _, _, _)| mp2);
-        let sk_val = witness.clone().map(|(_, _, sk, _, _, _, _, _, _, _)| sk);
-        let alpha_val = witness
-            .clone()
-            .map(|(_, _, _, alpha, _, _, _, _, _, _)| alpha);
-        let old1_val = witness.clone().map(|(_, _, _, _, o1, _, _, _, _, _)| o1);
-        let old2_val = witness.clone().map(|(_, _, _, _, _, o2, _, _, _, _)| o2);
-        let new1_val = witness.clone().map(|(_, _, _, _, _, _, n1, _, _, _)| n1);
-        let new2_val = witness.clone().map(|(_, _, _, _, _, _, _, n2, _, _)| n2);
-        let pk1x_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k1, _)| k1.0);
-        let pk1y_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k1, _)| k1.1);
-        let pk2x_val = witness.clone().map(|(_, _, _, _, _, _, _, _, _, k2)| k2.0);
-        let pk2y_val = witness.clone().map(|(_, _, _, _, _, _, _, _, _, k2)| k2.1);
+        let commit_map_val = witness.clone().map(|(m, _, _, _, _, _, _, _, _)| m);
+
+        let sk_val = witness.clone().map(|(_, sk, _, _, _, _, _, _, _)| sk);
+        let alpha_val = witness.clone().map(|(_, _, alpha, _, _, _, _, _, _)| alpha);
+
+        let old1_val = witness.clone().map(|(_, _, _, o1, _, _, _, _, _)| o1);
+        let old2_val = witness.clone().map(|(_, _, _, _, o2, _, _, _, _)| o2);
+        let new1_val = witness.clone().map(|(_, _, _, _, _, n1, _, _, _)| n1);
+        let new2_val = witness.clone().map(|(_, _, _, _, _, _, n2, _, _)| n2);
+
+        let pk1x_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _)| k1.0);
+        let pk1y_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _)| k1.1);
+        let pk2x_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2.0);
+        let pk2y_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2.1);
 
         // Assign sender secret once, derive sender pk once
         let sk: AssignedScalarOfNativeCurve<Jubjub> = std_lib.jubjub().assign(layouter, sk_val)?;
@@ -1673,10 +1566,30 @@ impl Relation for Spend2Output2 {
         let old_c1 = compute_commitment_from_parts(std_lib, layouter, &old1_asg, &pk_sx, &pk_sy)?;
         let old_c2 = compute_commitment_from_parts(std_lib, layouter, &old2_asg, &pk_sx, &pk_sy)?;
 
-        // Verify Merkle proofs and check roots match
-        let root1 = compute_merkle_root(std_lib, layouter, mp1_val, old_c1.clone())?;
-        let root2 = compute_merkle_root(std_lib, layouter, mp2_val, old_c2.clone())?;
-        std_lib.assert_equal(layouter, &root1, &root2)?;
+        // PATCH: Use MapGadget over the provided pre-state commitment map to prove membership
+        // and to derive the state root.
+
+        let mut commit_map_gadget: midnight_circuits::map::map_gadget::MapGadget<
+            midnight_curves::Fq,
+            midnight_circuits::field::NativeGadget<
+                midnight_curves::Fq,
+                midnight_circuits::field::decomposition::chip::P2RDecompositionChip<
+                    midnight_curves::Fq,
+                >,
+                midnight_circuits::field::NativeChip<midnight_curves::Fq>,
+            >,
+            PoseidonChip<midnight_curves::Fq>,
+        > = std_lib.map_gadget().clone();
+        commit_map_gadget.init(layouter, commit_map_val)?;
+
+        let one = std_lib.assign_fixed(layouter, F::ONE)?;
+
+        let v1 = commit_map_gadget.get(layouter, &old_c1)?;
+        let v2 = commit_map_gadget.get(layouter, &old_c2)?;
+        std_lib.assert_equal(layouter, &v1, &one)?;
+        std_lib.assert_equal(layouter, &v2, &one)?;
+
+        let root = commit_map_gadget.succinct_repr();
 
         // Nullifiers (BOUND TO UNBLINDED sender pk to prevent double-spends)
         let nf1 = compute_nullifier(std_lib, layouter, &old_c1, &pk_sx, &pk_sy)?;
@@ -1697,8 +1610,8 @@ impl Relation for Spend2Output2 {
             std_lib, layouter, &old1_asg, &old2_asg, &new1_asg, &new2_asg,
         )?;
 
-        // ---- Single public input: Poseidon hash using BLINDED pk ----
-        let acc1 = std_lib.poseidon(layouter, &[root1.clone(), pk_bx.clone(), pk_by.clone()])?;
+        // ---- Single public input: Poseidon hash using BLINDED pk and Map root ----
+        let acc1 = std_lib.poseidon(layouter, &[root.clone(), pk_bx.clone(), pk_by.clone()])?;
         let acc2 = std_lib.poseidon(layouter, &[acc1, new_c1.clone(), new_c2.clone()])?;
         let instance_hash = std_lib.poseidon(layouter, &[acc2, nf1.clone(), nf2.clone()])?;
 
@@ -1788,44 +1701,6 @@ fn compute_nullifier<L: Layouter<F>>(
     std_lib.poseidon(layouter, &[h, pk_y.clone(), zero])
 }
 
-fn compute_merkle_root<L: Layouter<F>>(
-    std_lib: &ZkStdLib,
-    layouter: &mut L,
-    mp_val: Value<MerklePath<F>>,
-    leaf: AssignedNative<F>,
-) -> Result<AssignedNative<F>, Error> {
-    let siblings: Vec<AssignedNative<F>> = std_lib.assign_many(
-        layouter,
-        mp_val
-            .clone()
-            .map(|mp| mp.siblings.iter().map(|x| x.0).collect::<Vec<_>>())
-            .transpose_vec(TREE_HEIGHT - 1)
-            .as_slice(),
-    )?;
-    let positions = mp_val
-        .map(|mp| {
-            mp.siblings
-                .iter()
-                .map(|x| if x.1 { F::ONE } else { F::ZERO })
-                .collect::<Vec<_>>()
-        })
-        .transpose_vec(TREE_HEIGHT - 1);
-    let position_bits: Vec<AssignedBit<F>> = std_lib
-        .assign_many(layouter, positions.as_slice())?
-        .iter()
-        .map(|p| std_lib.convert(layouter, p))
-        .collect::<Result<_, _>>()?;
-    let zero: AssignedNative<F> = std_lib.assign_fixed(layouter, F::ZERO)?;
-    siblings
-        .iter()
-        .zip(position_bits.iter())
-        .try_fold(leaf, |acc, (sib, pos)| {
-            let left = std_lib.select(layouter, pos, &acc, sib)?;
-            let right = std_lib.select(layouter, pos, sib, &acc)?;
-            std_lib.poseidon(layouter, &[left, right, zero.clone()])
-        })
-}
-
 fn check_value_conservation_assigned<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
@@ -1865,7 +1740,6 @@ fn host_instance_hash(items: [F; 7]) -> F {
 
 #[derive(Clone, Debug)]
 struct Note {
-    idx: usize,
     utxo: Utxo,
     commit: F,
     spent: bool,
@@ -1883,6 +1757,9 @@ struct Account {
 
 fn main() {
     use midnight_circuits::instructions::map::MapCPU;
+
+    // PATCH: distinct leaf VK name (must be consistent anywhere fixed bases/names are derived).
+    const LEAF_VK_NAME: &str = "spend2output2_vk";
 
     const K: u32 = 14;
     const NUM_ACCOUNTS: usize = 4;
@@ -1902,7 +1779,7 @@ fn main() {
     let mut rng = ChaCha8Rng::from_entropy();
     let asset_id = F::random(&mut rng);
 
-    let mut commitment_leaves: Vec<F> = Vec::new();
+    // PATCH: the commitment state is the MapMt, and its succinct_repr() is the state root.
     let mut commitment_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
     let mut nullifier_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
 
@@ -1941,19 +1818,19 @@ fn main() {
                 utxo.randomness,
             );
 
-            let idx = commitment_leaves.len();
-            commitment_leaves.push(commit);
             commitment_map.insert(&commit, &F::ONE);
 
             acc.wallet.push(Note {
-                idx,
                 utxo,
                 commit,
                 spent: false,
             });
         }
     }
-    println!("Initial root: {:?}", commitment_root(&commitment_leaves));
+    println!(
+        "Initial commitment root: {:?}",
+        commitment_map.succinct_repr()
+    );
 
     let choose_sender = |rng: &mut ChaCha8Rng, accs: &mut [Account]| -> Option<usize> {
         let viable: Vec<usize> = accs
@@ -1977,7 +1854,6 @@ fn main() {
             break;
         }
 
-        let mut shadow_commitment_leaves = commitment_leaves.clone();
         let mut shadow_accounts = accounts.clone();
         let mut shadow_nullifier_map = nullifier_map.clone();
         let mut shadow_commitment_map = commitment_map.clone();
@@ -1988,9 +1864,9 @@ fn main() {
         let mut client_proofs: Vec<AggClientProof> = Vec::new();
 
         println!(
-            "\n=== Starting batch {} from root {:?} ===",
+            "\n=== Starting batch {} from commitment root {:?} ===",
             batch_idx,
-            commitment_root(&shadow_commitment_leaves)
+            shadow_commitment_map.succinct_repr()
         );
 
         let mut batch_failed = false;
@@ -2035,11 +1911,8 @@ fn main() {
             let old1 = shadow_accounts[sender_idx].wallet[i_old1].clone();
             let old2 = shadow_accounts[sender_idx].wallet[i_old2].clone();
 
-            let root_before = commitment_root(&shadow_commitment_leaves);
-            let mp1 = commitment_merkle_path(&shadow_commitment_leaves, old1.idx);
-            let mp2 = commitment_merkle_path(&shadow_commitment_leaves, old2.idx);
-            assert_eq!(root_before, mp1.compute_root());
-            assert_eq!(root_before, mp2.compute_root());
+            // PATCH: root_before is the MapMt succinct repr BEFORE inserting the new commitments.
+            let root_before = shadow_commitment_map.succinct_repr();
 
             let total: u128 = old1.utxo.amount + old2.utxo.amount;
             let out1_amt: u128 = if total == 0 {
@@ -2078,10 +1951,10 @@ fn main() {
             let nf1 = host_nullify(old1.commit, sender.pk_x, sender.pk_y);
             let nf2 = host_nullify(old2.commit, sender.pk_x, sender.pk_y);
 
+            // We can update nullifier state immediately (Spend2Output2 doesn't read it),
+            // but commitment updates MUST happen after proving so the map witness is pre-state.
             shadow_nullifier_map.insert(&nf1, &F::ONE);
             shadow_nullifier_map.insert(&nf2, &F::ONE);
-            shadow_commitment_map.insert(&new1_commit, &F::ONE);
-            shadow_commitment_map.insert(&new2_commit, &F::ONE);
 
             let alpha = JubjubScalar::random(&mut OsRng);
             let blind_point = JubjubSubgroup::generator() * alpha;
@@ -2101,9 +1974,9 @@ fn main() {
             ];
             let instance: F = host_instance_hash(public_items);
 
+            // PATCH: witness includes the *pre-state* commitment map.
             let witness = (
-                mp1,
-                mp2,
+                shadow_commitment_map.clone(),
                 sender.sk,
                 alpha,
                 old1.utxo.clone(),
@@ -2132,35 +2005,28 @@ fn main() {
                 public_items,
             });
 
-            let idx_new1 = shadow_commitment_leaves.len();
-            shadow_commitment_leaves.push(new1_commit);
-            let idx_new2 = shadow_commitment_leaves.len();
-            shadow_commitment_leaves.push(new2_commit);
+            // Now apply the state transition for subsequent txs.
+            shadow_commitment_map.insert(&new1_commit, &F::ONE);
+            shadow_commitment_map.insert(&new2_commit, &F::ONE);
 
             shadow_accounts[sender_idx].wallet[i_old1].spent = true;
             shadow_accounts[sender_idx].wallet[i_old2].spent = true;
 
             shadow_accounts[r1].wallet.push(Note {
-                idx: idx_new1,
                 utxo: new1,
                 commit: new1_commit,
                 spent: false,
             });
             shadow_accounts[r2].wallet.push(Note {
-                idx: idx_new2,
                 utxo: new2,
                 commit: new2_commit,
                 spent: false,
             });
 
-            let root_after = commitment_root(&shadow_commitment_leaves);
-            let mp_out1 = commitment_merkle_path(&shadow_commitment_leaves, idx_new1);
-            let mp_out2 = commitment_merkle_path(&shadow_commitment_leaves, idx_new2);
-            assert_eq!(root_after, mp_out1.compute_root());
-            assert_eq!(root_after, mp_out2.compute_root());
+            let root_after = shadow_commitment_map.succinct_repr();
 
             println!(
-                "[batch {}, tx {}] shadow root updated: {:?}",
+                "[batch {}, tx {}] shadow commitment root updated: {:?}",
                 batch_idx, total_transfers_done, root_after
             );
 
@@ -2182,7 +2048,8 @@ fn main() {
         );
 
         let now = Instant::now();
-        let agg_result = aggregate_client_proofs(&srs, vk.vk(), "poseidon_vk", K, &client_proofs);
+        // PATCH: use correct leaf vk name (must match fixed-base naming expectations).
+        let agg_result = aggregate_client_proofs(&srs, vk.vk(), LEAF_VK_NAME, K, &client_proofs);
         println!(
             "Batch {} aggregated proof generated and internally verified in {:?}",
             batch_idx,
@@ -2351,21 +2218,23 @@ fn main() {
             );
         }
 
-        commitment_leaves = shadow_commitment_leaves;
         accounts = shadow_accounts;
         nullifier_map = shadow_nullifier_map;
         commitment_map = shadow_commitment_map;
 
         println!(
-            "After batch {} committed root: {:?}",
+            "After batch {} committed commitment root: {:?}",
             batch_idx,
-            commitment_root(&commitment_leaves)
+            commitment_map.succinct_repr()
         );
 
         batch_idx += 1;
     }
 
-    println!("\nFinal root: {:?}", commitment_root(&commitment_leaves));
+    println!(
+        "\nFinal commitment root: {:?}",
+        commitment_map.succinct_repr()
+    );
 
     for acc in &accounts {
         let bal: u128 = acc

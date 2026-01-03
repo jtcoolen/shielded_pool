@@ -1083,7 +1083,7 @@ mod proof_agg {
     #[derive(Clone, Debug)]
     pub struct FinalAggCircuit {
         /// Inner aggregation vk / proof / public inputs
-        pub agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
+        pub agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
         pub agg_vk_name: String,
         pub agg_proof: Value<Vec<u8>>,
         pub agg_public_inputs: Vec<F>,
@@ -1254,7 +1254,8 @@ mod proof_agg {
             // ------------------------------------------------------------------
             // 4. Assign vk for the inner AGG circuit and verify the AGG proof
             // ------------------------------------------------------------------
-            let vk_val = native_chip.assign(&mut layouter, self.agg_vk.2.clone())?;
+            let vk_val: AssignedNative<F> =
+                native_chip.assign_fixed(&mut layouter, self.agg_vk.2.clone())?;
             let assigned_vk = verifier_chip.assign_vk(
                 self.agg_vk_name.as_str(),
                 &self.agg_vk.0,
@@ -2243,16 +2244,12 @@ fn main() {
             let agg_vk_data = (
                 agg_domain.clone(),
                 agg_result.agg_vk.cs().clone(),
-                Value::known(agg_result.agg_vk.transcript_repr()),
+                agg_result.agg_vk.transcript_repr(),
             );
 
             // Shape-only circuit for keygen
             let default_final_circuit = FinalAggCircuit {
-                agg_vk: (
-                    agg_domain.clone(),
-                    agg_result.agg_vk.cs().clone(),
-                    Value::unknown(),
-                ),
+                agg_vk: agg_vk_data.clone(),
                 agg_vk_name: agg_result.agg_vk_name.clone(),
                 agg_proof: Value::unknown(),
                 // the values themselves don't matter for the shape, only the length

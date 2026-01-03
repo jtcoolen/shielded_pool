@@ -1604,6 +1604,7 @@ impl Relation for Spend2Output2 {
 
         let new_c1 = compute_commitment_from_parts(std_lib, layouter, &new1_asg, &pk1x, &pk1y)?;
         let new_c2 = compute_commitment_from_parts(std_lib, layouter, &new2_asg, &pk2x, &pk2y)?;
+        std_lib.assert_not_equal(layouter, &new_c1, &new_c2)?;
 
         // Value conservation
         check_value_conservation_assigned(

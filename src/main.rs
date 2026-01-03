@@ -21,6 +21,7 @@ use midnight_curves::{Fq as F, Fr as JubjubScalar, JubjubExtended as Jubjub, Jub
 use midnight_proofs::{
     circuit::{Layouter, Value},
     plonk::Error,
+    transcript::Transcript,
 };
 use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
@@ -89,6 +90,14 @@ mod proof_agg {
     type CBase = <C as CircuitCurve>::Base;
     type NG = NativeGadget<F, P2RDecompositionChip<F>, NativeChip<F>>;
     type Map = midnight_circuits::map::cpu::MapMt<F, PoseidonChip<F>>;
+
+    /// Re-exported accumulator type for host-side code.
+    pub type AggAccumulator = Accumulator<S>;
+
+    /// Convert an accumulator to the exact "acc_pi..." field list used as public inputs.
+    pub fn accumulator_as_public_input(acc: &AggAccumulator) -> Vec<F> {
+        AssignedAccumulator::as_public_input(acc)
+    }
 
     // Leaf aggregation circuit size and internal aggregation circuit size.
     // Mirrors the <AGG> pattern (leaf smaller than internal).
@@ -232,6 +241,25 @@ mod proof_agg {
             curve_config,
             poseidon_config,
         )
+    }
+
+    /// Typed container for AggCircuit public inputs:
+    /// layout = [state, acc_pi..., level]
+    #[derive(Clone, Debug)]
+    pub struct AggPublicInputs {
+        pub state: F,
+        pub pi_acc: AggAccumulator,
+        pub level: F,
+    }
+
+    impl AggPublicInputs {
+        pub fn to_fields(&self) -> Vec<F> {
+            let mut out = Vec::new();
+            out.push(self.state);
+            out.extend(AssignedAccumulator::as_public_input(&self.pi_acc));
+            out.push(self.level);
+            out
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -434,9 +462,9 @@ mod proof_agg {
     struct TreeNode {
         state: F,
         proof: Vec<u8>,
-        proof_acc: Accumulator<S>,
-        pi_acc: Accumulator<S>,
-        public_inputs: Vec<F>,
+        proof_acc: AggAccumulator,
+        pi_acc: AggAccumulator,
+        public_inputs: AggPublicInputs,
     }
 
     #[derive(Clone, Debug)]
@@ -454,10 +482,12 @@ mod proof_agg {
     pub struct AggregationResult {
         pub root_state: F,
         pub agg_proof: Vec<u8>,
-        pub agg_public_inputs: Vec<F>,
-        pub agg_state_index: usize, // now always 0 (state is first PI)
+        pub agg_public_inputs: AggPublicInputs,
+        pub agg_proof_acc: AggAccumulator,
         pub agg_vk: VerifyingKey<F, KZGCommitmentScheme<E>>,
         pub agg_vk_name: String,
+        pub fixed_base_names: Vec<String>,
+        pub fixed_bases: BTreeMap<String, C>,
         pub leaf_states: Vec<F>,
         pub client_pis: Vec<[F; 7]>,
     }
@@ -532,15 +562,6 @@ mod proof_agg {
         );
 
         acc
-    }
-
-    // Off-circuit helper to build raw public inputs (no hashing): [state, acc_pi..., level]
-    fn agg_public_inputs(state: F, acc: &Accumulator<S>, level: F) -> Vec<F> {
-        let mut out = Vec::new();
-        out.push(state);
-        out.extend(AssignedAccumulator::as_public_input(acc));
-        out.push(level);
-        out
     }
 
     fn agg_vk_name_for_level(level: usize) -> String {
@@ -634,13 +655,6 @@ mod proof_agg {
     }
 
     /// Aggregates a list of client proofs into a single AGG proof.
-    ///
-    /// Requirements:
-    /// - `client_proofs.len() > 0`
-    /// - `client_proofs.len()` is a power of two
-    ///
-    /// Returns:
-    /// - AggregationResult with root state, proof, and metadata for FinalAggCircuit
     pub fn aggregate_client_proofs(
         leaf_srs: &ParamsKZG<Bls12>,
         leaf_vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
@@ -658,18 +672,14 @@ mod proof_agg {
         let max_level: usize = (num_leaves as u32).trailing_zeros() as usize;
         assert!(max_level > 0, "max_level computed as 0");
 
-        // -----------------------------
         // Leaf vk data (for any 1-instance circuit)
-        // -----------------------------
         let leaf_vk_data = VkData {
             domain: EvaluationDomain::new(leaf_vk.cs().degree() as u32, leaf_k),
             cs: leaf_vk.cs().clone(),
             transcript_repr: leaf_vk.transcript_repr(),
         };
 
-        // -----------------------------
         // Setup aggregation CS and SRS
-        // -----------------------------
         let mut agg_cs = ConstraintSystem::default();
         configure_agg_circuit(&mut agg_cs);
 
@@ -688,14 +698,10 @@ mod proof_agg {
             "agg_srs1 vs agg_srs2 s_g2 mismatch"
         );
 
-        // -----------------------------
         // Precompute all AGG vk names
-        // -----------------------------
         let agg_vk_names: Vec<String> = (1..=max_level).map(agg_vk_name_for_level).collect();
 
-        // -----------------------------
         // Build a global fixed base name list (Leaf + every AGG vk_name)
-        // -----------------------------
         let combined_fixed_base_names: Vec<String> = {
             let mut set = BTreeSet::new();
             let mut out = Vec::new();
@@ -715,9 +721,7 @@ mod proof_agg {
             out
         };
 
-        // -----------------------------
         // Keygen one AGG VK/PK per level
-        // -----------------------------
         let mut agg_levels: Vec<AggLevelKeys> = Vec::with_capacity(max_level);
 
         for level in 1..=max_level {
@@ -783,9 +787,7 @@ mod proof_agg {
 
         let agg_store = AggKeyStore::new(agg_levels);
 
-        // -----------------------------
         // Build combined fixed bases map
-        // -----------------------------
         let mut leaf_fixed_bases = BTreeMap::new();
         leaf_fixed_bases.insert(String::from("com_instance"), C::identity());
         leaf_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
@@ -805,9 +807,7 @@ mod proof_agg {
             );
         }
 
-        // -----------------------------
         // Build a global trivial accumulator carrying fixed bases for all circuits
-        // -----------------------------
         let trivial_leaf =
             trivial_acc_with_names(&fixed_base_names_for(leaf_vk_name, &leaf_vk_data.cs));
 
@@ -821,9 +821,7 @@ mod proof_agg {
         let mut trivial_combined = Accumulator::accumulate(&trivial_all);
         trivial_combined.collapse();
 
-        // -----------------------------
         // Create leaf aggregation layer (AGG level 1, verifies client proofs)
-        // -----------------------------
         println!("\nCreating {} leaf AGG nodes...", num_leaves / 2);
 
         let leaf_level = 1usize;
@@ -879,7 +877,12 @@ mod proof_agg {
                 ]);
                 accumulated_pi.collapse();
 
-                let public_inputs = agg_public_inputs(state, &accumulated_pi, F::ONE);
+                let public_inputs = AggPublicInputs {
+                    state,
+                    pi_acc: accumulated_pi.clone(),
+                    level: F::ONE, // leaf level outputs next_level = 1
+                };
+                let public_inputs_fields = public_inputs.to_fields();
 
                 let start = Instant::now();
                 let proof = {
@@ -894,7 +897,7 @@ mod proof_agg {
                         leaf_keys.pk.as_ref(),
                         &[circuit],
                         1,
-                        &[&[&[], &public_inputs]],
+                        &[&[&[], &public_inputs_fields]],
                         OsRng,
                         &mut transcript,
                     )
@@ -918,7 +921,7 @@ mod proof_agg {
                     leaf_keys.vk.as_ref(),
                     &leaf_keys.fixed_bases,
                     &proof,
-                    &public_inputs,
+                    &public_inputs_fields,
                 );
 
                 TreeNode {
@@ -931,9 +934,7 @@ mod proof_agg {
             })
             .collect();
 
-        // -----------------------------
         // Build internal layers (each verifies previous aggregation layer)
-        // -----------------------------
         let mut child_level: usize = 1;
         while current_level.len() > 1 {
             let parent_level = child_level + 1;
@@ -983,8 +984,12 @@ mod proof_agg {
                     ]);
                     accumulated_pi.collapse();
 
-                    let public_inputs =
-                        agg_public_inputs(state, &accumulated_pi, F::from(parent_level as u64));
+                    let public_inputs = AggPublicInputs {
+                        state,
+                        pi_acc: accumulated_pi.clone(),
+                        level: F::from(parent_level as u64),
+                    };
+                    let public_inputs_fields = public_inputs.to_fields();
 
                     let start = Instant::now();
                     let proof = {
@@ -999,7 +1004,7 @@ mod proof_agg {
                             parent_keys.pk.as_ref(),
                             &[circuit],
                             1,
-                            &[&[&[], &public_inputs]],
+                            &[&[&[], &public_inputs_fields]],
                             OsRng,
                             &mut transcript,
                         )
@@ -1024,7 +1029,7 @@ mod proof_agg {
                         parent_keys.vk.as_ref(),
                         &parent_keys.fixed_bases,
                         &proof,
-                        &public_inputs,
+                        &public_inputs_fields,
                     );
 
                     TreeNode {
@@ -1041,9 +1046,7 @@ mod proof_agg {
             child_level = parent_level;
         }
 
-        // -----------------------------
         // Final root and sanity check
-        // -----------------------------
         let root = &current_level[0];
 
         let leaf_states: Vec<F> = client_proofs.iter().map(|p| p.state).collect();
@@ -1061,33 +1064,42 @@ mod proof_agg {
             root_state: root.state,
             agg_proof: root.proof.clone(),
             agg_public_inputs: root.public_inputs.clone(),
-            agg_state_index: 0, // state is first PI now
+            agg_proof_acc: root.proof_acc.clone(),
             agg_vk: (*final_keys.vk).clone(),
             agg_vk_name: final_keys.name.clone(),
+            fixed_base_names: combined_fixed_base_names,
+            fixed_bases: combined_fixed_bases,
             leaf_states,
             client_pis,
         }
     }
 
     /// Final aggregation circuit:
-    ///  - witnesses the client would-be public inputs (per-leaf 7-tuple),
-    ///  - recomputes each client's hashed public input and Poseidon Merkle root,
+    ///  - recomputes each client's instance hash and Poseidon Merkle root,
     ///  - ties that root to the AGG proof,
-    ///  - witnesses sparse nullifier & commitment maps (pre-state),
-    ///  - inserts all batch nullifiers and commitments into the maps,
-    ///  - exposes only:
-    ///       * public input 0: pre-commitment succinct_repr root
-    ///       * public input 1: post-commitment succinct_repr root
-    ///       * public input 2: pre-nullifier succinct_repr root
-    ///       * public input 3: post-nullifier succinct_repr root
+    ///  - performs commitment/nullifier state transition checks,
+    ///  - AND: computes a "collapsed accumulator" = accumulate( inner_proof_acc , agg_pi_acc )
+    ///        and exposes it as public input(s).
+    ///
+    /// Public inputs exposed:
+    ///   * PI0: pre-commitment succinct_repr root
+    ///   * PI1: post-commitment succinct_repr root
+    ///   * PI2: pre-nullifier succinct_repr root
+    ///   * PI3: post-nullifier succinct_repr root
+    ///   * PI4.. : collapsed accumulator (acc_pi...)
     #[derive(Clone, Debug)]
     pub struct FinalAggCircuit {
-        /// Inner aggregation vk / proof / public inputs
+        /// Inner aggregation vk / proof
         pub agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
         pub agg_vk_name: String,
         pub agg_proof: Value<Vec<u8>>,
-        pub agg_public_inputs: Vec<F>,
-        pub agg_state_index: usize,
+
+        /// The PI accumulator from the inner AggCircuit (must match the one used in `prepare`)
+        pub agg_pi_acc: Value<AggAccumulator>,
+        /// The "level" field element expected in the inner public inputs
+        pub agg_level: F,
+        /// Fixed base names needed to assign `agg_pi_acc` deterministically
+        pub fixed_base_names: Vec<String>,
 
         /// For each client leaf, the 7 would-be public inputs:
         ///   [root, pk'_x, pk'_y, new_c1, new_c2, nf1, nf2]
@@ -1253,9 +1265,11 @@ mod proof_agg {
 
             // ------------------------------------------------------------------
             // 4. Assign vk for the inner AGG circuit and verify the AGG proof
+            //    Ensures agg_pi_acc used here is exactly the same used to build
+            //    the PI slice passed to `prepare`.
             // ------------------------------------------------------------------
             let vk_val: AssignedNative<F> =
-                native_chip.assign_fixed(&mut layouter, self.agg_vk.2.clone())?;
+                native_chip.assign_fixed(&mut layouter, self.agg_vk.2)?;
             let assigned_vk = verifier_chip.assign_vk(
                 self.agg_vk_name.as_str(),
                 &self.agg_vk.0,
@@ -1263,22 +1277,29 @@ mod proof_agg {
                 vk_val,
             )?;
 
-            // Enforce that the "state" entry of agg_public_inputs equals our root
-            assert!(
-                self.agg_state_index < self.agg_public_inputs.len(),
-                "agg_state_index out of range"
-            );
-            let mut assigned_pi: Vec<AssignedNative<F>> =
-                Vec::with_capacity(self.agg_public_inputs.len());
-            for (i, pi) in self.agg_public_inputs.iter().cloned().enumerate() {
-                let assigned = scalar_chip.assign(&mut layouter, Value::known(pi))?;
-                if i == self.agg_state_index {
-                    scalar_chip.assert_equal(&mut layouter, &assigned, &root)?;
-                }
-                assigned_pi.push(assigned);
-            }
+            // Assign the inner PI accumulator witness
+            let mut agg_pi_acc = AssignedAccumulator::assign(
+                &mut layouter,
+                &curve_chip,
+                &scalar_chip,
+                1,
+                1,
+                &[],
+                &self.fixed_base_names,
+                self.agg_pi_acc.clone(),
+            )?;
+            agg_pi_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-            // Verify the final AGG proof inside the circuit
+            // Inner level
+            let level = scalar_chip.assign(&mut layouter, Value::known(self.agg_level))?;
+
+            // Build the inner public inputs: [root, acc_pi..., level]
+            let mut assigned_pi: Vec<AssignedNative<F>> = Vec::new();
+            assigned_pi.push(root.clone());
+            assigned_pi.extend(verifier_chip.as_public_input(&mut layouter, &agg_pi_acc)?);
+            assigned_pi.push(level);
+
+            // Verify the final AGG proof inside the circuit -> proof accumulator
             let id_point: AssignedForeignPoint<
                 midnight_curves::Fq,
                 midnight_curves::G1Projective,
@@ -1293,6 +1314,24 @@ mod proof_agg {
                 self.agg_proof.clone(),
             )?;
             proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
+
+            // ------------------------------------------------------------------
+            // 5. Collapse final accumulator = accumulate(proof_acc, agg_pi_acc)
+            //    and expose it as public input(s).
+            // ------------------------------------------------------------------
+            let mut collapsed = AssignedAccumulator::<S>::accumulate(
+                &mut layouter,
+                &verifier_chip,
+                &scalar_chip,
+                &poseidon_chip,
+                &[proof_acc, agg_pi_acc],
+            )?;
+            collapsed.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
+
+            let collapsed_pi = verifier_chip.as_public_input(&mut layouter, &collapsed)?;
+            for x in collapsed_pi.iter() {
+                scalar_chip.constrain_as_public_input(&mut layouter, x)?;
+            }
 
             core_decomp_chip.load(&mut layouter)
         }
@@ -1418,7 +1457,8 @@ mod proof_agg {
 
 // Re-export pieces we need in the shielded example.
 use proof_agg::{
-    ClientProof as AggClientProof, FINAL_NUM_LEAVES, FinalAggCircuit, aggregate_client_proofs,
+    AggAccumulator, ClientProof as AggClientProof, FINAL_NUM_LEAVES, FinalAggCircuit,
+    accumulator_as_public_input, aggregate_client_proofs,
 };
 
 use crate::proof_agg::filecoin_srs_agg;
@@ -1558,12 +1598,8 @@ fn commitment_merkle_path(leaves: &[F], mut index: usize) -> MerklePath<F> {
 pub struct Spend2Output2;
 
 impl Relation for Spend2Output2 {
-    // Single public input: Poseidon hash of (root, pk'_x, pk'_y, new_c1, new_c2, nf1, nf2)
-    // where pk' = pk + [alpha]G is a per-transaction blinded key
     type Instance = F;
 
-    // Witness unchanged except we add the blinding factor alpha
-    // (includes everything needed to recompute values that are no longer public)
     type Witness = (
         MerklePath<F>,
         MerklePath<F>,
@@ -1578,7 +1614,6 @@ impl Relation for Spend2Output2 {
     );
 
     fn format_instance(instance: &Self::Instance) -> Result<Vec<F>, Error> {
-        // Expose only the single hash as the public input
         Ok(vec![*instance])
     }
 
@@ -1614,7 +1649,7 @@ impl Relation for Spend2Output2 {
         let pk_sender_fields = std_lib.jubjub().as_public_input(layouter, &pk_sender)?;
         let (pk_sx, pk_sy) = (pk_sender_fields[0].clone(), pk_sender_fields[1].clone());
 
-        // Blinded key: pk' = pk + [alpha]G  (used publicly; authorization proven inside)
+        // Blinded key: pk' = pk + [alpha]G
         let alpha: AssignedScalarOfNativeCurve<Jubjub> =
             std_lib.jubjub().assign(layouter, alpha_val)?;
         let blind = std_lib.jubjub().mul(layouter, &alpha, &generator)?;
@@ -1640,7 +1675,6 @@ impl Relation for Spend2Output2 {
         // Nullifiers (BOUND TO UNBLINDED sender pk to prevent double-spends)
         let nf1 = compute_nullifier(std_lib, layouter, &old_c1, &pk_sx, &pk_sy)?;
         let nf2 = compute_nullifier(std_lib, layouter, &old_c2, &pk_sx, &pk_sy)?;
-        // ensure nf1 != nf2
         std_lib.assert_not_equal(layouter, &nf1, &nf2)?;
 
         // New outputs: use provided recipient (pk_out*) coordinates (assigned once)
@@ -1652,24 +1686,17 @@ impl Relation for Spend2Output2 {
         let new_c1 = compute_commitment_from_parts(std_lib, layouter, &new1_asg, &pk1x, &pk1y)?;
         let new_c2 = compute_commitment_from_parts(std_lib, layouter, &new2_asg, &pk2x, &pk2y)?;
 
-        // Value conservation (same asset id + 128-bit amounts using BigUint gadget)
+        // Value conservation
         check_value_conservation_assigned(
             std_lib, layouter, &old1_asg, &old2_asg, &new1_asg, &new2_asg,
         )?;
 
         // ---- Single public input: Poseidon hash using BLINDED pk ----
-        // Sponge the seven values using the same 3-arity Poseidon as elsewhere:
-        // (root, pk'_x, pk'_y) -> acc1
-        // (acc1, new_c1, new_c2) -> acc2
-        // (acc2, nf1,  nf2)      -> instance_hash
         let acc1 = std_lib.poseidon(layouter, &[root1.clone(), pk_bx.clone(), pk_by.clone()])?;
         let acc2 = std_lib.poseidon(layouter, &[acc1, new_c1.clone(), new_c2.clone()])?;
         let instance_hash = std_lib.poseidon(layouter, &[acc2, nf1.clone(), nf2.clone()])?;
 
-        // Expose only this hash as the single public input
         std_lib.constrain_as_public_input(layouter, &instance_hash)?;
-        // -----------------------------------------------------------------
-
         Ok(())
     }
 
@@ -1682,7 +1709,7 @@ impl Relation for Spend2Output2 {
             secp256k1: false,
             bls12_381: false,
             base64: false,
-            nr_pow2range_cols: 1, // BigUint gadget uses pow2range; 1 column is fine here
+            nr_pow2range_cols: 1,
             automaton: false,
         }
     }
@@ -1695,16 +1722,14 @@ impl Relation for Spend2Output2 {
     }
 }
 
-// A small helper carrying the once-assigned UTXO components used across the circuit.
 #[derive(Clone)]
 struct AssignedUtxo {
     id: AssignedNative<F>,
-    amount_f: AssignedNative<F>,    // amount as a field (for hashing)
-    amount_big: AssignedBigUint<F>, // amount as BigUint (for 128-bit arithmetic)
+    amount_f: AssignedNative<F>,
+    amount_big: AssignedBigUint<F>,
     randomness: AssignedNative<F>,
 }
 
-// Assign UTXO fields exactly once (both field & BigUint representations)
 fn assign_utxo<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
@@ -1727,7 +1752,6 @@ fn assign_utxo<L: Layouter<F>>(
     })
 }
 
-// Helpers (amounts are already assigned; we never re-assign the same witness)
 fn compute_commitment_from_parts<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
@@ -1796,7 +1820,6 @@ fn compute_merkle_root<L: Layouter<F>>(
         })
 }
 
-// 128-bit amount conservation and asset-id equality using already-assigned components.
 fn check_value_conservation_assigned<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
@@ -1805,19 +1828,16 @@ fn check_value_conservation_assigned<L: Layouter<F>>(
     out1: &AssignedUtxo,
     out2: &AssignedUtxo,
 ) -> Result<(), Error> {
-    // All asset IDs equal (no re-assigning)
     std_lib.assert_equal(layouter, &in1.id, &in2.id)?;
     std_lib.assert_equal(layouter, &in1.id, &out1.id)?;
     std_lib.assert_equal(layouter, &in1.id, &out2.id)?;
 
-    // Amount conservation with 128-bit integers (no re-assigning)
     let big = std_lib.biguint();
     let sum_in = big.add(layouter, &in1.amount_big, &in2.amount_big)?;
     let sum_out = big.add(layouter, &out1.amount_big, &out2.amount_big)?;
     big.assert_equal(layouter, &sum_in, &sum_out)
 }
 
-// Host-side helpers
 fn host_commit(id: F, amt_u128: u128, pk_x: F, pk_y: F, rand: F) -> F {
     let tag = F::from(UTXO_COMMIT_TAG);
     let amt_f = F::from_u128(amt_u128);
@@ -1831,21 +1851,15 @@ fn host_nullify(commit: F, pk_x: F, pk_y: F) -> F {
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h, pk_y, F::ZERO])
 }
 
-// Poseidon sponge (3-arity) over the seven public items:
-// (root, pk_x, pk_y)           -> acc1
-// (acc1, new_c1, new_c2)       -> acc2
-// (acc2, nf1,  nf2)            -> final hash
 fn host_instance_hash(items: [F; 7]) -> F {
     let acc1 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[items[0], items[1], items[2]]);
     let acc2 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc1, items[3], items[4]]);
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc2, items[5], items[6]])
 }
 
-// -------------------- Multiple accounts & randomized transfers --------------------
-
 #[derive(Clone, Debug)]
 struct Note {
-    idx: usize, // index in commitment-leaf vector
+    idx: usize,
     utxo: Utxo,
     commit: F,
     spent: bool,
@@ -1880,12 +1894,8 @@ fn main() {
     let pk = compact_std_lib::setup_pk(&relation, &vk);
 
     let mut rng = ChaCha8Rng::from_entropy();
-    let asset_id = F::random(&mut rng); // single asset across all accounts
+    let asset_id = F::random(&mut rng);
 
-    // Global state:
-    //  - commitment_leaves: append-only commitment tree leaves for membership proofs
-    //  - commitment_map: sparse map of commitments for state roots
-    //  - nullifier_map: sparse map of nullifiers for spent detection
     let mut commitment_leaves: Vec<F> = Vec::new();
     let mut commitment_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
     let mut nullifier_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
@@ -1907,10 +1917,9 @@ fn main() {
         })
         .collect();
 
-    // Seed deposits: random (<=120-bit) amounts, credited to each account
+    // Seed deposits
     for acc in &mut accounts {
         for _ in 0..NUM_SEED_DEPOSITS_PER_ACCOUNT {
-            // generate <=120-bit to avoid u128 overflow on sums
             let hi: u128 = rng.r#gen::<u128>() >> (128 - AMOUNT_GEN_BITS);
             let amt: u128 = hi;
             let utxo = Utxo {
@@ -1940,7 +1949,6 @@ fn main() {
     }
     println!("Initial root: {:?}", commitment_root(&commitment_leaves));
 
-    // Helper: choose a sender account with >=2 unspent notes
     let choose_sender = |rng: &mut ChaCha8Rng, accs: &mut [Account]| -> Option<usize> {
         let viable: Vec<usize> = accs
             .iter()
@@ -1963,7 +1971,6 @@ fn main() {
             break;
         }
 
-        // Start a new batch from the current committed state
         let mut shadow_commitment_leaves = commitment_leaves.clone();
         let mut shadow_accounts = accounts.clone();
         let mut shadow_nullifier_map = nullifier_map.clone();
@@ -1999,7 +2006,6 @@ fn main() {
                 }
             };
 
-            // Pick two distinct unspent notes from sender (on shadow state)
             let (i_old1, i_old2) = {
                 let unspent: Vec<usize> = shadow_accounts[sender_idx]
                     .wallet
@@ -2016,23 +2022,19 @@ fn main() {
                 (a, b)
             };
 
-            // Choose two (possibly equal) recipients at random
             let r1 = rng.gen_range(0..NUM_ACCOUNTS);
             let r2 = rng.gen_range(0..NUM_ACCOUNTS);
 
-            // Sender & inputs (from shadow state)
             let sender = shadow_accounts[sender_idx].clone();
             let old1 = shadow_accounts[sender_idx].wallet[i_old1].clone();
             let old2 = shadow_accounts[sender_idx].wallet[i_old2].clone();
 
-            // Build membership proofs against current *shadow* root
             let root_before = commitment_root(&shadow_commitment_leaves);
             let mp1 = commitment_merkle_path(&shadow_commitment_leaves, old1.idx);
             let mp2 = commitment_merkle_path(&shadow_commitment_leaves, old2.idx);
             assert_eq!(root_before, mp1.compute_root());
             assert_eq!(root_before, mp2.compute_root());
 
-            // Random split to recipients: out1 in [0..=total]
             let total: u128 = old1.utxo.amount + old2.utxo.amount;
             let out1_amt: u128 = if total == 0 {
                 0
@@ -2067,17 +2069,14 @@ fn main() {
                 new2.randomness,
             );
 
-            // Nullifiers (bound to UNBLINDED sender key to maintain uniqueness)
             let nf1 = host_nullify(old1.commit, sender.pk_x, sender.pk_y);
             let nf2 = host_nullify(old2.commit, sender.pk_x, sender.pk_y);
 
-            // Update shadow nullifier/commitment maps
             shadow_nullifier_map.insert(&nf1, &F::ONE);
             shadow_nullifier_map.insert(&nf2, &F::ONE);
             shadow_commitment_map.insert(&new1_commit, &F::ONE);
             shadow_commitment_map.insert(&new2_commit, &F::ONE);
 
-            // Per-transaction blinding factor and blinded key pk' = pk + [alpha]G
             let alpha = JubjubScalar::random(&mut OsRng);
             let blind_point = JubjubSubgroup::generator() * alpha;
             let pk_blinded_point = sender.pk_point + blind_point;
@@ -2085,7 +2084,6 @@ fn main() {
             let pk_bx = pkb_fields[0];
             let pk_by = pkb_fields[1];
 
-            // Compute single public instance hash (Poseidon sponge) using BLINDED pk
             let public_items = [
                 root_before,
                 pk_bx,
@@ -2097,12 +2095,11 @@ fn main() {
             ];
             let instance: F = host_instance_hash(public_items);
 
-            // Witness carries alpha and recipient keys for outputs (unchanged)
             let witness = (
                 mp1,
                 mp2,
                 sender.sk,
-                alpha, // blinding factor
+                alpha,
                 old1.utxo.clone(),
                 old2.utxo.clone(),
                 new1.clone(),
@@ -2111,7 +2108,6 @@ fn main() {
                 (shadow_accounts[r2].pk_x, shadow_accounts[r2].pk_y),
             );
 
-            // Prove (per-transfer client proof)
             let now = Instant::now();
             let proof = compact_std_lib::prove::<Spend2Output2, PoseidonState<F>>(
                 &srs, &pk, &relation, &instance, witness, OsRng,
@@ -2124,20 +2120,17 @@ fn main() {
                 now.elapsed()
             );
 
-            // Collect client proof for aggregation (state + proof + 7-tuple)
             client_proofs.push(AggClientProof {
                 state: instance,
                 proof: proof.clone(),
                 public_items,
             });
 
-            // Apply to shadow commitment leaves (pending state)
             let idx_new1 = shadow_commitment_leaves.len();
             shadow_commitment_leaves.push(new1_commit);
             let idx_new2 = shadow_commitment_leaves.len();
             shadow_commitment_leaves.push(new2_commit);
 
-            // Mark inputs spent and credit recipients in shadow accounts
             shadow_accounts[sender_idx].wallet[i_old1].spent = true;
             shadow_accounts[sender_idx].wallet[i_old2].spent = true;
 
@@ -2154,7 +2147,6 @@ fn main() {
                 spent: false,
             });
 
-            // quick inclusion checks on shadow state
             let root_after = commitment_root(&shadow_commitment_leaves);
             let mp_out1 = commitment_merkle_path(&shadow_commitment_leaves, idx_new1);
             let mp_out2 = commitment_merkle_path(&shadow_commitment_leaves, idx_new2);
@@ -2183,16 +2175,8 @@ fn main() {
             "Batch size must be a power of two."
         );
 
-        // Aggregate this batch of shielded proofs into a single proof, verifying all
-        // client proofs and the aggregation circuit.
         let now = Instant::now();
-        let agg_result = aggregate_client_proofs(
-            &srs,
-            vk.vk(),
-            "poseidon_vk", // label used only for fixed-base bookkeeping
-            K,
-            &client_proofs,
-        );
+        let agg_result = aggregate_client_proofs(&srs, vk.vk(), "poseidon_vk", K, &client_proofs);
         println!(
             "Batch {} aggregated proof generated and internally verified in {:?}",
             batch_idx,
@@ -2205,7 +2189,6 @@ fn main() {
             agg_result.agg_proof.len()
         );
 
-        // Map roots for this batch (pre and post)
         let pre_nullifier_root = pre_nullifier_map_for_batch.succinct_repr();
         let post_nullifier_root = shadow_nullifier_map.succinct_repr();
 
@@ -2217,7 +2200,6 @@ fn main() {
         // ---------------------------------------------------------------------
         {
             use midnight_proofs::poly::kzg::KZGCommitmentScheme;
-            use midnight_proofs::transcript::Transcript;
             use midnight_proofs::{
                 circuit::Value,
                 plonk::{create_proof, keygen_pk, keygen_vk_with_k, prepare},
@@ -2247,14 +2229,23 @@ fn main() {
                 agg_result.agg_vk.transcript_repr(),
             );
 
+            // Compute the "collapsed accumulator" that FinalAggCircuit will expose:
+            // collapsed = accumulate( inner_proof_acc , agg_pi_acc )
+            let mut collapsed: AggAccumulator = AggAccumulator::accumulate(&[
+                agg_result.agg_proof_acc.clone(),
+                agg_result.agg_public_inputs.pi_acc.clone(),
+            ]);
+            collapsed.collapse();
+            let collapsed_pi = accumulator_as_public_input(&collapsed);
+
             // Shape-only circuit for keygen
             let default_final_circuit = FinalAggCircuit {
                 agg_vk: agg_vk_data.clone(),
                 agg_vk_name: agg_result.agg_vk_name.clone(),
                 agg_proof: Value::unknown(),
-                // the values themselves don't matter for the shape, only the length
-                agg_public_inputs: agg_result.agg_public_inputs.clone(),
-                agg_state_index: agg_result.agg_state_index,
+                agg_pi_acc: Value::unknown(),
+                agg_level: F::ZERO,
+                fixed_base_names: agg_result.fixed_base_names.clone(),
                 client_pis: [[F::ZERO; 7]; FINAL_NUM_LEAVES],
                 pre_nullifier_map: Value::unknown(),
                 post_nullifier_root: Value::unknown(),
@@ -2262,7 +2253,6 @@ fn main() {
                 post_commitment_root: Value::unknown(),
             };
 
-            // Use the same SRS size as the FinalAggCircuit (AGG_K).
             let agg_srs = proof_agg::filecoin_srs_agg(proof_agg::AGG_K).unwrap();
             let final_vk = keygen_vk_with_k(&agg_srs, &default_final_circuit, proof_agg::AGG_K)
                 .expect("final vk generation should not fail");
@@ -2274,8 +2264,9 @@ fn main() {
                 agg_vk: agg_vk_data,
                 agg_vk_name: agg_result.agg_vk_name.clone(),
                 agg_proof: Value::known(agg_result.agg_proof.clone()),
-                agg_public_inputs: agg_result.agg_public_inputs.clone(),
-                agg_state_index: agg_result.agg_state_index,
+                agg_pi_acc: Value::known(agg_result.agg_public_inputs.pi_acc.clone()),
+                agg_level: agg_result.agg_public_inputs.level,
+                fixed_base_names: agg_result.fixed_base_names.clone(),
                 client_pis: client_pis_array,
                 pre_nullifier_map: Value::known(pre_nullifier_map_for_batch.clone()),
                 post_nullifier_root: Value::known(post_nullifier_root),
@@ -2283,12 +2274,15 @@ fn main() {
                 post_commitment_root: Value::known(post_commitment_root),
             };
 
-            // Public inputs: pre/post commitment roots, then pre/post nullifier roots
-            let mut final_public_inputs =
-                AssignedNative::<F>::as_public_input(&pre_commitment_root);
-            final_public_inputs.extend(AssignedNative::<F>::as_public_input(&post_commitment_root));
-            final_public_inputs.extend(AssignedNative::<F>::as_public_input(&pre_nullifier_root));
-            final_public_inputs.extend(AssignedNative::<F>::as_public_input(&post_nullifier_root));
+            // Public inputs:
+            // [pre_commit, post_commit, pre_null, post_null, collapsed_acc_pi...]
+            let mut final_public_inputs: Vec<F> = vec![
+                pre_commitment_root,
+                post_commitment_root,
+                pre_nullifier_root,
+                post_nullifier_root,
+            ];
+            final_public_inputs.extend(collapsed_pi.clone());
 
             let final_proof_bytes = {
                 let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
@@ -2328,21 +2322,29 @@ fn main() {
                 dual_msm.check(&agg_srs.verifier_params()),
                 "Final aggregation proof must verify"
             );
+
+            // verify the output accumulator attesting to the truthness of the client proofs
+            assert!(
+                collapsed.check(&agg_srs.s_g2().into(), &agg_result.fixed_bases),
+                "Final aggregation collapsed accumulator must verify"
+            );
+
             println!(
-                "\n✅ Final aggregation proof for batch {} verified in-circuit.\n\
+                "\n✅ Final aggregation proof for batch {} verified.\n\
                  Shared state Merkle root (internal to circuit): {:?}\n\
                  Commitment-set transition: {:?} -> {:?}\n\
-                 Nullifier-set transition: {:?} -> {:?}",
+                 Nullifier-set transition: {:?} -> {:?}\n\
+                 Collapsed accumulator PI length: {} field elements",
                 batch_idx,
                 agg_result.root_state,
                 pre_commitment_root,
                 post_commitment_root,
                 pre_nullifier_root,
-                post_nullifier_root
+                post_nullifier_root,
+                collapsed_pi.len()
             );
         }
 
-        // Commit shadow state only after successful aggregation/verification
         commitment_leaves = shadow_commitment_leaves;
         accounts = shadow_accounts;
         nullifier_map = shadow_nullifier_map;
@@ -2359,7 +2361,6 @@ fn main() {
 
     println!("\nFinal root: {:?}", commitment_root(&commitment_leaves));
 
-    // (Optional) show balances per account (sum of unspent amounts)
     for acc in &accounts {
         let bal: u128 = acc
             .wallet

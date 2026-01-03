@@ -1202,6 +1202,12 @@ mod proof_agg {
                 }
 
                 let root_pi = assigned_items[0].clone();
+                scalar_chip.assert_equal(
+                    &mut layouter,
+                    &commit_map_gadget.succinct_repr(),
+                    &root_pi,
+                )?;
+
                 let pkx = assigned_items[1].clone();
                 let pky = assigned_items[2].clone();
                 let new_c1 = assigned_items[3].clone();

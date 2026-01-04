@@ -1268,6 +1268,7 @@ mod proof_agg {
             }
 
             let root = level_vals[0].clone();
+            scalar_chip.constrain_as_public_input(&mut layouter, &root)?;
 
             // ------------------------------------------------------------------
             // 4. Assign vk for the inner AGG circuit and verify the AGG proof
@@ -2154,12 +2155,13 @@ fn main() {
             };
 
             // Public inputs:
-            // [pre_commit, post_commit, pre_null, post_null, collapsed_acc_pi...]
+            // [pre_commit, post_commit, pre_null, post_null, merkle_root collapsed_acc_pi]
             let mut final_public_inputs: Vec<F> = vec![
                 pre_commitment_root,
                 post_commitment_root,
                 pre_nullifier_root,
                 post_nullifier_root,
+                agg_result.root_state,
             ];
             final_public_inputs.extend(collapsed_pi.clone());
 

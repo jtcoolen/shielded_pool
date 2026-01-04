@@ -2661,7 +2661,7 @@ fn main() {
             let default_final_circuit = FinalAggCircuit {
                 child_vk: agg_result.child_vk.clone(),
                 child_vk_name: agg_result.child_vk_name.clone(),
-                child_level: F::ZERO,
+                child_level: F::from(agg_result.child_level as u64),
                 left_proof: Value::unknown(),
                 right_proof: Value::unknown(),
                 left_pi_acc: Value::unknown(),

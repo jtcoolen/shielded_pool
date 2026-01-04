@@ -959,7 +959,8 @@ mod proof_agg {
                     let left = &current_level[i * 2];
                     let right = &current_level[i * 2 + 1];
 
-                    let state = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[left.state, right.state]);
+                    let state =
+                        <PoseidonChip<F> as HashCPU<F, F>>::hash(&[left.state, right.state]);
 
                     let circuit = InternalAggCircuit {
                         child_vk: child_vk_data.clone(),
@@ -1078,6 +1079,9 @@ mod proof_agg {
     ///  - recomputes each client's instance hash and Poseidon Merkle root,
     ///  - ties that root to the AGG proof,
     ///  - performs commitment/nullifier state transition checks,
+    ///  - checks each client root_pi is in the historic-roots set,
+    ///  - enforces the *batch* pre-commitment root is also in the historic-roots set,
+    ///  - updates the historic-roots set by inserting post_commitment_root,
     ///  - AND: computes a "collapsed accumulator" = accumulate( inner_proof_acc , agg_pi_acc )
     ///        and exposes it as public input(s).
     ///
@@ -1086,7 +1090,10 @@ mod proof_agg {
     ///   * PI1: post-commitment succinct_repr root
     ///   * PI2: pre-nullifier succinct_repr root
     ///   * PI3: post-nullifier succinct_repr root
-    ///   * PI4.. : collapsed accumulator (acc_pi...)
+    ///   * PI4: pre-historic-commitment-roots-set succinct_repr root
+    ///   * PI5: post-historic-commitment-roots-set succinct_repr root
+    ///   * PI6: Poseidon Merkle root of client instance hashes (batch)
+    ///   * PI7.. : collapsed accumulator (acc_pi...)
     #[derive(Clone, Debug)]
     pub struct FinalAggCircuit {
         /// Inner aggregation vk / proof
@@ -1112,6 +1119,10 @@ mod proof_agg {
         /// Commitment-set state transition
         pub pre_commitment_map: Value<Map>,
         pub post_commitment_root: Value<F>,
+
+        /// NEW: MapMt "set" of historic commitment roots: key=root, value=1.
+        pub pre_commitment_roots_map: Value<Map>,
+        pub post_commitment_roots_root: Value<F>,
     }
 
     impl Circuit<F> for FinalAggCircuit {
@@ -1183,6 +1194,27 @@ mod proof_agg {
             let one = scalar_chip.assign(&mut layouter, Value::known(F::ONE))?;
 
             // ------------------------------------------------------------------
+            // 1b. Historic commitment roots "set" (MapMt as a set)
+            // ------------------------------------------------------------------
+            let mut roots_map_gadget = midnight_circuits::map::map_gadget::MapGadget::<
+                F,
+                NG,
+                PoseidonChip<F>,
+            >::new(&scalar_chip, &poseidon_chip);
+            roots_map_gadget.init(&mut layouter, self.pre_commitment_roots_map.clone())?;
+
+            let pre_roots_set_root = roots_map_gadget.succinct_repr();
+            scalar_chip.constrain_as_public_input(&mut layouter, &pre_roots_set_root)?;
+
+            let expected_post_roots_set_root =
+                scalar_chip.assign(&mut layouter, self.post_commitment_roots_root.clone())?;
+            scalar_chip.constrain_as_public_input(&mut layouter, &expected_post_roots_set_root)?;
+
+            // NEW: enforce that the batch pre-state commitment root is itself in the historic-roots set.
+            let pre_ok = roots_map_gadget.get(&mut layouter, &pre_commit_root)?;
+            scalar_chip.assert_equal(&mut layouter, &pre_ok, &one)?;
+
+            // ------------------------------------------------------------------
             // 2. Recompute client instance hashes and update maps
             // ------------------------------------------------------------------
             assert!(
@@ -1202,11 +1234,10 @@ mod proof_agg {
                 }
 
                 let root_pi = assigned_items[0].clone();
-                scalar_chip.assert_equal(
-                    &mut layouter,
-                    &commit_map_gadget.succinct_repr(),
-                    &root_pi,
-                )?;
+
+                // NEW: root_pi must be a known historic committed root.
+                let root_ok = roots_map_gadget.get(&mut layouter, &root_pi)?;
+                scalar_chip.assert_equal(&mut layouter, &root_ok, &one)?;
 
                 let pkx = assigned_items[1].clone();
                 let pky = assigned_items[2].clone();
@@ -1226,9 +1257,9 @@ mod proof_agg {
                 let inst_hash =
                     poseidon_chip.hash(&mut layouter, &[acc2, nf1.clone(), nf2.clone()])?;
 
-                leaf_hashes.push(inst_hash.clone());
+                leaf_hashes.push(inst_hash);
 
-                // Commitments: just insert (append-only set)
+                // Commitments: insert (append-only set)
                 commit_map_gadget.insert(&mut layouter, &new_c1, &one)?;
                 commit_map_gadget.insert(&mut layouter, &new_c2, &one)?;
 
@@ -1252,6 +1283,14 @@ mod proof_agg {
                 &expected_post_null_root,
             )?;
 
+            // NEW: update historic-roots set with the newly produced commitment root.
+            roots_map_gadget.insert(&mut layouter, &expected_post_commit_root, &one)?;
+            scalar_chip.assert_equal(
+                &mut layouter,
+                &roots_map_gadget.succinct_repr(),
+                &expected_post_roots_set_root,
+            )?;
+
             // ------------------------------------------------------------------
             // 3. Poseidon Merkle root of client instance hashes (batch instances)
             // ------------------------------------------------------------------
@@ -1267,13 +1306,12 @@ mod proof_agg {
                 level_vals = next_level;
             }
 
-            let root = level_vals[0].clone();
-            scalar_chip.constrain_as_public_input(&mut layouter, &root)?;
+            let batch_root = level_vals[0].clone();
+            // PI6
+            scalar_chip.constrain_as_public_input(&mut layouter, &batch_root)?;
 
             // ------------------------------------------------------------------
             // 4. Assign vk for the inner AGG circuit and verify the AGG proof
-            //    Ensures agg_pi_acc used here is exactly the same used to build
-            //    the PI slice passed to `prepare`.
             // ------------------------------------------------------------------
             let vk_val: AssignedNative<F> =
                 native_chip.assign_fixed(&mut layouter, self.agg_vk.2)?;
@@ -1302,7 +1340,7 @@ mod proof_agg {
 
             // Build the inner public inputs: [root, acc_pi..., level]
             let mut assigned_pi: Vec<AssignedNative<F>> = Vec::new();
-            assigned_pi.push(root.clone());
+            assigned_pi.push(batch_root.clone());
             assigned_pi.extend(verifier_chip.as_public_input(&mut layouter, &agg_pi_acc)?);
             assigned_pi.push(level);
 
@@ -1499,11 +1537,11 @@ pub struct Spend2Output2;
 impl Relation for Spend2Output2 {
     type Instance = F;
 
-    // PATCH: replace the two Merkle paths with a single pre-state commitment map witness.
-    // The circuit proves membership of the two consumed commitments via MapGadget::get,
+    // Witness includes a single pre-state commitment map witness.
+    // Circuit proves membership of the two consumed commitments via MapGadget::get,
     // and uses commit_map.succinct_repr() as the "root" hashed into the instance.
     type Witness = (
-        MapMt<F, PoseidonChip<F>>, // pre-state commitment map
+        MapMt<F, PoseidonChip<F>>, // historic (committed) commitment map snapshot
         JubjubScalar,              // sk
         F,                         // alpha (blinding factor)
         Utxo,
@@ -1568,9 +1606,8 @@ impl Relation for Spend2Output2 {
         let old_c1 = compute_commitment_from_parts(std_lib, layouter, &old1_asg, &pk_sx, &pk_sy)?;
         let old_c2 = compute_commitment_from_parts(std_lib, layouter, &old2_asg, &pk_sx, &pk_sy)?;
 
-        // PATCH: Use MapGadget over the provided pre-state commitment map to prove membership
-        // and to derive the state root.
-
+        // Use MapGadget over the provided historic commitment map snapshot to prove membership
+        // and to derive the state root included in the instance hash.
         let mut commit_map_gadget: midnight_circuits::map::map_gadget::MapGadget<
             midnight_curves::Fq,
             midnight_circuits::field::NativeGadget<
@@ -1750,6 +1787,10 @@ struct Note {
     utxo: Utxo,
     commit: F,
     spent: bool,
+    // NEW: the canonical commitment-root index where this note is known to exist.
+    // - seed notes: 0 (genesis)
+    // - outputs created in batch i: confirmed_at_root_idx = (current_history_len) before committing batch
+    confirmed_at_root_idx: usize,
 }
 
 #[derive(Clone)]
@@ -1765,12 +1806,12 @@ struct Account {
 fn main() {
     use midnight_circuits::instructions::map::MapCPU;
 
-    // PATCH: distinct leaf VK name (must be consistent anywhere fixed bases/names are derived).
+    // distinct leaf VK name (must be consistent anywhere fixed bases/names are derived).
     const LEAF_VK_NAME: &str = "spend2output2_vk";
 
     const K: u32 = 14;
     const NUM_ACCOUNTS: usize = 4;
-    const NUM_SEED_DEPOSITS_PER_ACCOUNT: usize = 3;
+    const NUM_SEED_DEPOSITS_PER_ACCOUNT: usize = 5;
     const NUM_TRANSFERS: usize = 120;
 
     assert_eq!(
@@ -1786,9 +1827,14 @@ fn main() {
     let mut rng = ChaCha8Rng::from_entropy();
     let asset_id = F::random(&mut rng);
 
-    // PATCH: the commitment state is the MapMt, and its succinct_repr() is the state root.
+    // commitment and nullifier states
     let mut commitment_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
     let mut nullifier_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
+
+    // NEW: canonical historic commitment roots + snapshots + "set" (MapMt)
+    let mut commitment_root_history: Vec<F> = Vec::new();
+    let mut commitment_root_snapshots: Vec<MapMt<F, PoseidonChip<F>>> = Vec::new();
+    let mut commitment_roots_set = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
 
     // Create accounts
     let mut accounts: Vec<Account> = (0..NUM_ACCOUNTS)
@@ -1831,19 +1877,33 @@ fn main() {
                 utxo,
                 commit,
                 spent: false,
+                confirmed_at_root_idx: 0,
             });
         }
     }
-    println!(
-        "Initial commitment root: {:?}",
-        commitment_map.succinct_repr()
-    );
 
-    let choose_sender = |rng: &mut ChaCha8Rng, accs: &mut [Account]| -> Option<usize> {
+    let genesis_root = commitment_map.succinct_repr();
+    println!("Initial commitment root: {:?}", genesis_root);
+
+    // Commit genesis root into history + set
+    commitment_root_history.push(genesis_root);
+    commitment_root_snapshots.push(commitment_map.clone());
+    commitment_roots_set.insert(&genesis_root, &F::ONE);
+
+    let choose_sender = |rng: &mut ChaCha8Rng,
+                         accs: &mut [Account],
+                         latest_confirmed_root_idx: usize|
+     -> Option<usize> {
         let viable: Vec<usize> = accs
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.wallet.iter().filter(|n| !n.spent).count() >= 2)
+            .filter(|(_, a)| {
+                a.wallet
+                    .iter()
+                    .filter(|n| !n.spent && n.confirmed_at_root_idx <= latest_confirmed_root_idx)
+                    .count()
+                    >= 2
+            })
             .map(|(i, _)| i)
             .collect();
         if viable.is_empty() {
@@ -1867,6 +1927,9 @@ fn main() {
 
         let pre_nullifier_map_for_batch = shadow_nullifier_map.clone();
         let pre_commitment_map_for_batch = shadow_commitment_map.clone();
+        let pre_commitment_roots_map_for_batch = commitment_roots_set.clone();
+
+        let latest_confirmed_root_idx = commitment_root_history.len() - 1;
 
         let mut client_proofs: Vec<AggClientProof> = Vec::new();
 
@@ -1883,11 +1946,15 @@ fn main() {
                 break;
             }
 
-            let sender_idx = match choose_sender(&mut rng, &mut shadow_accounts) {
+            let sender_idx = match choose_sender(
+                &mut rng,
+                &mut shadow_accounts,
+                latest_confirmed_root_idx,
+            ) {
                 Some(i) => i,
                 None => {
                     println!(
-                        "[batch {}] no account has two spendable notes; stopping batching.",
+                        "[batch {}] no account has two spendable confirmed notes; stopping batching.",
                         batch_idx
                     );
                     batch_failed = true;
@@ -1900,7 +1967,9 @@ fn main() {
                     .wallet
                     .iter()
                     .enumerate()
-                    .filter(|(_, n)| !n.spent)
+                    .filter(|(_, n)| {
+                        !n.spent && n.confirmed_at_root_idx <= latest_confirmed_root_idx
+                    })
                     .map(|(i, _)| i)
                     .collect();
                 let a = unspent[rng.gen_range(0..unspent.len())];
@@ -1918,8 +1987,19 @@ fn main() {
             let old1 = shadow_accounts[sender_idx].wallet[i_old1].clone();
             let old2 = shadow_accounts[sender_idx].wallet[i_old2].clone();
 
-            // PATCH: root_before is the MapMt succinct repr BEFORE inserting the new commitments.
-            let root_before = shadow_commitment_map.succinct_repr();
+            // NEW: choose a *historic committed* root at/after both notes are confirmed
+            let min_root_idx =
+                core::cmp::max(old1.confirmed_at_root_idx, old2.confirmed_at_root_idx);
+            let max_lag = (latest_confirmed_root_idx - min_root_idx).min(3);
+            let lag = if max_lag == 0 {
+                0
+            } else {
+                rng.gen_range(0..=max_lag)
+            };
+            let chosen_root_idx = latest_confirmed_root_idx - lag;
+
+            let historic_commit_map = commitment_root_snapshots[chosen_root_idx].clone();
+            let root_before = commitment_root_history[chosen_root_idx];
 
             let total: u128 = old1.utxo.amount + old2.utxo.amount;
             let out1_amt: u128 = if total == 0 {
@@ -1958,8 +2038,8 @@ fn main() {
             let nf1 = host_nullify(old1.commit, sender.pk_x, sender.pk_y);
             let nf2 = host_nullify(old2.commit, sender.pk_x, sender.pk_y);
 
-            // We can update nullifier state immediately (Spend2Output2 doesn't read it),
-            // but commitment updates MUST happen after proving so the map witness is pre-state.
+            // Update nullifier state immediately (Spend2Output2 doesn't read it),
+            // but commitment updates MUST happen after proving so the map witness is historic pre-state.
             shadow_nullifier_map.insert(&nf1, &F::ONE);
             shadow_nullifier_map.insert(&nf2, &F::ONE);
 
@@ -1981,9 +2061,9 @@ fn main() {
             ];
             let instance: F = host_instance_hash(public_items);
 
-            // PATCH: witness includes the *pre-state* commitment map.
+            // Witness includes the chosen historic commitment map snapshot.
             let witness = (
-                shadow_commitment_map.clone(),
+                historic_commit_map,
                 sender.sk,
                 F::from_bytes_le(&alpha.to_bytes()).unwrap(),
                 old1.utxo.clone(),
@@ -2012,22 +2092,27 @@ fn main() {
                 public_items,
             });
 
-            // Now apply the state transition for subsequent txs.
+            // Apply the state transition for subsequent txs in the batch.
             shadow_commitment_map.insert(&new1_commit, &F::ONE);
             shadow_commitment_map.insert(&new2_commit, &F::ONE);
 
             shadow_accounts[sender_idx].wallet[i_old1].spent = true;
             shadow_accounts[sender_idx].wallet[i_old2].spent = true;
 
+            // New outputs become spendable only once the batch is committed, i.e. at the next root index.
+            let confirm_at_idx = commitment_root_history.len();
+
             shadow_accounts[r1].wallet.push(Note {
                 utxo: new1,
                 commit: new1_commit,
                 spent: false,
+                confirmed_at_root_idx: confirm_at_idx,
             });
             shadow_accounts[r2].wallet.push(Note {
                 utxo: new2,
                 commit: new2_commit,
                 spent: false,
+                confirmed_at_root_idx: confirm_at_idx,
             });
 
             let root_after = shadow_commitment_map.succinct_repr();
@@ -2055,7 +2140,6 @@ fn main() {
         );
 
         let now = Instant::now();
-        // PATCH: use correct leaf vk name (must match fixed-base naming expectations).
         let agg_result = aggregate_client_proofs(&srs, vk.vk(), LEAF_VK_NAME, K, &client_proofs);
         println!(
             "Batch {} aggregated proof generated and internally verified in {:?}",
@@ -2074,6 +2158,12 @@ fn main() {
 
         let pre_commitment_root = pre_commitment_map_for_batch.succinct_repr();
         let post_commitment_root = shadow_commitment_map.succinct_repr();
+
+        // NEW: historic-roots-set transition for this batch
+        let pre_roots_set_root = pre_commitment_roots_map_for_batch.succinct_repr();
+        let mut shadow_commitment_roots_set = pre_commitment_roots_map_for_batch.clone();
+        shadow_commitment_roots_set.insert(&post_commitment_root, &F::ONE);
+        let post_roots_set_root = shadow_commitment_roots_set.succinct_repr();
 
         // ---------------------------------------------------------------------
         // Create and verify a FinalAggCircuit proof for *this* aggregation
@@ -2131,6 +2221,8 @@ fn main() {
                 post_nullifier_root: Value::unknown(),
                 pre_commitment_map: Value::unknown(),
                 post_commitment_root: Value::unknown(),
+                pre_commitment_roots_map: Value::unknown(),
+                post_commitment_roots_root: Value::unknown(),
             };
 
             let agg_srs = proof_agg::filecoin_srs_agg(proof_agg::AGG_K).unwrap();
@@ -2152,15 +2244,21 @@ fn main() {
                 post_nullifier_root: Value::known(post_nullifier_root),
                 pre_commitment_map: Value::known(pre_commitment_map_for_batch.clone()),
                 post_commitment_root: Value::known(post_commitment_root),
+                pre_commitment_roots_map: Value::known(pre_commitment_roots_map_for_batch.clone()),
+                post_commitment_roots_root: Value::known(post_roots_set_root),
             };
 
             // Public inputs:
-            // [pre_commit, post_commit, pre_null, post_null, merkle_root collapsed_acc_pi]
+            // [pre_commit, post_commit, pre_null, post_null,
+            //  pre_roots_set, post_roots_set,
+            //  batch_merkle_root, collapsed_acc_pi...]
             let mut final_public_inputs: Vec<F> = vec![
                 pre_commitment_root,
                 post_commitment_root,
                 pre_nullifier_root,
                 post_nullifier_root,
+                pre_roots_set_root,
+                post_roots_set_root,
                 agg_result.root_state,
             ];
             final_public_inputs.extend(collapsed_pi.clone());
@@ -2212,9 +2310,10 @@ fn main() {
 
             println!(
                 "\n✅ Final aggregation proof for batch {} verified.\n\
-                 Shared state Merkle root (internal to circuit): {:?}\n\
+                 Shared batch Merkle root (internal to circuit): {:?}\n\
                  Commitment-set transition: {:?} -> {:?}\n\
                  Nullifier-set transition: {:?} -> {:?}\n\
+                 Historic-roots-set transition: {:?} -> {:?}\n\
                  Collapsed accumulator PI length: {} field elements",
                 batch_idx,
                 agg_result.root_state,
@@ -2222,13 +2321,21 @@ fn main() {
                 post_commitment_root,
                 pre_nullifier_root,
                 post_nullifier_root,
+                pre_roots_set_root,
+                post_roots_set_root,
                 collapsed_pi.len()
             );
         }
 
+        // Commit batch state to "chain"
         accounts = shadow_accounts;
         nullifier_map = shadow_nullifier_map;
         commitment_map = shadow_commitment_map;
+
+        // Commit roots-set and snapshot for the new canonical commitment root
+        commitment_roots_set = shadow_commitment_roots_set;
+        commitment_root_history.push(commitment_map.succinct_repr());
+        commitment_root_snapshots.push(commitment_map.clone());
 
         println!(
             "After batch {} committed commitment root: {:?}",

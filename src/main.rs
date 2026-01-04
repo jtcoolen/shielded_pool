@@ -19,7 +19,7 @@ use midnight_circuits::{
 };
 
 use midnight_curves::{Fq as F, Fr as JubjubScalar, JubjubExtended as Jubjub, JubjubSubgroup};
-use midnight_proofs::plonk::Error;
+use midnight_proofs::plonk::{Error, create_proof, keygen_pk, keygen_vk_with_k, prepare};
 use midnight_proofs::{
     circuit::{Layouter, Value},
     transcript::Transcript,
@@ -402,20 +402,9 @@ mod proof_agg {
 
                 scalar_chip.assert_equal(&mut layouter, &l[0], &c_pre)?;
 
-                let inst_l = {
-                    let acc1 = poseidon_chip
-                        .hash(&mut layouter, &[l[0].clone(), l[1].clone(), l[2].clone()])?;
-                    let acc2 =
-                        poseidon_chip.hash(&mut layouter, &[acc1, l[3].clone(), l[4].clone()])?;
-                    poseidon_chip.hash(&mut layouter, &[acc2, l[5].clone(), l[6].clone()])?
-                };
-                let inst_r = {
-                    let acc1 = poseidon_chip
-                        .hash(&mut layouter, &[r[0].clone(), r[1].clone(), r[2].clone()])?;
-                    let acc2 =
-                        poseidon_chip.hash(&mut layouter, &[acc1, r[3].clone(), r[4].clone()])?;
-                    poseidon_chip.hash(&mut layouter, &[acc2, r[5].clone(), r[6].clone()])?
-                };
+                // ✅ Single Poseidon hash of all 7 would-be public inputs
+                let inst_l = poseidon_chip.hash(&mut layouter, &l[..])?;
+                let inst_r = poseidon_chip.hash(&mut layouter, &r[..])?;
 
                 commit_map_gadget.insert(&mut layouter, &l[3], &one)?;
                 commit_map_gadget.insert(&mut layouter, &l[4], &one)?;
@@ -644,11 +633,10 @@ mod proof_agg {
         level_states[0]
     }
 
+    // ✅ Single Poseidon hash of all 7 would-be public inputs (host-side)
     fn host_instance_hash(items: [F; 7]) -> F {
         use midnight_circuits::instructions::hash::HashCPU;
-        let acc1 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[items[0], items[1], items[2]]);
-        let acc2 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc1, items[3], items[4]]);
-        <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc2, items[5], items[6]])
+        <PoseidonChip<F> as HashCPU<F, F>>::hash(&items)
     }
 
     fn verify_and_extract_acc(
@@ -727,6 +715,7 @@ mod proof_agg {
         }
     }
 
+    #[derive(Clone)]
     struct AggKeyStore {
         levels: Vec<AggLevelKeys>,
     }
@@ -773,30 +762,66 @@ mod proof_agg {
         (vk, pk)
     }
 
-    pub fn aggregate_client_proofs(
+    /// Cached aggregation keys & supporting data. Compute once (e.g., at program start),
+    /// then reuse for every batch.
+    #[derive(Clone)]
+    pub struct AggSetup {
+        // Inputs
+        leaf_vk_name: String,
+        num_leaves: usize,
+        max_agg_level: usize,
+
+        // Derived/cached
+        leaf_vk_data: VkData,
+
+        agg_srs_leaf: ParamsKZG<Bls12>,
+        agg_srs_internal: ParamsKZG<Bls12>,
+        agg_store: AggKeyStore,
+
+        leaf_fixed_bases: BTreeMap<String, C>,
+        fixed_base_names: Vec<String>,
+        fixed_bases: BTreeMap<String, C>,
+        trivial_combined: Accumulator<S>,
+
+        child_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
+        child_vk_name: String,
+        child_level: usize,
+    }
+
+    impl AggSetup {
+        pub fn child_vk(&self) -> &(EvaluationDomain<F>, ConstraintSystem<F>, F) {
+            &self.child_vk
+        }
+        pub fn child_vk_name(&self) -> &str {
+            &self.child_vk_name
+        }
+        pub fn child_level(&self) -> usize {
+            self.child_level
+        }
+        pub fn fixed_base_names(&self) -> &[String] {
+            &self.fixed_base_names
+        }
+    }
+
+    /// Prepare and cache all aggregation keys once, for a fixed `num_leaves` (batch size).
+    pub fn prepare_agg_setup(
         leaf_srs: &ParamsKZG<Bls12>,
         leaf_vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
-        leaf_vk_name: &'static str,
+        leaf_vk_name: &str,
         leaf_k: u32,
-        client_proofs: &[ClientProof],
-        pre_commitment_map: Map,
-        pre_nullifier_map: Map,
-    ) -> AggregationResult {
-        use midnight_circuits::instructions::hash::HashCPU;
-
-        assert!(!client_proofs.is_empty(), "Need at least one client proof");
+        num_leaves: usize,
+    ) -> AggSetup {
+        assert!(num_leaves > 0, "Need at least one client proof");
         assert!(
-            client_proofs.len().is_power_of_two(),
+            num_leaves.is_power_of_two(),
             "Client proofs must be power of two"
         );
 
-        let num_leaves = client_proofs.len();
         let max_level: usize = (num_leaves as u32).trailing_zeros() as usize;
         assert!(
             max_level >= 2,
             "Merged final agg requires at least 4 client proofs"
         );
-
         let max_agg_level: usize = max_level - 1;
 
         let leaf_vk_data = VkData {
@@ -808,15 +833,19 @@ mod proof_agg {
         let mut agg_cs = ConstraintSystem::default();
         configure_agg_circuit(&mut agg_cs);
 
-        let agg_srs1 = filecoin_srs_agg(K_LEAF).unwrap();
-        let agg_srs2 = filecoin_srs_agg(K_INTERNAL).unwrap();
+        let agg_srs_leaf = filecoin_srs_agg(K_LEAF).unwrap();
+        let agg_srs_internal = filecoin_srs_agg(K_INTERNAL).unwrap();
 
-        assert_eq!(leaf_srs.s_g2(), agg_srs2.s_g2(), "s_g2 mismatch");
-        assert_eq!(agg_srs1.s_g2(), agg_srs2.s_g2(), "s_g2 mismatch");
+        assert_eq!(leaf_srs.s_g2(), agg_srs_internal.s_g2(), "s_g2 mismatch");
+        assert_eq!(
+            agg_srs_leaf.s_g2(),
+            agg_srs_internal.s_g2(),
+            "s_g2 mismatch"
+        );
 
         let agg_vk_names: Vec<String> = (1..=max_agg_level).map(agg_vk_name_for_level).collect();
 
-        let combined_fixed_base_names: Vec<String> = {
+        let fixed_base_names: Vec<String> = {
             let mut set = BTreeSet::new();
             let mut out = Vec::new();
 
@@ -870,11 +899,11 @@ mod proof_agg {
                     right_proof: Value::unknown(),
                     left_acc: Value::unknown(),
                     right_acc: Value::unknown(),
-                    fixed_base_names: combined_fixed_base_names.clone(),
+                    fixed_base_names: fixed_base_names.clone(),
                     prev_level: Value::unknown(),
                     is_leaf,
                 };
-                let (vk, pk) = keygen_vk_pk(&agg_srs1, &default_circuit, K_LEAF);
+                let (vk, pk) = keygen_vk_pk(&agg_srs_leaf, &default_circuit, K_LEAF);
                 println!("Computed {} vk/pk in {:?}", name, start.elapsed());
                 agg_levels.push(AggLevelKeys::new(level, name, vk, pk));
             } else {
@@ -892,11 +921,11 @@ mod proof_agg {
                     right_proof: Value::unknown(),
                     left_acc: Value::unknown(),
                     right_acc: Value::unknown(),
-                    fixed_base_names: combined_fixed_base_names.clone(),
+                    fixed_base_names: fixed_base_names.clone(),
                     prev_level: Value::unknown(),
                     is_leaf,
                 };
-                let (vk, pk) = keygen_vk_pk(&agg_srs2, &default_circuit, K_INTERNAL);
+                let (vk, pk) = keygen_vk_pk(&agg_srs_internal, &default_circuit, K_INTERNAL);
                 println!("Computed {} vk/pk in {:?}", name, start.elapsed());
                 agg_levels.push(AggLevelKeys::new(level, name, vk, pk));
             }
@@ -911,10 +940,10 @@ mod proof_agg {
             leaf_vk,
         ));
 
-        let mut combined_fixed_bases = BTreeMap::new();
-        combined_fixed_bases.extend(leaf_fixed_bases.iter().map(|(k, v)| (k.clone(), *v)));
+        let mut fixed_bases = BTreeMap::new();
+        fixed_bases.extend(leaf_fixed_bases.iter().map(|(k, v)| (k.clone(), *v)));
         for level in 1..=agg_store.max_level() {
-            combined_fixed_bases.extend(
+            fixed_bases.extend(
                 agg_store
                     .get(level)
                     .fixed_bases
@@ -925,7 +954,6 @@ mod proof_agg {
 
         let trivial_leaf =
             trivial_acc_with_names(&fixed_base_names_for(leaf_vk_name, &leaf_vk_data.cs));
-
         let mut trivial_all: Vec<Accumulator<S>> = vec![trivial_leaf];
         for level in 1..=agg_store.max_level() {
             let vk_name = agg_store.get(level).name.as_str();
@@ -935,10 +963,83 @@ mod proof_agg {
         let mut trivial_combined = Accumulator::accumulate(&trivial_all);
         trivial_combined.collapse();
 
+        let child_level = max_agg_level;
+        let child_keys = agg_store.get(child_level);
+        let child_vk = (
+            child_keys.vk_data.domain.clone(),
+            child_keys.vk_data.cs.clone(),
+            child_keys.vk_data.transcript_repr,
+        );
+
+        AggSetup {
+            leaf_vk_name: leaf_vk_name.to_string(),
+            num_leaves,
+            max_agg_level,
+
+            leaf_vk_data,
+
+            agg_srs_leaf,
+            agg_srs_internal,
+            agg_store: agg_store.clone(),
+
+            leaf_fixed_bases,
+            fixed_base_names,
+            fixed_bases,
+            trivial_combined,
+
+            child_vk,
+            child_vk_name: child_keys.name.clone(),
+            child_level,
+        }
+    }
+
+    /// Aggregation using cached keys (`AggSetup`). No vk/pk computation occurs here.
+    pub fn aggregate_client_proofs_cached(
+        setup: &AggSetup,
+        leaf_srs: &ParamsKZG<Bls12>,
+        leaf_vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
+        client_proofs: &[ClientProof],
+        pre_commitment_map: Map,
+        pre_nullifier_map: Map,
+    ) -> AggregationResult {
+        use midnight_circuits::instructions::hash::HashCPU;
+
+        assert_eq!(
+            client_proofs.len(),
+            setup.num_leaves,
+            "client_proofs len must match cached setup (expected {}, got {})",
+            setup.num_leaves,
+            client_proofs.len()
+        );
+        assert!(!client_proofs.is_empty(), "Need at least one client proof");
+        assert!(
+            client_proofs.len().is_power_of_two(),
+            "Client proofs must be power of two"
+        );
+
+        let num_leaves = client_proofs.len();
+        let max_level: usize = (num_leaves as u32).trailing_zeros() as usize;
+        assert!(
+            max_level >= 2,
+            "Merged final agg requires at least 4 client proofs"
+        );
+        let max_agg_level: usize = max_level - 1;
+        assert_eq!(
+            max_agg_level, setup.max_agg_level,
+            "max_agg_level mismatch with cached setup"
+        );
+
+        let agg_srs1 = &setup.agg_srs_leaf;
+        let agg_srs2 = &setup.agg_srs_internal;
+
+        let combined_fixed_base_names = setup.fixed_base_names.clone();
+        let combined_fixed_bases = setup.fixed_bases.clone();
+        let trivial_combined = setup.trivial_combined.clone();
+
         println!("\nCreating {} leaf AGG nodes...", num_leaves / 2);
 
         let leaf_level = 1usize;
-        let leaf_keys = agg_store.get(leaf_level);
+        let leaf_keys = setup.agg_store.get(leaf_level);
         let leaf_agg_vk_name = leaf_keys.name.clone();
 
         let mut rolling_commit_map = pre_commitment_map.clone();
@@ -1032,12 +1133,12 @@ mod proof_agg {
             );
         });
 
-        let leaf_vk_data_cl = leaf_vk_data.clone();
-        let combined_fixed_base_names_cl = combined_fixed_base_names.clone();
-        let leaf_vk_name_string = leaf_vk_name.to_string();
-
+        let leaf_vk_data_cl = setup.leaf_vk_data.clone();
+        let leaf_vk_name_string = setup.leaf_vk_name.clone();
         let leaf_pk = leaf_keys.pk.clone();
         let leaf_vk_arc = leaf_keys.vk.clone();
+
+        let leaf_fixed_bases = setup.leaf_fixed_bases.clone();
 
         let mut current_level: Vec<TreeNode> = leaf_plans
             .par_iter()
@@ -1058,7 +1159,7 @@ mod proof_agg {
                     right_proof: Value::known(p.right_proof.clone()),
                     left_acc: Value::known(trivial_combined.clone()),
                     right_acc: Value::known(trivial_combined.clone()),
-                    fixed_base_names: combined_fixed_base_names_cl.clone(),
+                    fixed_base_names: combined_fixed_base_names.clone(),
                     prev_level: Value::known(F::ZERO),
                     is_leaf: true,
                 };
@@ -1102,7 +1203,7 @@ mod proof_agg {
                         CircuitTranscript<PoseidonState<F>>,
                         LeafAggCircuit,
                     >(
-                        &agg_srs1,
+                        agg_srs1,
                         leaf_pk.as_ref(),
                         &[circuit],
                         1,
@@ -1128,7 +1229,7 @@ mod proof_agg {
                 );
 
                 let proof_acc = verify_and_extract_acc(
-                    &agg_srs1,
+                    agg_srs1,
                     leaf_vk_arc.as_ref(),
                     &leaf_keys.fixed_bases,
                     &proof,
@@ -1147,7 +1248,7 @@ mod proof_agg {
         let mut child_level: usize = 1;
         while current_level.len() > 2 {
             let parent_level = child_level + 1;
-            let parent_keys = agg_store.get(parent_level);
+            let parent_keys = setup.agg_store.get(parent_level);
             let parent_vk_name = parent_keys.name.clone();
 
             println!(
@@ -1157,7 +1258,7 @@ mod proof_agg {
                 current_level.len() / 2
             );
 
-            let child_keys = agg_store.get(child_level);
+            let child_keys = setup.agg_store.get(child_level);
             let child_vk_data = child_keys.vk_data.clone();
             let child_vk_name = child_keys.name.clone();
 
@@ -1241,7 +1342,7 @@ mod proof_agg {
                             CircuitTranscript<PoseidonState<F>>,
                             InternalAggCircuit,
                         >(
-                            &agg_srs2,
+                            agg_srs2,
                             parent_pk.as_ref(),
                             &[circuit],
                             1,
@@ -1267,7 +1368,7 @@ mod proof_agg {
                     );
 
                     let proof_acc = verify_and_extract_acc(
-                        &agg_srs2,
+                        agg_srs2,
                         parent_vk.as_ref(),
                         &parent_keys.fixed_bases,
                         &proof,
@@ -1321,7 +1422,7 @@ mod proof_agg {
             "Root subroot mismatch with recomputed Poseidon tree root"
         );
 
-        let child_keys = agg_store.get(child_level);
+        let child_keys = setup.agg_store.get(child_level);
         let child_vk_tuple = (
             child_keys.vk_data.domain.clone(),
             child_keys.vk_data.cs.clone(),
@@ -1598,7 +1699,7 @@ mod proof_agg {
 
 use proof_agg::{
     AggAccumulator, ClientProof as AggClientProof, FinalAggCircuit, accumulator_as_public_input,
-    aggregate_client_proofs, filecoin_srs_agg,
+    aggregate_client_proofs_cached, filecoin_srs_agg, prepare_agg_setup,
 };
 
 const UTXO_COMMIT_TAG: u64 = 0x0001;
@@ -1714,9 +1815,18 @@ impl Relation for Spend2Output2 {
             std_lib, layouter, &old1_asg, &old2_asg, &new1_asg, &new2_asg,
         )?;
 
-        let acc1 = std_lib.poseidon(layouter, &[root.clone(), pk_bx.clone(), pk_by.clone()])?;
-        let acc2 = std_lib.poseidon(layouter, &[acc1, new_c1.clone(), new_c2.clone()])?;
-        let instance_hash = std_lib.poseidon(layouter, &[acc2, nf1.clone(), nf2.clone()])?;
+        let instance_hash = std_lib.poseidon(
+            layouter,
+            &[
+                root.clone(),
+                pk_bx.clone(),
+                pk_by.clone(),
+                new_c1.clone(),
+                new_c2.clone(),
+                nf1.clone(),
+                nf2.clone(),
+            ],
+        )?;
 
         std_lib.constrain_as_public_input(layouter, &instance_hash)?;
         Ok(())
@@ -1836,10 +1946,9 @@ fn host_nullify(commit: F, pk_x: F, pk_y: F) -> F {
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h, pk_y, F::ZERO])
 }
 
+// ✅ Single Poseidon hash of all 7 would-be public inputs (host-side)
 fn host_instance_hash(items: [F; 7]) -> F {
-    let acc1 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[items[0], items[1], items[2]]);
-    let acc2 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc1, items[3], items[4]]);
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[acc2, items[5], items[6]])
+    <PoseidonChip<F> as HashCPU<F, F>>::hash(&items)
 }
 
 #[derive(Clone, Debug)]
@@ -1872,6 +1981,31 @@ fn main() {
     let relation = Spend2Output2;
     let vk = compact_std_lib::setup_vk(&srs, &relation);
     let pk = compact_std_lib::setup_pk(&relation, &vk);
+
+    // ✅ Cache AGG keys once (for the fixed batch size).
+    let agg_setup = prepare_agg_setup(&srs, vk.vk(), LEAF_VK_NAME, K, BATCH_SIZE);
+
+    // ✅ Cache FINAL aggregation vk/pk once (depends only on cached agg_setup for this batch size).
+    let final_agg_srs = proof_agg::filecoin_srs_agg(proof_agg::AGG_K).unwrap();
+    let default_final_circuit = FinalAggCircuit {
+        child_vk: agg_setup.child_vk().clone(),
+        child_vk_name: agg_setup.child_vk_name().to_string(),
+        child_level: F::from(agg_setup.child_level() as u64),
+        left_proof: Value::unknown(),
+        right_proof: Value::unknown(),
+        left_pi_acc: Value::unknown(),
+        right_pi_acc: Value::unknown(),
+        fixed_base_names: agg_setup.fixed_base_names().to_vec(),
+        left_child_state: Value::unknown(),
+        right_child_state: Value::unknown(),
+        agg_state: Value::unknown(),
+        pre_commitment_roots_map: Value::unknown(),
+        post_commitment_roots_root: Value::unknown(),
+    };
+    let final_vk = keygen_vk_with_k(&final_agg_srs, &default_final_circuit, proof_agg::AGG_K)
+        .expect("final vk gen should not fail");
+    let final_pk =
+        keygen_pk(final_vk.clone(), &default_final_circuit).expect("final pk gen should not fail");
 
     let mut rng = ChaCha8Rng::from_entropy();
     let asset_id = F::random(&mut rng);
@@ -2165,11 +2299,10 @@ fn main() {
         );
 
         let now = Instant::now();
-        let agg_result = aggregate_client_proofs(
+        let agg_result = aggregate_client_proofs_cached(
+            &agg_setup,
             &srs,
             vk.vk(),
-            LEAF_VK_NAME,
-            K,
             &client_proofs,
             pre_commitment_map_for_batch.clone(),
             pre_nullifier_map_for_batch.clone(),
@@ -2191,10 +2324,7 @@ fn main() {
 
         {
             use midnight_proofs::poly::kzg::KZGCommitmentScheme;
-            use midnight_proofs::{
-                plonk::{create_proof, keygen_pk, keygen_vk_with_k, prepare},
-                transcript::CircuitTranscript,
-            };
+            use midnight_proofs::transcript::CircuitTranscript;
 
             let mut final_acc: AggAccumulator = AggAccumulator::accumulate(&[
                 agg_result.left_top.proof_acc.clone(),
@@ -2204,28 +2334,6 @@ fn main() {
             ]);
             final_acc.collapse();
             let final_acc_pi = accumulator_as_public_input(&final_acc);
-
-            let default_final_circuit = FinalAggCircuit {
-                child_vk: agg_result.child_vk.clone(),
-                child_vk_name: agg_result.child_vk_name.clone(),
-                child_level: F::from(agg_result.child_level as u64),
-                left_proof: Value::unknown(),
-                right_proof: Value::unknown(),
-                left_pi_acc: Value::unknown(),
-                right_pi_acc: Value::unknown(),
-                fixed_base_names: agg_result.fixed_base_names.clone(),
-                left_child_state: Value::unknown(),
-                right_child_state: Value::unknown(),
-                agg_state: Value::unknown(),
-                pre_commitment_roots_map: Value::unknown(),
-                post_commitment_roots_root: Value::unknown(),
-            };
-
-            let agg_srs = proof_agg::filecoin_srs_agg(proof_agg::AGG_K).unwrap();
-            let final_vk = keygen_vk_with_k(&agg_srs, &default_final_circuit, proof_agg::AGG_K)
-                .expect("final vk gen should not fail");
-            let final_pk = keygen_pk(final_vk.clone(), &default_final_circuit)
-                .expect("final pk gen should not fail");
 
             let final_circuit = FinalAggCircuit {
                 child_vk: agg_result.child_vk.clone(),
@@ -2254,6 +2362,7 @@ fn main() {
             ];
             final_public_inputs.extend(final_acc_pi.clone());
 
+            // ✅ Use cached final_pk/final_vk/final_agg_srs (no per-batch keygen).
             let final_proof_bytes = {
                 let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
                 create_proof::<
@@ -2262,7 +2371,7 @@ fn main() {
                     CircuitTranscript<PoseidonState<F>>,
                     FinalAggCircuit,
                 >(
-                    &agg_srs,
+                    &final_agg_srs,
                     &final_pk,
                     &[final_circuit],
                     1,
@@ -2288,12 +2397,12 @@ fn main() {
             .expect("Final aggregation verification preparation failed");
 
             assert!(
-                dual_msm.check(&agg_srs.verifier_params()),
+                dual_msm.check(&final_agg_srs.verifier_params()),
                 "Final proof must verify"
             );
 
             assert!(
-                final_acc.check(&agg_srs.s_g2().into(), &agg_result.fixed_bases),
+                final_acc.check(&final_agg_srs.s_g2().into(), &agg_result.fixed_bases),
                 "Final aggregation accumulator must verify"
             );
 

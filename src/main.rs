@@ -27,20 +27,16 @@ use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
 
 // -----------------------------------------------------------------------------
-// Proof aggregator module (SWAPPED to use the recursive aggregation approach
-// from <AGG>: explicit per-level VKs, enforced prev_level, and raw PIs
-// [state_fields..., acc_pi..., level] (no VK-PI prefix selection).
+// Proof aggregator module
 //
-// UPDATED per <SPEC>/<PATCH>:
-// - Agg state is now 5 field elements:
-//   [C_pre, C_post, N_pre, N_post, batch_subroot]
-// - Leaf agg nodes recompute each client's instance hash from 7 public items,
-//   verify client proof against that hash, then hash two inst hashes into subroot,
-//   and perform the 2-tx map updates (commitment + nullifier) using prestate maps.
-// - Internal agg nodes hash child subroots, and enforce boundary equality:
-//   left.C_post == right.C_pre and left.N_post == right.N_pre
-// - FinalAggCircuit is a thin wrap: verifies root agg proof against the 5-field state,
-//   optionally updates historic-roots set, and collapses the accumulator.
+// UPDATED per your request (MERGE):
+// - We remove the extra "wrap" proof layer: the final aggregation circuit now
+//   directly verifies the two top-level AGG child proofs and includes the checks
+//   previously performed by FinalAggCircuit (historic-roots-set transition, PI order).
+// - The final aggregation circuit DOES NOT recompute the merkle hash for the batch
+//   subroot; it takes it from the provided final agg_state (and exposes it).
+// - Public inputs are exposed in the SAME ORDER as before:
+//     [C_pre, C_post, N_pre, N_post, s_root, pre_roots_set, post_roots_set, acc_pi...]
 // -----------------------------------------------------------------------------
 mod proof_agg {
     use core::array;
@@ -107,17 +103,12 @@ mod proof_agg {
     type Map = midnight_circuits::map::cpu::MapMt<F, PoseidonChip<F>>;
 
     // -------------------------------------------------------------------------
-    // NEW (per your request): wrapper to make Map transferable across rayon threads
-    // without patching the upstream library. The !Send/!Sync comes from PhantomData<H>
-    // (PoseidonChip) rather than actual shared mutable state inside MapMt.
+    // Wrapper to make Map transferable across rayon threads without patching upstream.
     // -------------------------------------------------------------------------
     #[repr(transparent)]
     #[derive(Clone)]
     struct SendableMap(Map);
 
-    // SAFETY: MapMt stores owned data; the !Send/!Sync is inherited through a marker type param.
-    // Each LeafPlan owns its own cloned map snapshots; we don't share mutable instances across
-    // threads.
     unsafe impl Send for SendableMap {}
     unsafe impl Sync for SendableMap {}
 
@@ -140,7 +131,6 @@ mod proof_agg {
     }
 
     // Leaf aggregation circuit size and internal aggregation circuit size.
-    // Mirrors the <AGG> pattern (leaf smaller than internal).
     const K_LEAF: u32 = 19;
     const K_INTERNAL: u32 = 20;
 
@@ -157,7 +147,7 @@ mod proof_agg {
     type InternalAggCircuit = AggCircuit<K_INTERNAL>;
 
     // -------------------------------------------------------------------------
-    // NEW: Agg state is 5 field elements:
+    // Agg state is 5 field elements:
     //   [C_pre, C_post, N_pre, N_post, batch_subroot]
     // -------------------------------------------------------------------------
     pub const AGG_STATE_WIDTH: usize = 5;
@@ -643,7 +633,7 @@ mod proof_agg {
             )?;
             right_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-            // Accumulate and output
+            // Accumulate and output (this is the PI accumulator for this node)
             let mut next_acc = AssignedAccumulator::<S>::accumulate(
                 &mut layouter,
                 &verifier_chip,
@@ -669,12 +659,12 @@ mod proof_agg {
     }
 
     #[derive(Clone, Debug)]
-    struct TreeNode {
-        state: AggState,
-        proof: Vec<u8>,
-        proof_acc: AggAccumulator,
-        pi_acc: AggAccumulator,
-        public_inputs: AggPublicInputs,
+    pub struct TreeNode {
+        pub state: AggState,
+        pub proof: Vec<u8>,
+        pub proof_acc: AggAccumulator,
+        pub pi_acc: AggAccumulator,
+        pub public_inputs: AggPublicInputs,
     }
 
     #[derive(Clone, Debug)]
@@ -702,16 +692,28 @@ mod proof_agg {
         right_proof: Vec<u8>,
     }
 
+    /// Result of building the AGG tree up to the top *pair* (two nodes).
+    /// The final circuit (merged) will verify these two proofs and output the
+    /// final public inputs in the same order as before:
+    ///   [state_fields..., pre_roots_set, post_roots_set, acc_pi...]
     #[derive(Clone, Debug)]
     pub struct AggregationResult {
         pub root_state: AggState,
-        pub agg_proof: Vec<u8>,
-        pub agg_public_inputs: AggPublicInputs,
-        pub agg_proof_acc: AggAccumulator,
-        pub agg_vk: VerifyingKey<F, KZGCommitmentScheme<E>>,
-        pub agg_vk_name: String,
+
+        // Top pair (both are AGG proofs at level `child_level`)
+        pub left_top: TreeNode,
+        pub right_top: TreeNode,
+
+        // The VK data/name for the child level that FinalAggCircuit verifies
+        pub child_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
+        pub child_vk_name: String,
+        pub child_level: usize,
+
+        // Fixed base plumbing for accumulator checks / in-circuit accumulator assignment
         pub fixed_base_names: Vec<String>,
         pub fixed_bases: BTreeMap<String, C>,
+
+        // Debug material
         pub leaf_states: Vec<F>,
         pub client_pis: Vec<[F; 7]>,
     }
@@ -885,8 +887,11 @@ mod proof_agg {
         (vk, pk)
     }
 
-    /// Aggregates a list of client proofs into a single AGG proof.
-    /// NEW: takes batch pre-maps so leaf agg nodes can prove the 2-tx segment transitions.
+    /// Aggregates a list of client proofs into an AGG tree up to the top pair.
+    /// Leaf agg nodes prove the 2-tx segment transitions using `pre_*_map`.
+    ///
+    /// NOTE (MERGE): we stop one level earlier (top pair) because the final circuit
+    /// will verify these two top proofs and include the FinalAgg checks.
     pub fn aggregate_client_proofs(
         leaf_srs: &ParamsKZG<Bls12>,
         leaf_vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
@@ -907,6 +912,14 @@ mod proof_agg {
         let num_leaves = client_proofs.len();
         let max_level: usize = (num_leaves as u32).trailing_zeros() as usize;
         assert!(max_level > 0, "max_level computed as 0");
+        assert!(
+            max_level >= 2,
+            "Merged final agg requires at least 4 client proofs (got {})",
+            num_leaves
+        );
+
+        // We build AGG levels 1..=(max_level-1). The final circuit verifies level (max_level-1).
+        let max_agg_level: usize = max_level - 1;
 
         // Leaf vk data (for any 1-instance circuit)
         let leaf_vk_data = VkData {
@@ -934,10 +947,10 @@ mod proof_agg {
             "agg_srs1 vs agg_srs2 s_g2 mismatch"
         );
 
-        // Precompute all AGG vk names
-        let agg_vk_names: Vec<String> = (1..=max_level).map(agg_vk_name_for_level).collect();
+        // Precompute AGG vk names (levels we actually build)
+        let agg_vk_names: Vec<String> = (1..=max_agg_level).map(agg_vk_name_for_level).collect();
 
-        // Build a global fixed base name list (Leaf + every AGG vk_name)
+        // Build a global fixed base name list (Leaf + every AGG vk_name we build)
         let combined_fixed_base_names: Vec<String> = {
             let mut set = BTreeSet::new();
             let mut out = Vec::new();
@@ -957,10 +970,10 @@ mod proof_agg {
             out
         };
 
-        // Keygen one AGG VK/PK per level
-        let mut agg_levels: Vec<AggLevelKeys> = Vec::with_capacity(max_level);
+        // Keygen one AGG VK/PK per level (1..=max_agg_level)
+        let mut agg_levels: Vec<AggLevelKeys> = Vec::with_capacity(max_agg_level);
 
-        for level in 1..=max_level {
+        for level in 1..=max_agg_level {
             let (child_vk, child_vk_name, expected_prev_level, is_leaf) = if level == 1 {
                 (
                     leaf_vk_data.clone(),
@@ -1031,7 +1044,7 @@ mod proof_agg {
 
         let agg_store = AggKeyStore::new(agg_levels);
 
-        // Build combined fixed bases map
+        // Build combined fixed bases map (Leaf + all built AGG levels)
         let mut leaf_fixed_bases = BTreeMap::new();
         leaf_fixed_bases.insert(String::from("com_instance"), C::identity());
         leaf_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
@@ -1051,7 +1064,7 @@ mod proof_agg {
             );
         }
 
-        // Build a global trivial accumulator carrying fixed bases for all circuits
+        // Build a global trivial accumulator carrying fixed bases for all circuits we use
         let trivial_leaf =
             trivial_acc_with_names(&fixed_base_names_for(leaf_vk_name, &leaf_vk_data.cs));
 
@@ -1076,12 +1089,7 @@ mod proof_agg {
         let mut rolling_commit_map = pre_commitment_map.clone();
         let mut rolling_null_map = pre_nullifier_map.clone();
 
-        // ---------------------------------------------------------------------
-        // Parallel proof creation:
-        // Step 1: Build a leaf plan per leaf sequentially (rolling maps dependency).
-        // Step 2: Pure CPU checks in parallel (instance hash recomputation).
-        // Step 3: create_proof + verify/extract acc IN PARALLEL for each leaf plan.
-        // ---------------------------------------------------------------------
+        // Build leaf plans sequentially (rolling maps dependency)
         let mut leaf_plans: Vec<LeafPlan> = Vec::with_capacity(num_leaves / 2);
 
         for i in 0..num_leaves / 2 {
@@ -1093,7 +1101,6 @@ mod proof_agg {
             let n_pre = rolling_null_map.succinct_repr();
 
             // Leaf root-binding expectations:
-            // left.root == current C_pre
             assert_eq!(left.public_items[0], c_pre, "leaf {} left root != c_pre", i);
 
             // Clone prestate maps for leaf witness
@@ -1158,7 +1165,7 @@ mod proof_agg {
             });
         }
 
-        // Step 2: pure CPU checks in parallel.
+        // Pure CPU checks in parallel.
         leaf_plans.par_iter().for_each(|p| {
             let inst_l = host_instance_hash(p.left_items);
             let inst_r = host_instance_hash(p.right_items);
@@ -1181,7 +1188,7 @@ mod proof_agg {
             );
         });
 
-        // Step 3: create_proof in parallel
+        // Create leaf agg proofs in parallel
         let leaf_vk_data_cl = leaf_vk_data.clone();
         let combined_fixed_base_names_cl = combined_fixed_base_names.clone();
         let leaf_vk_name_string = leaf_vk_name.to_string();
@@ -1230,6 +1237,7 @@ mod proof_agg {
                     &[p.right_state],
                 );
 
+                // Leaf pi accumulator = accumulate(proof_acc_left, trivial, proof_acc_right, trivial)
                 let mut accumulated_pi = Accumulator::accumulate(&[
                     proof_acc_left,
                     trivial_combined.clone(),
@@ -1297,9 +1305,9 @@ mod proof_agg {
             })
             .collect();
 
-        // Build internal layers (each verifies previous aggregation layer)
+        // Build internal layers up to the top pair
         let mut child_level: usize = 1;
-        while current_level.len() > 1 {
+        while current_level.len() > 2 {
             let parent_level = child_level + 1;
             let parent_keys = agg_store.get(parent_level);
             let parent_vk_name = parent_keys.name.clone();
@@ -1434,27 +1442,62 @@ mod proof_agg {
             child_level = parent_level;
         }
 
-        // Final root and sanity check
-        let root = &current_level[0];
+        assert_eq!(
+            current_level.len(),
+            2,
+            "expected to stop at the top pair; got len={}",
+            current_level.len()
+        );
 
+        // Top pair sanity checks and compute final root_state (host-side).
+        let left_top = current_level[0].clone();
+        let right_top = current_level[1].clone();
+
+        assert_eq!(
+            left_top.state.c_post, right_top.state.c_pre,
+            "top-pair commit boundary mismatch"
+        );
+        assert_eq!(
+            left_top.state.n_post, right_top.state.n_pre,
+            "top-pair null boundary mismatch"
+        );
+
+        let root_subroot = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[
+            left_top.state.subroot,
+            right_top.state.subroot,
+        ]);
+
+        let root_state = AggState {
+            c_pre: left_top.state.c_pre,
+            c_post: right_top.state.c_post,
+            n_pre: left_top.state.n_pre,
+            n_post: right_top.state.n_post,
+            subroot: root_subroot,
+        };
+
+        // Sanity check vs full recomputed Poseidon tree root (host-side only).
         let leaf_states: Vec<F> = client_proofs.iter().map(|p| p.state).collect();
         let client_pis: Vec<[F; 7]> = client_proofs.iter().map(|p| p.public_items).collect();
         let expected_root = poseidon_tree_root(&leaf_states);
         assert_eq!(
-            root.state.subroot, expected_root,
+            root_state.subroot, expected_root,
             "Root subroot mismatch with recomputed Poseidon tree root"
         );
 
-        let final_level = max_level;
-        let final_keys = agg_store.get(final_level);
+        let child_keys = agg_store.get(child_level);
+        let child_vk_tuple = (
+            child_keys.vk_data.domain.clone(),
+            child_keys.vk_data.cs.clone(),
+            child_keys.vk_data.transcript_repr,
+        );
 
         AggregationResult {
-            root_state: root.state,
-            agg_proof: root.proof.clone(),
-            agg_public_inputs: root.public_inputs.clone(),
-            agg_proof_acc: root.proof_acc.clone(),
-            agg_vk: (*final_keys.vk).clone(),
-            agg_vk_name: final_keys.name.clone(),
+            root_state,
+            left_top,
+            right_top,
+            child_vk: child_vk_tuple,
+            child_vk_name: child_keys.name.clone(),
+            child_level,
             fixed_base_names: combined_fixed_base_names,
             fixed_bases: combined_fixed_bases,
             leaf_states,
@@ -1462,30 +1505,53 @@ mod proof_agg {
         }
     }
 
-    /// Final aggregation circuit (thin wrapper):
-    ///  - exposes the 5-field agg state as public inputs,
-    ///  - (optionally) updates the historic-commitment-roots set, and collapses the accumulator.
+    /// Final aggregation circuit (MERGED):
     ///
-    /// Public inputs exposed:
+    /// - Verifies the two top-level AGG child proofs against:
+    ///     PI_child = [state_fields..., acc_pi..., level]
+    /// - Enforces boundary equality:
+    ///     left.C_post == right.C_pre
+    ///     left.N_post == right.N_pre
+    /// - Binds the exposed final state roots:
+    ///     C_pre  == left.C_pre
+    ///     C_post == right.C_post
+    ///     N_pre  == left.N_pre
+    ///     N_post == right.N_post
+    /// - DOES NOT recompute the Merkle subroot:
+    ///     subroot is taken from `agg_state` and exposed (no constraint to children).
+    /// - Performs the historic commitment-roots "set" transition (MapMt as a set):
+    ///     * exposes pre-root-set root
+    ///     * checks C_pre is in set
+    ///     * inserts C_post and enforces expected post-root-set root
+    /// - Outputs the final accumulator:
+    ///     acc = accumulate(left_proof_acc, left_pi_acc, right_proof_acc, right_pi_acc)
+    ///
+    /// Public inputs (same order as BEFORE):
     ///   * PI0..PI4: [C_pre, C_post, N_pre, N_post, s_root]
     ///   * PI5: pre-historic-commitment-roots-set root
     ///   * PI6: post-historic-commitment-roots-set root
-    ///   * PI7.. : collapsed accumulator (acc_pi...)
+    ///   * PI7.. : accumulator (acc_pi...)
     #[derive(Clone, Debug)]
     pub struct FinalAggCircuit {
-        /// Inner aggregation vk / proof
-        pub agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
-        pub agg_vk_name: String,
-        pub agg_proof: Value<Vec<u8>>,
+        /// VK of the child agg layer (the level of `left` and `right` proofs)
+        pub child_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
+        pub child_vk_name: String,
 
-        /// The PI accumulator from the inner AggCircuit (must match the one used in `prepare`)
-        pub agg_pi_acc: Value<AggAccumulator>,
-        /// The "level" field element expected in the inner public inputs
-        pub agg_level: F,
-        /// Fixed base names needed to assign `agg_pi_acc` deterministically
+        /// Expected child level in the child public inputs
+        pub child_level: F,
+
+        /// Child proofs and their PI accumulators
+        pub left_proof: Value<Vec<u8>>,
+        pub right_proof: Value<Vec<u8>>,
+        pub left_pi_acc: Value<AggAccumulator>,
+        pub right_pi_acc: Value<AggAccumulator>,
         pub fixed_base_names: Vec<String>,
 
-        /// NEW: agg state fields supplied (and exposed) by the caller
+        /// Child agg states (5-field) used to build/verify child public inputs and boundaries
+        pub left_child_state: Value<AggState>,
+        pub right_child_state: Value<AggState>,
+
+        /// Final agg state (exposed as PI0..PI4). `subroot` is NOT recomputed.
         pub agg_state: Value<AggState>,
 
         /// Historic commitment roots "set" (MapMt as a set): key=root, value=1.
@@ -1505,12 +1571,16 @@ mod proof_agg {
 
         fn without_witnesses(&self) -> Self {
             Self {
-                agg_vk: self.agg_vk.clone(),
-                agg_vk_name: self.agg_vk_name.clone(),
-                agg_proof: Value::unknown(),
-                agg_pi_acc: Value::unknown(),
-                agg_level: self.agg_level,
+                child_vk: self.child_vk.clone(),
+                child_vk_name: self.child_vk_name.clone(),
+                child_level: self.child_level,
+                left_proof: Value::unknown(),
+                right_proof: Value::unknown(),
+                left_pi_acc: Value::unknown(),
+                right_pi_acc: Value::unknown(),
                 fixed_base_names: self.fixed_base_names.clone(),
+                left_child_state: Value::unknown(),
+                right_child_state: Value::unknown(),
                 agg_state: Value::unknown(),
                 pre_commitment_roots_map: Value::unknown(),
                 post_commitment_roots_root: Value::unknown(),
@@ -1534,7 +1604,9 @@ mod proof_agg {
             let verifier_chip: VerifierGadget<_> =
                 VerifierGadget::<S>::new(&curve_chip, &scalar_chip, &poseidon_chip);
 
-            // 1) Expose agg state fields as public inputs
+            // ----------------------------
+            // 1) Assign and expose final agg state fields (PI0..PI4)
+            // ----------------------------
             let c_pre =
                 scalar_chip.assign(&mut layouter, self.agg_state.clone().map(|s| s.c_pre))?;
             scalar_chip.constrain_as_public_input(&mut layouter, &c_pre)?;
@@ -1551,9 +1623,68 @@ mod proof_agg {
                 scalar_chip.assign(&mut layouter, self.agg_state.clone().map(|s| s.subroot))?;
             scalar_chip.constrain_as_public_input(&mut layouter, &subroot)?;
 
+            // ----------------------------
+            // 2) Assign child states and enforce boundaries + bind roots (no Merkle recompute)
+            // ----------------------------
+            let l_c_pre = scalar_chip.assign(
+                &mut layouter,
+                self.left_child_state.clone().map(|s| s.c_pre),
+            )?;
+            let l_c_post: AssignedNative<F> = scalar_chip.assign(
+                &mut layouter,
+                self.left_child_state.clone().map(|s| s.c_post),
+            )?;
+            let l_n_pre = scalar_chip.assign(
+                &mut layouter,
+                self.left_child_state.clone().map(|s| s.n_pre),
+            )?;
+            let l_n_post: AssignedNative<F> = scalar_chip.assign(
+                &mut layouter,
+                self.left_child_state.clone().map(|s| s.n_post),
+            )?;
+            let l_subroot: AssignedNative<F> = scalar_chip.assign(
+                &mut layouter,
+                self.left_child_state.clone().map(|s| s.subroot),
+            )?;
+
+            let r_c_pre = scalar_chip.assign(
+                &mut layouter,
+                self.right_child_state.clone().map(|s| s.c_pre),
+            )?;
+            let r_c_post = scalar_chip.assign(
+                &mut layouter,
+                self.right_child_state.clone().map(|s| s.c_post),
+            )?;
+            let r_n_pre = scalar_chip.assign(
+                &mut layouter,
+                self.right_child_state.clone().map(|s| s.n_pre),
+            )?;
+            let r_n_post = scalar_chip.assign(
+                &mut layouter,
+                self.right_child_state.clone().map(|s| s.n_post),
+            )?;
+            let r_subroot: AssignedNative<F> = scalar_chip.assign(
+                &mut layouter,
+                self.right_child_state.clone().map(|s| s.subroot),
+            )?;
+
+            // Boundary constraints (same as internal agg)
+            scalar_chip.assert_equal(&mut layouter, &l_c_post, &r_c_pre)?;
+            scalar_chip.assert_equal(&mut layouter, &l_n_post, &r_n_pre)?;
+
+            // Bind exposed roots to child boundaries
+            scalar_chip.assert_equal(&mut layouter, &c_pre, &l_c_pre)?;
+            scalar_chip.assert_equal(&mut layouter, &c_post, &r_c_post)?;
+            scalar_chip.assert_equal(&mut layouter, &n_pre, &l_n_pre)?;
+            scalar_chip.assert_equal(&mut layouter, &n_post, &r_n_post)?;
+
+            // NOTE: subroot is NOT recomputed / constrained to H(l_subroot, r_subroot).
+
+            // ----------------------------
+            // 3) Historic commitment-roots "set" transition (PI5..PI6)
+            // ----------------------------
             let one = scalar_chip.assign(&mut layouter, Value::known(F::ONE))?;
 
-            // 2) Historic commitment roots "set" transition
             let mut roots_map_gadget = midnight_circuits::map::map_gadget::MapGadget::<
                 F,
                 NG,
@@ -1580,17 +1711,19 @@ mod proof_agg {
                 &expected_post_roots_set_root,
             )?;
 
-            // 3) Verify the inner AGG proof against PI = [state_fields..., acc_pi..., level]
+            // ----------------------------
+            // 4) Verify the two child AGG proofs and compute final accumulator
+            // ----------------------------
             let vk_val: AssignedNative<F> =
-                native_chip.assign_fixed(&mut layouter, self.agg_vk.2)?;
+                native_chip.assign_fixed(&mut layouter, self.child_vk.2)?;
             let assigned_vk = verifier_chip.assign_vk(
-                self.agg_vk_name.as_str(),
-                &self.agg_vk.0,
-                &self.agg_vk.1,
+                self.child_vk_name.as_str(),
+                &self.child_vk.0,
+                &self.child_vk.1,
                 vk_val,
             )?;
 
-            let mut agg_pi_acc = AssignedAccumulator::assign(
+            let mut left_pi_acc = AssignedAccumulator::assign(
                 &mut layouter,
                 &curve_chip,
                 &scalar_chip,
@@ -1598,20 +1731,42 @@ mod proof_agg {
                 1,
                 &[],
                 &self.fixed_base_names,
-                self.agg_pi_acc.clone(),
+                self.left_pi_acc.clone(),
             )?;
-            agg_pi_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
+            left_pi_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-            let level = scalar_chip.assign(&mut layouter, Value::known(self.agg_level))?;
+            let mut right_pi_acc = AssignedAccumulator::assign(
+                &mut layouter,
+                &curve_chip,
+                &scalar_chip,
+                1,
+                1,
+                &[],
+                &self.fixed_base_names,
+                self.right_pi_acc.clone(),
+            )?;
+            right_pi_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-            let mut assigned_pi: Vec<AssignedNative<F>> = Vec::new();
-            assigned_pi.push(c_pre.clone());
-            assigned_pi.push(c_post.clone());
-            assigned_pi.push(n_pre.clone());
-            assigned_pi.push(n_post.clone());
-            assigned_pi.push(subroot.clone());
-            assigned_pi.extend(verifier_chip.as_public_input(&mut layouter, &agg_pi_acc)?);
-            assigned_pi.push(level);
+            let level: AssignedNative<F> =
+                scalar_chip.assign(&mut layouter, Value::known(self.child_level))?;
+
+            let mut left_pi: Vec<AssignedNative<F>> = Vec::new();
+            left_pi.push(l_c_pre.clone());
+            left_pi.push(l_c_post.clone());
+            left_pi.push(l_n_pre.clone());
+            left_pi.push(l_n_post.clone());
+            left_pi.push(l_subroot.clone());
+            left_pi.extend(verifier_chip.as_public_input(&mut layouter, &left_pi_acc)?);
+            left_pi.push(level.clone());
+
+            let mut right_pi: Vec<AssignedNative<F>> = Vec::new();
+            right_pi.push(r_c_pre.clone());
+            right_pi.push(r_c_post.clone());
+            right_pi.push(r_n_pre.clone());
+            right_pi.push(r_n_post.clone());
+            right_pi.push(r_subroot.clone());
+            right_pi.extend(verifier_chip.as_public_input(&mut layouter, &right_pi_acc)?);
+            right_pi.push(level);
 
             let id_point: AssignedForeignPoint<
                 midnight_curves::Fq,
@@ -1619,27 +1774,39 @@ mod proof_agg {
                 midnight_curves::G1Projective,
             > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
 
-            let mut proof_acc: AssignedAccumulator<_> = verifier_chip.prepare(
+            let mut left_proof_acc: AssignedAccumulator<_> = verifier_chip.prepare(
+                &mut layouter,
+                &assigned_vk,
+                &[("com_instance", id_point.clone())],
+                &[&left_pi],
+                self.left_proof.clone(),
+            )?;
+            left_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
+
+            let mut right_proof_acc: AssignedAccumulator<_> = verifier_chip.prepare(
                 &mut layouter,
                 &assigned_vk,
                 &[("com_instance", id_point)],
-                &[&assigned_pi],
-                self.agg_proof.clone(),
+                &[&right_pi],
+                self.right_proof.clone(),
             )?;
-            proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
+            right_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-            // 4) Collapse final accumulator = accumulate(proof_acc, agg_pi_acc)
-            let mut collapsed = AssignedAccumulator::<S>::accumulate(
+            // final_acc = accumulate(child_proof_acc, child_pi_acc, ...)
+            let mut final_acc = AssignedAccumulator::<S>::accumulate(
                 &mut layouter,
                 &verifier_chip,
                 &scalar_chip,
                 &poseidon_chip,
-                &[proof_acc, agg_pi_acc],
+                &[left_proof_acc, left_pi_acc, right_proof_acc, right_pi_acc],
             )?;
-            collapsed.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
+            final_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-            let collapsed_pi = verifier_chip.as_public_input(&mut layouter, &collapsed)?;
-            for x in collapsed_pi.iter() {
+            // ----------------------------
+            // 5) Expose final accumulator public inputs (PI7..)
+            // ----------------------------
+            let final_acc_pi = verifier_chip.as_public_input(&mut layouter, &final_acc)?;
+            for x in final_acc_pi.iter() {
                 scalar_chip.constrain_as_public_input(&mut layouter, x)?;
             }
 
@@ -1649,9 +1816,8 @@ mod proof_agg {
 
     #[allow(dead_code)]
     pub fn demo_poseidon_aggregation() {
-        // Kept for local smoke-testing; updated to match the new leaf agg expectations.
-        // We generate base proofs for a 1-instance circuit whose instance equals Inst(items),
-        // by choosing witness = [acc2, nf1, nf2], where acc2 = H(H(root,pkx,pky),c1,c2).
+        // Kept for local smoke-testing; updated to match the new "stop at top pair" behavior.
+        // This demo only builds the AGG tree and prints the computed root state.
         use midnight_circuits::compact_std_lib::{self, MidnightCircuit};
         use midnight_proofs::poly::kzg::KZGCommitmentScheme;
 
@@ -1799,9 +1965,20 @@ mod proof_agg {
             pre_nullifier_map,
         );
 
-        println!("\n=== AGG Tree Complete (demo) ===");
-        println!("Root subroot: {:?}", agg_res.root_state.subroot);
-        println!("Aggregated proof length: {} bytes", agg_res.agg_proof.len());
+        println!("\n=== AGG Tree (up to top pair) Complete (demo) ===");
+        println!(
+            "Computed final root_state.subroot (host): {:?}",
+            agg_res.root_state.subroot
+        );
+        println!(
+            "Top pair level: {}, child vk name: {}",
+            agg_res.child_level, agg_res.child_vk_name
+        );
+        println!(
+            "Top-left proof bytes: {}, top-right proof bytes: {}",
+            agg_res.left_top.proof.len(),
+            agg_res.right_top.proof.len()
+        );
     }
 }
 
@@ -1817,7 +1994,7 @@ use crate::proof_agg::filecoin_srs_agg;
 
 // -----------------------------------------------------------------------------
 // Original shielded Spend2Output2 code, modified so client circuits use the SAME
-// MapMt commitment state as the batch transition (no hand-rolled Merkle paths).
+// MapMt commitment state as the batch transition.
 // -----------------------------------------------------------------------------
 
 const UTXO_COMMIT_TAG: u64 = 0x0001;
@@ -2092,9 +2269,6 @@ struct Note {
     utxo: Utxo,
     commit: F,
     spent: bool,
-    // NEW: the canonical commitment-root index where this note is known to exist.
-    // - seed notes: 0 (genesis)
-    // - outputs created in batch i: confirmed_at_root_idx = (current_history_len) before committing batch
     confirmed_at_root_idx: usize,
 }
 
@@ -2136,7 +2310,7 @@ fn main() {
     let mut commitment_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
     let mut nullifier_map = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
 
-    // NEW: canonical historic commitment roots + snapshots + "set" (MapMt)
+    // canonical historic commitment roots + snapshots + "set" (MapMt)
     let mut commitment_root_history: Vec<F> = Vec::new();
     let mut commitment_root_snapshots: Vec<MapMt<F, PoseidonChip<F>>> = Vec::new();
     let mut commitment_roots_set = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
@@ -2292,9 +2466,8 @@ fn main() {
             let old1 = shadow_accounts[sender_idx].wallet[i_old1].clone();
             let old2 = shadow_accounts[sender_idx].wallet[i_old2].clone();
 
-            // IMPORTANT (per updated spec):
-            // Use the *current* in-batch pre-state commitment root (sequential composition),
-            // not an arbitrary historic snapshot root.
+            // IMPORTANT:
+            // Use the *current* in-batch pre-state commitment root (sequential composition).
             let historic_commit_map = shadow_commitment_map.clone();
             let root_before = shadow_commitment_map.succinct_repr();
 
@@ -2396,7 +2569,7 @@ fn main() {
             shadow_accounts[sender_idx].wallet[i_old1].spent = true;
             shadow_accounts[sender_idx].wallet[i_old2].spent = true;
 
-            // New outputs become spendable only once the batch is committed, i.e. at the next root index.
+            // New outputs become spendable only once the batch is committed.
             let confirm_at_idx = commitment_root_history.len();
 
             shadow_accounts[r1].wallet.push(Note {
@@ -2436,6 +2609,7 @@ fn main() {
             "Batch size must be a power of two."
         );
 
+        // Build AGG tree up to the top pair (no root AGG proof anymore)
         let now = Instant::now();
         let agg_result = aggregate_client_proofs(
             &srs,
@@ -2447,63 +2621,55 @@ fn main() {
             pre_nullifier_map_for_batch.clone(),
         );
         println!(
-            "Batch {} aggregated proof generated and internally verified in {:?}",
+            "Batch {} aggregated (up to top pair) in {:?}",
             batch_idx,
             now.elapsed()
         );
         println!(
-            "Batch {} aggregated subroot: {:?}, agg proof length: {} bytes",
-            batch_idx,
-            agg_result.root_state.subroot,
-            agg_result.agg_proof.len()
+            "Batch {} computed subroot (host): {:?}",
+            batch_idx, agg_result.root_state.subroot
         );
 
-        // NEW: historic-roots-set transition for this batch
+        // Historic-roots-set transition for this batch
         let pre_roots_set_root = pre_commitment_roots_map_for_batch.succinct_repr();
         let mut shadow_commitment_roots_set = pre_commitment_roots_map_for_batch.clone();
         shadow_commitment_roots_set.insert(&agg_result.root_state.c_post, &F::ONE);
         let post_roots_set_root = shadow_commitment_roots_set.succinct_repr();
 
         // ---------------------------------------------------------------------
-        // Create and verify a FinalAggCircuit proof for *this* aggregation
+        // Create and verify the MERGED FinalAggCircuit proof for this batch
         // ---------------------------------------------------------------------
         {
             use midnight_proofs::poly::kzg::KZGCommitmentScheme;
             use midnight_proofs::{
                 circuit::Value,
                 plonk::{create_proof, keygen_pk, keygen_vk_with_k, prepare},
-                poly::EvaluationDomain,
                 transcript::CircuitTranscript,
             };
 
-            // Build vk data for the inner AggCircuit
-            let agg_domain = EvaluationDomain::<F>::new(
-                agg_result.agg_vk.cs().degree() as u32,
-                proof_agg::AGG_K,
-            );
-            let agg_vk_data = (
-                agg_domain.clone(),
-                agg_result.agg_vk.cs().clone(),
-                agg_result.agg_vk.transcript_repr(),
-            );
-
-            // Compute the "collapsed accumulator" that FinalAggCircuit will expose:
-            // collapsed = accumulate( inner_proof_acc , agg_pi_acc )
-            let mut collapsed: AggAccumulator = AggAccumulator::accumulate(&[
-                agg_result.agg_proof_acc.clone(),
-                agg_result.agg_public_inputs.pi_acc.clone(),
+            // Compute the final accumulator that the merged FinalAggCircuit exposes:
+            // final_acc = accumulate(left_top.proof_acc, left_top.pi_acc, right_top.proof_acc, right_top.pi_acc)
+            let mut final_acc: AggAccumulator = AggAccumulator::accumulate(&[
+                agg_result.left_top.proof_acc.clone(),
+                agg_result.left_top.pi_acc.clone(),
+                agg_result.right_top.proof_acc.clone(),
+                agg_result.right_top.pi_acc.clone(),
             ]);
-            collapsed.collapse();
-            let collapsed_pi = accumulator_as_public_input(&collapsed);
+            final_acc.collapse();
+            let final_acc_pi = accumulator_as_public_input(&final_acc);
 
             // Shape-only circuit for keygen
             let default_final_circuit = FinalAggCircuit {
-                agg_vk: agg_vk_data.clone(),
-                agg_vk_name: agg_result.agg_vk_name.clone(),
-                agg_proof: Value::unknown(),
-                agg_pi_acc: Value::unknown(),
-                agg_level: F::ZERO,
+                child_vk: agg_result.child_vk.clone(),
+                child_vk_name: agg_result.child_vk_name.clone(),
+                child_level: F::ZERO,
+                left_proof: Value::unknown(),
+                right_proof: Value::unknown(),
+                left_pi_acc: Value::unknown(),
+                right_pi_acc: Value::unknown(),
                 fixed_base_names: agg_result.fixed_base_names.clone(),
+                left_child_state: Value::unknown(),
+                right_child_state: Value::unknown(),
                 agg_state: Value::unknown(),
                 pre_commitment_roots_map: Value::unknown(),
                 post_commitment_roots_root: Value::unknown(),
@@ -2517,21 +2683,25 @@ fn main() {
 
             // Actual final circuit instance
             let final_circuit = FinalAggCircuit {
-                agg_vk: agg_vk_data,
-                agg_vk_name: agg_result.agg_vk_name.clone(),
-                agg_proof: Value::known(agg_result.agg_proof.clone()),
-                agg_pi_acc: Value::known(agg_result.agg_public_inputs.pi_acc.clone()),
-                agg_level: agg_result.agg_public_inputs.level,
+                child_vk: agg_result.child_vk.clone(),
+                child_vk_name: agg_result.child_vk_name.clone(),
+                child_level: F::from(agg_result.child_level as u64),
+                left_proof: Value::known(agg_result.left_top.proof.clone()),
+                right_proof: Value::known(agg_result.right_top.proof.clone()),
+                left_pi_acc: Value::known(agg_result.left_top.pi_acc.clone()),
+                right_pi_acc: Value::known(agg_result.right_top.pi_acc.clone()),
                 fixed_base_names: agg_result.fixed_base_names.clone(),
+                left_child_state: Value::known(agg_result.left_top.state),
+                right_child_state: Value::known(agg_result.right_top.state),
                 agg_state: Value::known(agg_result.root_state),
                 pre_commitment_roots_map: Value::known(pre_commitment_roots_map_for_batch.clone()),
                 post_commitment_roots_root: Value::known(post_roots_set_root),
             };
 
-            // Public inputs:
+            // Public inputs (same order as before):
             // [C_pre, C_post, N_pre, N_post, subroot,
             //  pre_roots_set, post_roots_set,
-            //  collapsed_acc_pi...]
+            //  acc_pi...]
             let mut final_public_inputs: Vec<F> = vec![
                 agg_result.root_state.c_pre,
                 agg_result.root_state.c_post,
@@ -2541,7 +2711,7 @@ fn main() {
                 pre_roots_set_root,
                 post_roots_set_root,
             ];
-            final_public_inputs.extend(collapsed_pi.clone());
+            final_public_inputs.extend(final_acc_pi.clone());
 
             let final_proof_bytes = {
                 let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
@@ -2582,19 +2752,19 @@ fn main() {
                 "Final aggregation proof must verify"
             );
 
-            // verify the output accumulator attesting to the truthness of the client proofs
+            // verify the output accumulator attesting to the truthness of the client proofs + agg proofs
             assert!(
-                collapsed.check(&agg_srs.s_g2().into(), &agg_result.fixed_bases),
-                "Final aggregation collapsed accumulator must verify"
+                final_acc.check(&agg_srs.s_g2().into(), &agg_result.fixed_bases),
+                "Final aggregation accumulator must verify"
             );
 
             println!(
-                "\n✅ Final aggregation proof for batch {} verified.\n\
-                 Batch instance-root (proved by AggCircuit tree): {:?}\n\
+                "\n✅ Final aggregation (MERGED) proof for batch {} verified.\n\
+                 Batch instance-root (host): {:?}\n\
                  Commitment-set transition: {:?} -> {:?}\n\
                  Nullifier-set transition: {:?} -> {:?}\n\
                  Historic-roots-set transition: {:?} -> {:?}\n\
-                 Collapsed accumulator PI length: {} field elements",
+                 Final accumulator PI length: {} field elements",
                 batch_idx,
                 agg_result.root_state.subroot,
                 agg_result.root_state.c_pre,
@@ -2603,7 +2773,7 @@ fn main() {
                 agg_result.root_state.n_post,
                 pre_roots_set_root,
                 post_roots_set_root,
-                collapsed_pi.len()
+                final_acc_pi.len()
             );
         }
 

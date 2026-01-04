@@ -11,7 +11,7 @@ use midnight_circuits::{
     instructions::{
         AssertionInstructions, AssignmentInstructions, ControlFlowInstructions,
         ConversionInstructions, DecompositionInstructions, EccInstructions,
-        PublicInputInstructions, hash::HashCPU, map::MapInstructions,
+        PublicInputInstructions, ZeroInstructions, hash::HashCPU, map::MapInstructions,
     },
     map::cpu::MapMt,
     types::{AssignedBit, AssignedNative, AssignedNativePoint, Instantiable},
@@ -1503,7 +1503,7 @@ impl Relation for Spend2Output2 {
     type Witness = (
         MapMt<F, PoseidonChip<F>>, // pre-state commitment map
         JubjubScalar,              // sk
-        JubjubScalar,              // alpha (blinding factor)
+        F,                         // alpha (blinding factor)
         Utxo,
         Utxo,
         Utxo,
@@ -1549,8 +1549,10 @@ impl Relation for Spend2Output2 {
         let (pk_sx, pk_sy) = (pk_sender_fields[0].clone(), pk_sender_fields[1].clone());
 
         // Blinded key: pk' = pk + [alpha]G
+        let alpha_native_value = std_lib.assign(layouter, alpha_val)?;
+        std_lib.assert_non_zero(layouter, &alpha_native_value)?;
         let alpha: AssignedScalarOfNativeCurve<Jubjub> =
-            std_lib.jubjub().assign(layouter, alpha_val)?;
+            std_lib.jubjub().convert(layouter, &alpha_native_value)?;
         let blind = std_lib.jubjub().mul(layouter, &alpha, &generator)?;
         let pk_blinded = std_lib.jubjub().add(layouter, &pk_sender, &blind)?;
         let pk_blinded_fields = std_lib.jubjub().as_public_input(layouter, &pk_blinded)?;
@@ -1979,7 +1981,7 @@ fn main() {
             let witness = (
                 shadow_commitment_map.clone(),
                 sender.sk,
-                alpha,
+                F::from_bytes_le(&alpha.to_bytes()).unwrap(),
                 old1.utxo.clone(),
                 old2.utxo.clone(),
                 new1.clone(),

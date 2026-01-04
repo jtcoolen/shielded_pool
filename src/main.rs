@@ -1463,6 +1463,7 @@ mod proof_agg {
 
 // Re-export pieces we need in the shielded example.
 use midnight_circuits::instructions::map::MapCPU;
+use midnight_curves::JubjubExtended;
 use proof_agg::{
     AggAccumulator, ClientProof as AggClientProof, FINAL_NUM_LEAVES, FinalAggCircuit,
     accumulator_as_public_input, aggregate_client_proofs,
@@ -1508,8 +1509,8 @@ impl Relation for Spend2Output2 {
         Utxo,
         Utxo,
         Utxo,
-        (F, F), // (pk_out1_x, pk_out1_y)
-        (F, F), // (pk_out2_x, pk_out2_y)
+        JubjubSubgroup, // (pk_out1_x, pk_out1_y)
+        JubjubSubgroup, // (pk_out2_x, pk_out2_y)
     );
 
     fn format_instance(instance: &Self::Instance) -> Result<Vec<F>, Error> {
@@ -1534,10 +1535,8 @@ impl Relation for Spend2Output2 {
         let new1_val = witness.clone().map(|(_, _, _, _, _, n1, _, _, _)| n1);
         let new2_val = witness.clone().map(|(_, _, _, _, _, _, n2, _, _)| n2);
 
-        let pk1x_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _)| k1.0);
-        let pk1y_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _)| k1.1);
-        let pk2x_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2.0);
-        let pk2y_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2.1);
+        let pk1_out_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _)| k1);
+        let pk2_out_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2);
 
         // Assign sender secret once, derive sender pk once
         let sk: AssignedScalarOfNativeCurve<Jubjub> = std_lib.jubjub().assign(layouter, sk_val)?;
@@ -1599,10 +1598,14 @@ impl Relation for Spend2Output2 {
         std_lib.assert_not_equal(layouter, &nf1, &nf2)?;
 
         // New outputs: use provided recipient (pk_out*) coordinates (assigned once)
-        let pk1x = std_lib.assign(layouter, pk1x_val)?;
-        let pk1y = std_lib.assign(layouter, pk1y_val)?;
-        let pk2x = std_lib.assign(layouter, pk2x_val)?;
-        let pk2y = std_lib.assign(layouter, pk2y_val)?;
+        let pk1_out: AssignedNativePoint<JubjubExtended> =
+            std_lib.jubjub().assign(layouter, pk1_out_val)?;
+        let pk1_fields = std_lib.jubjub().as_public_input(layouter, &pk1_out)?;
+        let (pk1x, pk1y) = (pk1_fields[0].clone(), pk1_fields[1].clone());
+        let pk2_out: AssignedNativePoint<JubjubExtended> =
+            std_lib.jubjub().assign(layouter, pk2_out_val)?;
+        let pk2_fields = std_lib.jubjub().as_public_input(layouter, &pk2_out)?;
+        let (pk2x, pk2y) = (pk2_fields[0].clone(), pk2_fields[1].clone());
 
         let new_c1 = compute_commitment_from_parts(std_lib, layouter, &new1_asg, &pk1x, &pk1y)?;
         let new_c2 = compute_commitment_from_parts(std_lib, layouter, &new2_asg, &pk2x, &pk2y)?;
@@ -1986,8 +1989,8 @@ fn main() {
                 old2.utxo.clone(),
                 new1.clone(),
                 new2.clone(),
-                (shadow_accounts[r1].pk_x, shadow_accounts[r1].pk_y),
-                (shadow_accounts[r2].pk_x, shadow_accounts[r2].pk_y),
+                shadow_accounts[r1].pk_point,
+                shadow_accounts[r2].pk_point,
             );
 
             let now = Instant::now();

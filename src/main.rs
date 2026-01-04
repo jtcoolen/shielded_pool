@@ -43,6 +43,7 @@ mod proof_agg {
 
     use halo2curves::{ff::Field, group::Group};
     use midnight_circuits::hash::poseidon::PoseidonState;
+    use midnight_circuits::instructions::hash::HashCPU;
     use midnight_circuits::instructions::map::{MapCPU, MapInstructions};
     use midnight_circuits::types::{AssignedForeignPoint, Instantiable};
     use midnight_circuits::{
@@ -1517,8 +1518,6 @@ mod proof_agg {
     ///     C_post == right.C_post
     ///     N_pre  == left.N_pre
     ///     N_post == right.N_post
-    /// - DOES NOT recompute the Merkle subroot:
-    ///     subroot is taken from `agg_state` and exposed (no constraint to children).
     /// - Performs the historic commitment-roots "set" transition (MapMt as a set):
     ///     * exposes pre-root-set root
     ///     * checks C_pre is in set
@@ -1619,9 +1618,6 @@ mod proof_agg {
             let n_post: AssignedNative<F> =
                 scalar_chip.assign(&mut layouter, self.agg_state.clone().map(|s| s.n_post))?;
             scalar_chip.constrain_as_public_input(&mut layouter, &n_post)?;
-            let subroot: AssignedNative<F> =
-                scalar_chip.assign(&mut layouter, self.agg_state.clone().map(|s| s.subroot))?;
-            scalar_chip.constrain_as_public_input(&mut layouter, &subroot)?;
 
             // ----------------------------
             // 2) Assign child states and enforce boundaries + bind roots (no Merkle recompute)
@@ -1678,7 +1674,10 @@ mod proof_agg {
             scalar_chip.assert_equal(&mut layouter, &n_pre, &l_n_pre)?;
             scalar_chip.assert_equal(&mut layouter, &n_post, &r_n_post)?;
 
-            // NOTE: subroot is NOT recomputed / constrained to H(l_subroot, r_subroot).
+            // subroot is constrained to H(l_subroot, r_subroot).
+            let subroot =
+                poseidon_chip.hash(&mut layouter, &[l_subroot.clone(), r_subroot.clone()])?;
+            scalar_chip.constrain_as_public_input(&mut layouter, &subroot)?;
 
             // ----------------------------
             // 3) Historic commitment-roots "set" transition (PI5..PI6)
@@ -1748,7 +1747,7 @@ mod proof_agg {
             right_pi_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
             let level: AssignedNative<F> =
-                scalar_chip.assign(&mut layouter, Value::known(self.child_level))?;
+                scalar_chip.assign_fixed(&mut layouter, self.child_level)?;
 
             let mut left_pi: Vec<AssignedNative<F>> = Vec::new();
             left_pi.push(l_c_pre.clone());

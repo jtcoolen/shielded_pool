@@ -89,6 +89,7 @@ mod proof_agg {
     };
     use rand::SeedableRng;
     use rand::rngs::OsRng;
+    use rayon::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::fs::File;
@@ -101,9 +102,34 @@ mod proof_agg {
     type F = <S as SelfEmulation>::F;
     type C = <S as SelfEmulation>::C;
     type E = <S as SelfEmulation>::Engine;
-    type CBase = <C as CircuitCurve>::Base;
+    type CBase = <C as midnight_circuits::ecc::curves::CircuitCurve>::Base;
     type NG = NativeGadget<F, P2RDecompositionChip<F>, NativeChip<F>>;
     type Map = midnight_circuits::map::cpu::MapMt<F, PoseidonChip<F>>;
+
+    // -------------------------------------------------------------------------
+    // NEW (per your request): wrapper to make Map transferable across rayon threads
+    // without patching the upstream library. The !Send/!Sync comes from PhantomData<H>
+    // (PoseidonChip) rather than actual shared mutable state inside MapMt.
+    // -------------------------------------------------------------------------
+    #[repr(transparent)]
+    #[derive(Clone)]
+    struct SendableMap(Map);
+
+    // SAFETY: MapMt stores owned data; the !Send/!Sync is inherited through a marker type param.
+    // Each LeafPlan owns its own cloned map snapshots; we don't share mutable instances across
+    // threads.
+    unsafe impl Send for SendableMap {}
+    unsafe impl Sync for SendableMap {}
+
+    impl SendableMap {
+        fn clone_inner(&self) -> Map {
+            self.0.clone()
+        }
+        #[allow(dead_code)]
+        fn into_inner(self) -> Map {
+            self.0
+        }
+    }
 
     /// Re-exported accumulator type for host-side code.
     pub type AggAccumulator = Accumulator<S>;
@@ -407,18 +433,6 @@ mod proof_agg {
             let zero = scalar_chip.assign(&mut layouter, Value::known(F::ZERO))?;
             let one = scalar_chip.assign(&mut layouter, Value::known(F::ONE))?;
 
-            // --------------------------------------------------------------
-            // Branch: LEAF agg (verifies 2 base proofs) and performs:
-            // - recompute inst hashes from items
-            // - enforce root chaining: left.root == C_pre, right.root == C_mid
-            // - apply 2-tx map updates (commitments + nullifiers)
-            // - subroot = H(inst_L, inst_R)
-            //
-            // Internal nodes:
-            // - verify child agg proofs
-            // - enforce boundary: left.C_post == right.C_pre, left.N_post == right.N_pre
-            // - subroot = H(left.subroot, right.subroot)
-            // --------------------------------------------------------------
             let (out_state_fields, assigned_left_pi_base, assigned_right_pi_base) = if self.is_leaf
             {
                 // Init MapGadgets from segment prestate
@@ -674,6 +688,20 @@ mod proof_agg {
         pub public_items: [F; 7],
     }
 
+    #[derive(Clone)]
+    struct LeafPlan {
+        i: usize,
+        left_items: [F; 7],
+        right_items: [F; 7],
+        pre_commitment_map: SendableMap,
+        pre_nullifier_map: SendableMap,
+        expected_state: AggState,
+        left_state: F,
+        right_state: F,
+        left_proof: Vec<u8>,
+        right_proof: Vec<u8>,
+    }
+
     #[derive(Clone, Debug)]
     pub struct AggregationResult {
         pub root_state: AggState,
@@ -868,6 +896,8 @@ mod proof_agg {
         pre_commitment_map: Map,
         pre_nullifier_map: Map,
     ) -> AggregationResult {
+        use midnight_circuits::instructions::hash::HashCPU;
+
         assert!(!client_proofs.is_empty(), "Need at least one client proof");
         assert!(
             client_proofs.len().is_power_of_two(),
@@ -1046,111 +1076,158 @@ mod proof_agg {
         let mut rolling_commit_map = pre_commitment_map.clone();
         let mut rolling_null_map = pre_nullifier_map.clone();
 
-        let mut current_level: Vec<TreeNode> = (0..num_leaves / 2)
-            .map(|i| {
-                let left = &client_proofs[i * 2];
-                let right = &client_proofs[i * 2 + 1];
+        // ---------------------------------------------------------------------
+        // Parallel proof creation:
+        // Step 1: Build a leaf plan per leaf sequentially (rolling maps dependency).
+        // Step 2: Pure CPU checks in parallel (instance hash recomputation).
+        // Step 3: create_proof + verify/extract acc IN PARALLEL for each leaf plan.
+        // ---------------------------------------------------------------------
+        let mut leaf_plans: Vec<LeafPlan> = Vec::with_capacity(num_leaves / 2);
 
-                // Pre roots for this leaf segment
-                let c_pre = rolling_commit_map.succinct_repr();
-                let n_pre = rolling_null_map.succinct_repr();
+        for i in 0..num_leaves / 2 {
+            let left = &client_proofs[i * 2];
+            let right = &client_proofs[i * 2 + 1];
 
-                // Ensure items -> instance matches provided client state
-                let inst_l = host_instance_hash(left.public_items);
-                let inst_r = host_instance_hash(right.public_items);
-                assert_eq!(inst_l, left.state, "left client instance mismatch");
-                assert_eq!(inst_r, right.state, "right client instance mismatch");
+            // Pre roots for this leaf segment
+            let c_pre = rolling_commit_map.succinct_repr();
+            let n_pre = rolling_null_map.succinct_repr();
 
-                // Leaf root-binding expectations:
-                // left.root == current C_pre
-                assert_eq!(
-                    left.public_items[0], c_pre,
-                    "leaf {} left root != c_pre",
-                    i
-                );
+            // Leaf root-binding expectations:
+            // left.root == current C_pre
+            assert_eq!(left.public_items[0], c_pre, "leaf {} left root != c_pre", i);
 
-                // Clone prestate maps for leaf witness
-                let pre_commit_map_for_leaf = rolling_commit_map.clone();
-                let pre_null_map_for_leaf = rolling_null_map.clone();
+            // Clone prestate maps for leaf witness
+            let pre_commit_map_for_leaf = rolling_commit_map.clone();
+            let pre_null_map_for_leaf = rolling_null_map.clone();
 
-                // Tx L commitment inserts -> c_mid
-                rolling_commit_map.insert(&left.public_items[3], &F::ONE);
-                rolling_commit_map.insert(&left.public_items[4], &F::ONE);
-                let c_mid = rolling_commit_map.succinct_repr();
+            // Tx L commitment inserts -> c_mid
+            rolling_commit_map.insert(&left.public_items[3], &F::ONE);
+            rolling_commit_map.insert(&left.public_items[4], &F::ONE);
+            let c_mid = rolling_commit_map.succinct_repr();
 
-                // Enforce right.root == c_mid
-                assert_eq!(
-                    right.public_items[0], c_mid,
-                    "leaf {} right root != c_mid",
-                    i
-                );
+            // Enforce right.root == c_mid
+            assert_eq!(
+                right.public_items[0], c_mid,
+                "leaf {} right root != c_mid",
+                i
+            );
 
-                // Tx L nullifiers check-then-set
-                for nf in [left.public_items[5], left.public_items[6]] {
-                    let old = rolling_null_map.get(&nf);
-                    assert_eq!(old, F::ZERO, "leaf {} left nf already spent", i);
-                    rolling_null_map.insert(&nf, &F::ONE);
-                }
+            // Tx L nullifiers check-then-set
+            for nf in [left.public_items[5], left.public_items[6]] {
+                let old = rolling_null_map.get(&nf);
+                assert_eq!(old, F::ZERO, "leaf {} left nf already spent", i);
+                rolling_null_map.insert(&nf, &F::ONE);
+            }
 
-                // Tx R commitment inserts
-                rolling_commit_map.insert(&right.public_items[3], &F::ONE);
-                rolling_commit_map.insert(&right.public_items[4], &F::ONE);
+            // Tx R commitment inserts
+            rolling_commit_map.insert(&right.public_items[3], &F::ONE);
+            rolling_commit_map.insert(&right.public_items[4], &F::ONE);
 
-                // Tx R nullifiers check-then-set
-                for nf in [right.public_items[5], right.public_items[6]] {
-                    let old = rolling_null_map.get(&nf);
-                    assert_eq!(old, F::ZERO, "leaf {} right nf already spent", i);
-                    rolling_null_map.insert(&nf, &F::ONE);
-                }
+            // Tx R nullifiers check-then-set
+            for nf in [right.public_items[5], right.public_items[6]] {
+                let old = rolling_null_map.get(&nf);
+                assert_eq!(old, F::ZERO, "leaf {} right nf already spent", i);
+                rolling_null_map.insert(&nf, &F::ONE);
+            }
 
-                let c_post = rolling_commit_map.succinct_repr();
-                let n_post = rolling_null_map.succinct_repr();
+            let c_post = rolling_commit_map.succinct_repr();
+            let n_post = rolling_null_map.succinct_repr();
 
-                // Leaf merkle insertion (subroot)
-                let subroot = <PoseidonChip<F> as midnight_circuits::instructions::hash::HashCPU<F, F>>::hash(&[inst_l, inst_r]);
+            // Leaf merkle insertion (subroot) is H(inst_l, inst_r).
+            let subroot = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[left.state, right.state]);
 
-                let state = AggState {
-                    c_pre,
-                    c_post,
-                    n_pre,
-                    n_post,
-                    subroot,
-                };
+            let expected_state = AggState {
+                c_pre,
+                c_post,
+                n_pre,
+                n_post,
+                subroot,
+            };
+
+            leaf_plans.push(LeafPlan {
+                i,
+                left_items: left.public_items,
+                right_items: right.public_items,
+                pre_commitment_map: SendableMap(pre_commit_map_for_leaf),
+                pre_nullifier_map: SendableMap(pre_null_map_for_leaf),
+                expected_state,
+                left_state: left.state,
+                right_state: right.state,
+                left_proof: left.proof.clone(),
+                right_proof: right.proof.clone(),
+            });
+        }
+
+        // Step 2: pure CPU checks in parallel.
+        leaf_plans.par_iter().for_each(|p| {
+            let inst_l = host_instance_hash(p.left_items);
+            let inst_r = host_instance_hash(p.right_items);
+            assert_eq!(
+                inst_l, p.left_state,
+                "left client instance mismatch (leaf {})",
+                p.i
+            );
+            assert_eq!(
+                inst_r, p.right_state,
+                "right client instance mismatch (leaf {})",
+                p.i
+            );
+
+            let subroot = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[inst_l, inst_r]);
+            assert_eq!(
+                subroot, p.expected_state.subroot,
+                "leaf {} planned subroot mismatch",
+                p.i
+            );
+        });
+
+        // Step 3: create_proof in parallel
+        let leaf_vk_data_cl = leaf_vk_data.clone();
+        let combined_fixed_base_names_cl = combined_fixed_base_names.clone();
+        let leaf_vk_name_string = leaf_vk_name.to_string();
+
+        let leaf_pk = leaf_keys.pk.clone();
+        let leaf_vk_arc = leaf_keys.vk.clone();
+
+        let mut current_level: Vec<TreeNode> = leaf_plans
+            .par_iter()
+            .map(|p| {
+                let state = p.expected_state;
 
                 let circuit = LeafAggCircuit {
-                    child_vk: leaf_vk_data.clone(),
-                    child_vk_name: leaf_vk_name.to_string(),
+                    child_vk: leaf_vk_data_cl.clone(),
+                    child_vk_name: leaf_vk_name_string.clone(),
                     expected_prev_level: F::ZERO,
                     left_child_state: array::from_fn(|_| Value::unknown()),
                     right_child_state: array::from_fn(|_| Value::unknown()),
-                    left_items: Value::known(left.public_items),
-                    right_items: Value::known(right.public_items),
-                    pre_commitment_map: Value::known(pre_commit_map_for_leaf),
-                    pre_nullifier_map: Value::known(pre_null_map_for_leaf),
-                    left_proof: Value::known(left.proof.clone()),
-                    right_proof: Value::known(right.proof.clone()),
+                    left_items: Value::known(p.left_items),
+                    right_items: Value::known(p.right_items),
+                    pre_commitment_map: Value::known(p.pre_commitment_map.clone_inner()),
+                    pre_nullifier_map: Value::known(p.pre_nullifier_map.clone_inner()),
+                    left_proof: Value::known(p.left_proof.clone()),
+                    right_proof: Value::known(p.right_proof.clone()),
                     left_acc: Value::known(trivial_combined.clone()),
                     right_acc: Value::known(trivial_combined.clone()),
-                    fixed_base_names: combined_fixed_base_names.clone(),
+                    fixed_base_names: combined_fixed_base_names_cl.clone(),
                     prev_level: Value::known(F::ZERO),
                     is_leaf: true,
                 };
 
-                // Verify client proofs and extract accumulators
+                // Verify client proofs and extract accumulators (host work; parallel-safe)
                 let proof_acc_left = verify_and_extract_acc(
                     leaf_srs,
                     leaf_vk,
                     &leaf_fixed_bases,
-                    &left.proof,
-                    &[left.state],
+                    &p.left_proof,
+                    &[p.left_state],
                 );
 
                 let proof_acc_right = verify_and_extract_acc(
                     leaf_srs,
                     leaf_vk,
                     &leaf_fixed_bases,
-                    &right.proof,
-                    &[right.state],
+                    &p.right_proof,
+                    &[p.right_state],
                 );
 
                 let mut accumulated_pi = Accumulator::accumulate(&[
@@ -1178,7 +1255,7 @@ mod proof_agg {
                         LeafAggCircuit,
                     >(
                         &agg_srs1,
-                        leaf_keys.pk.as_ref(),
+                        leaf_pk.as_ref(),
                         &[circuit],
                         1,
                         &[&[&[], &public_inputs_fields]],
@@ -1188,21 +1265,23 @@ mod proof_agg {
                     .expect("Leaf AGG proof failed");
                     transcript.finalize()
                 };
+
                 println!(
                     "Leaf AGG {} ({}) created in {:?}",
-                    i,
+                    p.i,
                     leaf_agg_vk_name,
                     start.elapsed()
                 );
 
                 assert!(
                     accumulated_pi.check(&agg_srs2.s_g2().into(), &combined_fixed_bases),
-                    "Leaf node {i}: accumulated PI accumulator did not check against combined fixed bases"
+                    "Leaf node {}: accumulated PI accumulator did not check against combined fixed bases",
+                    p.i
                 );
 
                 let proof_acc = verify_and_extract_acc(
                     &agg_srs1,
-                    leaf_keys.vk.as_ref(),
+                    leaf_vk_arc.as_ref(),
                     &leaf_keys.fixed_bases,
                     &proof,
                     &public_inputs_fields,
@@ -1236,10 +1315,16 @@ mod proof_agg {
             let child_vk_data = child_keys.vk_data.clone();
             let child_vk_name = child_keys.name.clone();
 
-            let next_level: Vec<TreeNode> = (0..current_level.len() / 2)
-                .map(|i| {
-                    let left = &current_level[i * 2];
-                    let right = &current_level[i * 2 + 1];
+            let parent_pk = parent_keys.pk.clone();
+            let parent_vk = parent_keys.vk.clone();
+
+            // Parallelize within the level
+            let next_level: Vec<TreeNode> = current_level
+                .par_chunks(2)
+                .enumerate()
+                .map(|(i, pair)| {
+                    let left = &pair[0];
+                    let right = &pair[1];
 
                     // Host-side boundary checks (fail fast)
                     assert_eq!(left.state.c_post, right.state.c_pre, "commit boundary mismatch");
@@ -1250,10 +1335,10 @@ mod proof_agg {
                         c_post: right.state.c_post,
                         n_pre: left.state.n_pre,
                         n_post: right.state.n_post,
-                        subroot: <PoseidonChip<F> as midnight_circuits::instructions::hash::HashCPU<F, F>>::hash(&[
-                            left.state.subroot,
-                            right.state.subroot,
-                        ]),
+                        subroot: <PoseidonChip<F> as midnight_circuits::instructions::hash::HashCPU<
+                            F,
+                            F,
+                        >>::hash(&[left.state.subroot, right.state.subroot]),
                     };
 
                     let l_fields = left.state.to_fields();
@@ -1303,7 +1388,7 @@ mod proof_agg {
                             InternalAggCircuit,
                         >(
                             &agg_srs2,
-                            parent_keys.pk.as_ref(),
+                            parent_pk.as_ref(),
                             &[circuit],
                             1,
                             &[&[&[], &public_inputs_fields]],
@@ -1313,6 +1398,7 @@ mod proof_agg {
                         .expect("Internal AGG proof failed");
                         transcript.finalize()
                     };
+
                     println!(
                         "Level {} node {} ({}) created in {:?}",
                         parent_level,
@@ -1328,7 +1414,7 @@ mod proof_agg {
 
                     let proof_acc = verify_and_extract_acc(
                         &agg_srs2,
-                        parent_keys.vk.as_ref(),
+                        parent_vk.as_ref(),
                         &parent_keys.fixed_bases,
                         &proof,
                         &public_inputs_fields,
@@ -1378,9 +1464,7 @@ mod proof_agg {
 
     /// Final aggregation circuit (thin wrapper):
     ///  - exposes the 5-field agg state as public inputs,
-    ///  - (optionally) updates the historic-commitment-roots set: assert C_pre is in set, insert C_post,
-    ///  - verifies the inner AGG proof against PI = [state_fields..., acc_pi..., level],
-    ///  - computes a "collapsed accumulator" = accumulate(inner_proof_acc, agg_pi_acc) and exposes it.
+    ///  - (optionally) updates the historic-commitment-roots set, and collapses the accumulator.
     ///
     /// Public inputs exposed:
     ///   * PI0..PI4: [C_pre, C_post, N_pre, N_post, s_root]
@@ -1450,11 +1534,7 @@ mod proof_agg {
             let verifier_chip: VerifierGadget<_> =
                 VerifierGadget::<S>::new(&curve_chip, &scalar_chip, &poseidon_chip);
 
-            // ------------------------------------------------------------------
-            // 1) Expose agg state fields as public inputs (no recomputation here)
-            //    layout:
-            //      PI0..PI4 = [C_pre, C_post, N_pre, N_post, subroot]
-            // ------------------------------------------------------------------
+            // 1) Expose agg state fields as public inputs
             let c_pre =
                 scalar_chip.assign(&mut layouter, self.agg_state.clone().map(|s| s.c_pre))?;
             scalar_chip.constrain_as_public_input(&mut layouter, &c_pre)?;
@@ -1473,10 +1553,7 @@ mod proof_agg {
 
             let one = scalar_chip.assign(&mut layouter, Value::known(F::ONE))?;
 
-            // ------------------------------------------------------------------
-            // 2) Historic commitment roots "set" (batch-level update)
-            //    assert C_pre in set; insert C_post; expose pre/post roots-set roots.
-            // ------------------------------------------------------------------
+            // 2) Historic commitment roots "set" transition
             let mut roots_map_gadget = midnight_circuits::map::map_gadget::MapGadget::<
                 F,
                 NG,
@@ -1491,11 +1568,11 @@ mod proof_agg {
                 scalar_chip.assign(&mut layouter, self.post_commitment_roots_root.clone())?;
             scalar_chip.constrain_as_public_input(&mut layouter, &expected_post_roots_set_root)?;
 
-            // Enforce that batch pre-state commitment root is in the historic-roots set.
+            // Enforce C_pre in set
             let pre_ok = roots_map_gadget.get(&mut layouter, &c_pre)?;
             scalar_chip.assert_equal(&mut layouter, &pre_ok, &one)?;
 
-            // Update historic-roots set with newly produced commitment root (C_post)
+            // Insert C_post and enforce expected post root
             roots_map_gadget.insert(&mut layouter, &c_post, &one)?;
             scalar_chip.assert_equal(
                 &mut layouter,
@@ -1503,9 +1580,7 @@ mod proof_agg {
                 &expected_post_roots_set_root,
             )?;
 
-            // ------------------------------------------------------------------
             // 3) Verify the inner AGG proof against PI = [state_fields..., acc_pi..., level]
-            // ------------------------------------------------------------------
             let vk_val: AssignedNative<F> =
                 native_chip.assign_fixed(&mut layouter, self.agg_vk.2)?;
             let assigned_vk = verifier_chip.assign_vk(
@@ -1515,7 +1590,6 @@ mod proof_agg {
                 vk_val,
             )?;
 
-            // Assign the inner PI accumulator witness
             let mut agg_pi_acc = AssignedAccumulator::assign(
                 &mut layouter,
                 &curve_chip,
@@ -1528,11 +1602,8 @@ mod proof_agg {
             )?;
             agg_pi_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-            // Inner level
             let level = scalar_chip.assign(&mut layouter, Value::known(self.agg_level))?;
 
-            // Build the inner public inputs:
-            // [C_pre, C_post, N_pre, N_post, subroot, acc_pi..., level]
             let mut assigned_pi: Vec<AssignedNative<F>> = Vec::new();
             assigned_pi.push(c_pre.clone());
             assigned_pi.push(c_post.clone());
@@ -1542,7 +1613,6 @@ mod proof_agg {
             assigned_pi.extend(verifier_chip.as_public_input(&mut layouter, &agg_pi_acc)?);
             assigned_pi.push(level);
 
-            // Verify the final AGG proof inside the circuit -> proof accumulator
             let id_point: AssignedForeignPoint<
                 midnight_curves::Fq,
                 midnight_curves::G1Projective,
@@ -1558,10 +1628,7 @@ mod proof_agg {
             )?;
             proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-            // ------------------------------------------------------------------
             // 4) Collapse final accumulator = accumulate(proof_acc, agg_pi_acc)
-            //    and expose it as public input(s).
-            // ------------------------------------------------------------------
             let mut collapsed = AssignedAccumulator::<S>::accumulate(
                 &mut layouter,
                 &verifier_chip,

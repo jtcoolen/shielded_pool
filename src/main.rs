@@ -5,33 +5,200 @@ use group::Group;
 
 use midnight_circuits::{
     biguint::AssignedBigUint,
-    compact_std_lib::{self, Relation, ZkStdLib, ZkStdLibArch},
+    compact_std_lib::{self, Relation, ZkStdLib, ZkStdLibArch, cost_model},
     ecc::native::AssignedScalarOfNativeCurve,
-    hash::poseidon::{PoseidonChip, PoseidonState},
+    field::{NativeChip, NativeGadget, decomposition::chip::P2RDecompositionChip},
+    hash::{
+        poseidon::{PoseidonChip, PoseidonState},
+        sha256::Sha256Chip,
+    },
     instructions::{
         AssertionInstructions, AssignmentInstructions, ConversionInstructions,
-        DecompositionInstructions, EccInstructions, PublicInputInstructions, ZeroInstructions,
+        DecompositionInstructions, EccInstructions, HashInstructions, PublicInputInstructions,
+        ZeroInstructions,
         hash::HashCPU,
         map::{MapCPU, MapInstructions},
     },
     map::cpu::MapMt,
-    types::{AssignedNative, AssignedNativePoint, Instantiable},
+    types::{AssignedByte, AssignedNative, AssignedNativePoint, Instantiable},
 };
 
 use midnight_curves::{Fq as F, Fr as JubjubScalar, JubjubExtended as Jubjub, JubjubSubgroup};
-use midnight_proofs::plonk::{Error, create_proof, keygen_pk, keygen_vk_with_k, prepare};
 use midnight_proofs::{
     circuit::{Layouter, Value},
     transcript::Transcript,
 };
+use midnight_proofs::{
+    plonk::{Error, create_proof, keygen_pk, keygen_vk_with_k, prepare},
+    transcript::{Hashable, Sampleable, TranscriptHash},
+};
 use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
+
+use sha3::{Digest, Keccak256};
+use std::{io, io::Read};
+
+use ff::FromUniformBytes;
+use group::GroupEncoding;
+
+fn sha2_merkle_root_7_fields<L: Layouter<F>>(
+    sha2_chip: &Sha256Chip<F>,
+    scalar_chip: &NativeGadget<
+        midnight_curves::Fq,
+        P2RDecompositionChip<midnight_curves::Fq>,
+        NativeChip<midnight_curves::Fq>,
+    >,
+    layouter: &mut L,
+    items: &[AssignedNative<F>; 7],
+) -> Result<AssignedNative<F>, Error> {
+    // Field byte length (Fq is 48 bytes on BLS12-381)
+    let field_bytes = <F as PrimeField>::Repr::default().as_ref().len();
+
+    // Leaf hash = H( be_bytes(field_element) )
+    let mut leaves: Vec<Vec<AssignedByte<F>>> = Vec::with_capacity(8);
+    for x in items.iter() {
+        let x_be = scalar_chip.assigned_to_be_bytes(layouter, x, Some(field_bytes))?;
+        // If your API is older, this might be std_lib.sha256(...)
+        let h = sha2_chip.hash(layouter, &x_be)?;
+        leaves.push(h.to_vec());
+    }
+
+    // Pad to 8 leaves with H(0)
+    let zero = scalar_chip.assign_fixed(layouter, F::ZERO)?;
+    let zero_be = scalar_chip.assigned_to_be_bytes(layouter, &zero, Some(field_bytes))?;
+    leaves.push(sha2_chip.hash(layouter, &zero_be)?.to_vec());
+
+    // Merkle up: parent = H(left || right)
+    let mut level = leaves;
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            let mut msg = Vec::with_capacity(64);
+            msg.extend_from_slice(&pair[0]);
+            msg.extend_from_slice(&pair[1]);
+            next.push(sha2_chip.hash(layouter, &msg)?.to_vec());
+        }
+        level = next;
+    }
+
+    // Map the 32-byte digest into a field element (same gadget you already use elsewhere)
+    // (This interprets bytes as little-endian “number mod p” inside the circuit.)
+    scalar_chip.assigned_from_le_bytes(layouter, &level[0])
+}
+
+/// Newtype so you can refer to it as `KeccakTranscript` in generics.
+#[derive(Clone)]
+pub struct KeccakTranscript(Keccak256);
+
+impl TranscriptHash for KeccakTranscript {
+    type Input = Vec<u8>;
+    type Output = Vec<u8>; // we return 64 bytes for your existing sampling code
+
+    fn init() -> Self {
+        // Domain separation (on-chain: start transcript bytes with this literal)
+        let mut h = Keccak256::new();
+        h.update(b"Domain separator for transcript");
+        Self(h)
+    }
+
+    fn absorb(&mut self, input: &Self::Input) {
+        self.0.update(&[0]);
+        self.0.update(input);
+    }
+
+    fn squeeze(&mut self) -> Self::Output {
+        // Mutate transcript state (so multiple squeezes differ)
+        self.0.update(&[1]);
+
+        // EVM-compatible 64 bytes:
+        // out = keccak256(preimage || 0x00) || keccak256(preimage || 0x01)
+        let mut out = Vec::with_capacity(64);
+
+        let r0 = {
+            let mut t = self.0.clone();
+            t.update(&[0u8]);
+            t.finalize()
+        };
+        out.extend_from_slice(r0.as_slice());
+
+        let r1 = {
+            let mut t = self.0.clone();
+            t.update(&[1u8]);
+            t.finalize()
+        };
+        out.extend_from_slice(r1.as_slice());
+
+        debug_assert_eq!(out.len(), 64);
+        out
+    }
+}
+
+// ------------------------------------------------------------
+// Fix #1 from your error: G1Projective must be Hashable<KeccakTranscript>
+// ------------------------------------------------------------
+impl Hashable<KeccakTranscript> for midnight_curves::G1Projective {
+    fn to_input(&self) -> Vec<u8> {
+        Hashable::<KeccakTranscript>::to_bytes(self)
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        <Self as GroupEncoding>::to_bytes(self).as_ref().to_vec()
+    }
+
+    fn read(buffer: &mut impl Read) -> io::Result<Self> {
+        let mut bytes = <Self as GroupEncoding>::Repr::default();
+        buffer.read_exact(bytes.as_mut())?;
+
+        Option::from(Self::from_bytes(&bytes))
+            .ok_or_else(|| io::Error::other("Invalid BLS12-381 point encoding in proof"))
+    }
+}
+
+// ------------------------------------------------------------
+// Fix #2/#3 from your error: BlsScalar must be Hashable + Sampleable for KeccakTranscript
+//
+// IMPORTANT: Replace `midnight_curves::Fq` below with your actual `BlsScalar` type
+// if it is a distinct alias/type in your crate.
+// ------------------------------------------------------------
+impl Hashable<KeccakTranscript> for midnight_curves::Fq {
+    fn to_input(&self) -> Vec<u8> {
+        self.to_repr().to_vec()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        self.to_repr().to_vec()
+    }
+
+    fn read(buffer: &mut impl Read) -> io::Result<Self> {
+        let mut bytes = <Self as PrimeField>::Repr::default();
+        buffer.read_exact(bytes.as_mut())?;
+
+        Option::from(Self::from_repr(bytes))
+            .ok_or_else(|| io::Error::other("Invalid BLS12-381 scalar encoding in proof"))
+    }
+}
+
+impl Sampleable<KeccakTranscript> for midnight_curves::Fq {
+    fn sample(hash_output: Vec<u8>) -> Self {
+        assert!(hash_output.len() <= 64);
+        assert!(hash_output.len() >= (midnight_curves::Fq::NUM_BITS as usize / 8) + 12);
+
+        let mut bytes = [0u8; 64];
+        bytes[..hash_output.len()].copy_from_slice(&hash_output);
+
+        midnight_curves::Fq::from_uniform_bytes(&bytes)
+    }
+}
 
 mod proof_agg {
     use core::array;
 
     use halo2curves::{ff::Field, group::Group};
+    use midnight_circuits::compact_std_lib::cost_model;
     use midnight_circuits::hash::poseidon::PoseidonState;
+    use midnight_circuits::hash::sha256::{
+        NB_SHA256_ADVICE_COLS, NB_SHA256_FIXED_COLS, Sha256Chip, Sha256Config,
+    };
     use midnight_circuits::instructions::map::{MapCPU, MapInstructions};
     use midnight_circuits::types::Instantiable;
     use midnight_circuits::{
@@ -58,6 +225,7 @@ mod proof_agg {
         },
     };
     use midnight_curves::Bls12;
+    use midnight_proofs::dev::cost_model;
     use midnight_proofs::poly::kzg::params::ParamsKZG;
     use midnight_proofs::utils::SerdeFormat;
     use midnight_proofs::{
@@ -79,6 +247,10 @@ mod proof_agg {
     use std::sync::Arc;
     use std::time::Instant;
 
+    #[cfg(feature = "dev-curves")]
+    use midnight_curves::bn256::{Bn256};
+    #[cfg(feature = "dev-curves")]
+    type FBN = midnight_curves::bn256::Fr;
     pub type S = BlstrsEmulation;
     type F = <S as SelfEmulation>::F;
     type C = <S as SelfEmulation>::C;
@@ -104,7 +276,7 @@ mod proof_agg {
     }
 
     const K_LEAF: u32 = 19;
-    const K_INTERNAL: u32 = 20;
+    const K_INTERNAL: u32 = 19;
 
     pub const AGG_K: u32 = K_INTERNAL;
 
@@ -147,6 +319,7 @@ mod proof_agg {
         std::io::Error::new(std::io::ErrorKind::Other, msg.into())
     }
 
+    // TODO test SRS
     pub fn filecoin_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>, std::io::Error> {
         ensure!(
             k <= 20,
@@ -215,6 +388,7 @@ mod proof_agg {
         P2RDecompositionConfig,
         ForeignEccConfig<C>,
         PoseidonConfig<F>,
+        Sha256Config,
     ) {
         let nb_advice_cols = nb_foreign_ecc_chip_columns::<F, C, C, NG>();
         let nb_fixed_cols = NB_ARITH_COLS + 4;
@@ -252,11 +426,20 @@ mod proof_agg {
             ),
         );
 
+        let sha2_config = Sha256Chip::configure(
+            meta,
+            &(
+                advice_columns[..NB_SHA256_ADVICE_COLS].try_into().unwrap(),
+                fixed_columns[..NB_SHA256_FIXED_COLS].try_into().unwrap(),
+            ),
+        );
+
         (
             native_config,
             core_decomp_config,
             curve_config,
             poseidon_config,
+            sha2_config,
         )
     }
 
@@ -306,6 +489,7 @@ mod proof_agg {
             P2RDecompositionConfig,
             ForeignEccConfig<C>,
             PoseidonConfig<F>,
+            Sha256Config,
         );
         type FloorPlanner = SimpleFloorPlanner;
         type Params = ();
@@ -342,10 +526,16 @@ mod proof_agg {
         ) -> Result<(), Error> {
             let native_chip = <NativeChip<F> as ComposableChip<F>>::new(&config.0, &());
             let core_decomp_chip = P2RDecompositionChip::new(&config.1, &(K as usize - 1));
-            let scalar_chip = NativeGadget::new(core_decomp_chip.clone(), native_chip.clone());
+            let scalar_chip: NativeGadget<
+                midnight_curves::Fq,
+                P2RDecompositionChip<midnight_curves::Fq>,
+                NativeChip<midnight_curves::Fq>,
+            > = NativeGadget::new(core_decomp_chip.clone(), native_chip.clone());
             let curve_chip = ForeignEccChip::new(&config.2, &scalar_chip, &scalar_chip);
             let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
             let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
+
+            let _sha2_chip = Sha256Chip::new(&config.4, &scalar_chip);
 
             let prev_level = scalar_chip.assign(&mut layouter, self.prev_level)?;
             scalar_chip.assert_equal_to_fixed(
@@ -1215,6 +1405,10 @@ mod proof_agg {
                     transcript.finalize()
                 };
 
+                println!("proof size (bytes): {}", proof.len());
+
+                //println!("cost model (leaf): {:?}", cost_model::circuit_model(&LeafAggCircuit));
+
                 println!(
                     "Leaf AGG {} ({}) created in {:?}",
                     p.i,
@@ -1354,6 +1548,8 @@ mod proof_agg {
                         transcript.finalize()
                     };
 
+                    //println!("cost model (level {}): {:?}", parent_level, cost_model(&InternalAggCircuit));
+
                     println!(
                         "Level {} node {} ({}) created in {:?}",
                         parent_level,
@@ -1468,6 +1664,7 @@ mod proof_agg {
             P2RDecompositionConfig,
             ForeignEccConfig<C>,
             PoseidonConfig<F>,
+            Sha256Config,
         );
         type FloorPlanner = SimpleFloorPlanner;
         type Params = ();
@@ -1706,7 +1903,7 @@ const UTXO_COMMIT_TAG: u64 = 0x0001;
 const UTXO_NULLIFY_TAG: u64 = 0x0002;
 const AMOUNT_BITS: u32 = 128;
 const AMOUNT_GEN_BITS: u32 = 120;
-const BATCH_SIZE: usize = 4;
+const BATCH_SIZE: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Utxo {
@@ -1970,6 +2167,9 @@ struct Account {
 }
 
 fn main() {
+    println!("shielded-pool dev-curves enabled? {}", cfg!(feature = "dev-curves"));
+    #[cfg(feature = "dev-curves")]
+    compile_error!("dev-curves is ON for shielded-pool");
     const LEAF_VK_NAME: &str = "spend2output2_vk";
 
     const K: u32 = 14;
@@ -2248,6 +2448,9 @@ fn main() {
                 now.elapsed()
             );
 
+            let stats = cost_model(&Spend2Output2);
+            println!("client circuit stats: {:?}", stats,);
+
             client_proofs.push(AggClientProof {
                 state: instance,
                 proof: proof.clone(),
@@ -2363,12 +2566,13 @@ fn main() {
             final_public_inputs.extend(final_acc_pi.clone());
 
             // ✅ Use cached final_pk/final_vk/final_agg_srs (no per-batch keygen).
+            #[cfg(not(feature = "dev-curves"))]
             let final_proof_bytes = {
-                let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
+                let mut transcript = CircuitTranscript::<KeccakTranscript>::init();
                 create_proof::<
                     F,
                     KZGCommitmentScheme<midnight_curves::Bls12>,
-                    CircuitTranscript<PoseidonState<F>>,
+                    CircuitTranscript<KeccakTranscript>,
                     FinalAggCircuit,
                 >(
                     &final_agg_srs,
@@ -2383,8 +2587,31 @@ fn main() {
                 transcript.finalize()
             };
 
+            #[cfg(feature = "dev-curves")]
+            let final_proof_bytes = {
+                let mut transcript = CircuitTranscript::<KeccakTranscript>::init();
+                create_proof::<
+                    FBN23,
+                    KZGCommitmentScheme<midnight_curves::bls12_381::Bls12>,
+                    CircuitTranscript<KeccakTranscript>,
+                    FinalAggCircuit,
+                >(
+                    &final_agg_srs,
+                    &final_pk,
+                    &[final_circuit],
+                    1,
+                    &[&[&[], &final_public_inputs]],
+                    OsRng,
+                    &mut transcript,
+                )
+                .expect("Final aggregation proof generation should not fail");
+                transcript.finalize()
+            };
+
+            println!("final proof size (bytes): {}", final_proof_bytes.len());
+
             let mut transcript =
-                CircuitTranscript::<PoseidonState<F>>::init_from_bytes(&final_proof_bytes);
+                CircuitTranscript::<KeccakTranscript>::init_from_bytes(&final_proof_bytes);
             let committed_bases: &[&[midnight_curves::G1Projective]] =
                 &[&[midnight_curves::G1Projective::identity()]];
             let instances: &[&[&[F]]] = &[&[&final_public_inputs]];
@@ -2392,7 +2619,7 @@ fn main() {
             let dual_msm = prepare::<
                 F,
                 KZGCommitmentScheme<midnight_curves::Bls12>,
-                CircuitTranscript<PoseidonState<F>>,
+                CircuitTranscript<KeccakTranscript>,
             >(&final_vk, committed_bases, instances, &mut transcript)
             .expect("Final aggregation verification preparation failed");
 

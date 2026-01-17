@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 midnight-circuits = { git = "https://github.com/jtcoolen/midnight-zk", branch = "julian/nf" }
-midnight-aggregator = { git = "https://github.com/jtcoolen/midnight-zk", branch = "julian/nf" }
+midnight-aggregator = { git = "https://github.com/jtcoolen/midnight-zk", branch = "julian/nf", optional = true }
 midnight-curves = { git = "https://github.com/jtcoolen/midnight-zk", branch = "julian/nf" }
 midnight-proofs = { git = "https://github.com/jtcoolen/midnight-zk", branch = "julian/nf" }
 sha2 = "0.10.9"
@@ -18,3 +18,19 @@ halo2curves = "0.9.0"
 rustfmt = "0.10.0"
 rayon = "1.11.0"
 blake2b_simd = "1.0.3"
+sha3 = "0.10.8"
+
+[features]
+default = ["truncated-challenges"]
+dev-curves = [
+  "midnight-curves/dev-curves",
+  "midnight-proofs/dev-curves",
+  "midnight-circuits/dev-curves",
+]
+truncated-challenges = [
+  "midnight-proofs/truncated-challenges",
+  "midnight-circuits/truncated-challenges",
+]
+
+# only build aggregator when you explicitly ask for it
+aggregation = ["midnight-aggregator"]

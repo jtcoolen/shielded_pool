@@ -584,8 +584,8 @@ mod proof_agg {
                 child_vk_val,
             )?;
 
-            let zero = scalar_chip.assign(&mut layouter, Value::known(F::ZERO))?;
-            let one = scalar_chip.assign(&mut layouter, Value::known(F::ONE))?;
+            let zero = scalar_chip.assign_fixed(&mut layouter, F::ZERO)?;
+            let one = scalar_chip.assign_fixed(&mut layouter, F::ONE)?;
 
             let (out_state_fields, assigned_left_pi_base, assigned_right_pi_base) = if self.is_leaf
             {

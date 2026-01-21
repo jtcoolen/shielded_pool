@@ -41,51 +41,6 @@ use std::{io, io::Read};
 use ff::FromUniformBytes;
 use group::GroupEncoding;
 
-fn sha2_merkle_root_7_fields<L: Layouter<F>>(
-    sha2_chip: &Sha256Chip<F>,
-    scalar_chip: &NativeGadget<
-        midnight_curves::Fq,
-        P2RDecompositionChip<midnight_curves::Fq>,
-        NativeChip<midnight_curves::Fq>,
-    >,
-    layouter: &mut L,
-    items: &[AssignedNative<F>; 7],
-) -> Result<AssignedNative<F>, Error> {
-    // Field byte length (Fq is 48 bytes on BLS12-381)
-    let field_bytes = <F as PrimeField>::Repr::default().as_ref().len();
-
-    // Leaf hash = H( be_bytes(field_element) )
-    let mut leaves: Vec<Vec<AssignedByte<F>>> = Vec::with_capacity(8);
-    for x in items.iter() {
-        let x_be = scalar_chip.assigned_to_be_bytes(layouter, x, Some(field_bytes))?;
-        // If your API is older, this might be std_lib.sha256(...)
-        let h = sha2_chip.hash(layouter, &x_be)?;
-        leaves.push(h.to_vec());
-    }
-
-    // Pad to 8 leaves with H(0)
-    let zero = scalar_chip.assign_fixed(layouter, F::ZERO)?;
-    let zero_be = scalar_chip.assigned_to_be_bytes(layouter, &zero, Some(field_bytes))?;
-    leaves.push(sha2_chip.hash(layouter, &zero_be)?.to_vec());
-
-    // Merkle up: parent = H(left || right)
-    let mut level = leaves;
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks(2) {
-            let mut msg = Vec::with_capacity(64);
-            msg.extend_from_slice(&pair[0]);
-            msg.extend_from_slice(&pair[1]);
-            next.push(sha2_chip.hash(layouter, &msg)?.to_vec());
-        }
-        level = next;
-    }
-
-    // Map the 32-byte digest into a field element (same gadget you already use elsewhere)
-    // (This interprets bytes as little-endian “number mod p” inside the circuit.)
-    scalar_chip.assigned_from_le_bytes(layouter, &level[0])
-}
-
 /// Newtype so you can refer to it as `KeccakTranscript` in generics.
 #[derive(Clone)]
 pub struct KeccakTranscript(Keccak256);
@@ -390,7 +345,7 @@ mod proof_agg {
         P2RDecompositionConfig,
         ForeignEccConfig<C>,
         PoseidonConfig<F>,
-        Sha256Config,
+        //Sha256Config,
     ) {
         let nb_advice_cols = nb_foreign_ecc_chip_columns::<F, C, C, NG>();
         let nb_fixed_cols = NB_ARITH_COLS + 4;
@@ -428,20 +383,20 @@ mod proof_agg {
             ),
         );
 
-        let sha2_config = Sha256Chip::configure(
+        /*let sha2_config = Sha256Chip::configure(
             meta,
             &(
                 advice_columns[..NB_SHA256_ADVICE_COLS].try_into().unwrap(),
                 fixed_columns[..NB_SHA256_FIXED_COLS].try_into().unwrap(),
             ),
-        );
+        );*/
 
         (
             native_config,
             core_decomp_config,
             curve_config,
             poseidon_config,
-            sha2_config,
+            //sha2_config,
         )
     }
 
@@ -495,7 +450,7 @@ mod proof_agg {
             P2RDecompositionConfig,
             ForeignEccConfig<C>,
             PoseidonConfig<F>,
-            Sha256Config,
+            //Sha256Config,
         );
         type FloorPlanner = SimpleFloorPlanner;
         type Params = ();
@@ -542,7 +497,7 @@ mod proof_agg {
             let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
             let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
 
-            let _sha2_chip = Sha256Chip::new(&config.4, &scalar_chip);
+            //let _sha2_chip = Sha256Chip::new(&config.4, &scalar_chip);
 
             let prev_level = scalar_chip.assign(&mut layouter, self.prev_level)?;
             scalar_chip.assert_equal_to_fixed(
@@ -1716,7 +1671,7 @@ mod proof_agg {
             P2RDecompositionConfig,
             ForeignEccConfig<C>,
             PoseidonConfig<F>,
-            Sha256Config,
+            //Sha256Config,
         );
         type FloorPlanner = SimpleFloorPlanner;
         type Params = ();

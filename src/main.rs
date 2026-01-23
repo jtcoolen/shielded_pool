@@ -1872,7 +1872,7 @@ mod proof_agg {
                 poseidon_chip.hash(&mut layouter, &[l_subroot.clone(), r_subroot.clone()])?;
             scalar_chip.constrain_as_public_input(&mut layouter, &subroot)?;
 
-            let one = scalar_chip.assign(&mut layouter, Value::known(F::ONE))?;
+            let one = scalar_chip.assign_fixed(&mut layouter, F::ONE)?;
 
             let mut roots_map_gadget = midnight_circuits::map::map_gadget::MapGadget::<
                 F,

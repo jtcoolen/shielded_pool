@@ -1,158 +1,50 @@
+// SPDX-License-Identifier: CC0-1.0
+
 use std::time::Instant;
 
-use ff::{Field, PrimeField};
+use ff::Field;
 use group::Group;
 
 use midnight_circuits::{
-    biguint::AssignedBigUint,
-    compact_std_lib::{self, Relation, ZkStdLib, ZkStdLibArch, cost_model},
-    ecc::native::AssignedScalarOfNativeCurve,
-    field::{NativeChip, NativeGadget, decomposition::chip::P2RDecompositionChip},
-    hash::{
-        poseidon::{PoseidonChip, PoseidonState},
-        sha256::Sha256Chip,
-    },
-    instructions::{
-        AssertionInstructions, AssignmentInstructions, ConversionInstructions,
-        DecompositionInstructions, EccInstructions, HashInstructions, PublicInputInstructions,
-        ZeroInstructions,
-        hash::HashCPU,
-        map::{MapCPU, MapInstructions},
-    },
+    compact_std_lib::{self, cost_model},
+    hash::poseidon::{PoseidonChip, PoseidonState},
+    instructions::map::MapCPU,
     map::cpu::MapMt,
-    types::{AssignedByte, AssignedNative, AssignedNativePoint, Instantiable},
+    types::{AssignedNativePoint, Instantiable},
 };
 
 use midnight_curves::{Fq as F, Fr as JubjubScalar, JubjubExtended as Jubjub, JubjubSubgroup};
-use midnight_proofs::{
-    circuit::{Layouter, Value},
-    transcript::Transcript,
-};
-use midnight_proofs::{
-    plonk::{Error, create_proof, keygen_pk, keygen_vk_with_k, prepare},
-    transcript::{Hashable, Sampleable, TranscriptHash},
-};
+use midnight_proofs::plonk::{create_proof, keygen_pk, keygen_vk_with_k, prepare};
+use midnight_proofs::{circuit::Value, transcript::Transcript};
 use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
 
-use sha3::{Digest, Keccak256};
-use std::{io, io::Read};
+mod circuits;
+mod primitives;
+mod proof;
+mod srs;
 
-use ff::FromUniformBytes;
-use group::GroupEncoding;
+use circuits::transfer::Spend2Output2;
 
-/// Newtype so you can refer to it as `KeccakTranscript` in generics.
-#[derive(Clone)]
-pub struct KeccakTranscript(Keccak256);
+use srs::filecoin_srs_agg;
 
-impl TranscriptHash for KeccakTranscript {
-    type Input = Vec<u8>;
-    type Output = Vec<u8>; // we return 64 bytes for your existing sampling code
+use proof::transcript::keccak::KeccakTranscript;
 
-    fn init() -> Self {
-        // Domain separation (on-chain: start transcript bytes with this literal)
-        let mut h = Keccak256::new();
-        h.update(b"Domain separator for transcript");
-        Self(h)
-    }
+use primitives::commitments::host_commit;
+use primitives::nullifiers::host_nullify;
 
-    fn absorb(&mut self, input: &Self::Input) {
-        self.0.update(&[0]);
-        self.0.update(input);
-    }
+use crate::accounts::Account;
+use crate::notes::Note;
 
-    fn squeeze(&mut self) -> Self::Output {
-        // Mutate transcript state (so multiple squeezes differ)
-        self.0.update(&[1]);
-
-        // EVM-compatible 64 bytes:
-        // out = keccak256(preimage || 0x00) || keccak256(preimage || 0x01)
-        let mut out = Vec::with_capacity(64);
-
-        let r0 = {
-            let mut t = self.0.clone();
-            t.update(&[0u8]);
-            t.finalize()
-        };
-        out.extend_from_slice(r0.as_slice());
-
-        let r1 = {
-            let mut t = self.0.clone();
-            t.update(&[1u8]);
-            t.finalize()
-        };
-        out.extend_from_slice(r1.as_slice());
-
-        debug_assert_eq!(out.len(), 64);
-        out
-    }
-}
-
-// ------------------------------------------------------------
-// Fix #1 from your error: G1Projective must be Hashable<KeccakTranscript>
-// ------------------------------------------------------------
-impl Hashable<KeccakTranscript> for midnight_curves::G1Projective {
-    fn to_input(&self) -> Vec<u8> {
-        Hashable::<KeccakTranscript>::to_bytes(self)
-    }
-
-    fn to_bytes(&self) -> Vec<u8> {
-        <Self as GroupEncoding>::to_bytes(self).as_ref().to_vec()
-    }
-
-    fn read(buffer: &mut impl Read) -> io::Result<Self> {
-        let mut bytes = <Self as GroupEncoding>::Repr::default();
-        buffer.read_exact(bytes.as_mut())?;
-
-        Option::from(Self::from_bytes(&bytes))
-            .ok_or_else(|| io::Error::other("Invalid BLS12-381 point encoding in proof"))
-    }
-}
-
-// ------------------------------------------------------------
-// Fix #2/#3 from your error: BlsScalar must be Hashable + Sampleable for KeccakTranscript
-//
-// IMPORTANT: Replace `midnight_curves::Fq` below with your actual `BlsScalar` type
-// if it is a distinct alias/type in your crate.
-// ------------------------------------------------------------
-impl Hashable<KeccakTranscript> for midnight_curves::Fq {
-    fn to_input(&self) -> Vec<u8> {
-        self.to_repr().to_vec()
-    }
-
-    fn to_bytes(&self) -> Vec<u8> {
-        self.to_repr().to_vec()
-    }
-
-    fn read(buffer: &mut impl Read) -> io::Result<Self> {
-        let mut bytes = <Self as PrimeField>::Repr::default();
-        buffer.read_exact(bytes.as_mut())?;
-
-        Option::from(Self::from_repr(bytes))
-            .ok_or_else(|| io::Error::other("Invalid BLS12-381 scalar encoding in proof"))
-    }
-}
-
-impl Sampleable<KeccakTranscript> for midnight_curves::Fq {
-    fn sample(hash_output: Vec<u8>) -> Self {
-        assert!(hash_output.len() <= 64);
-        assert!(hash_output.len() >= (midnight_curves::Fq::NUM_BITS as usize / 8) + 12);
-
-        let mut bytes = [0u8; 64];
-        bytes[..hash_output.len()].copy_from_slice(&hash_output);
-
-        midnight_curves::Fq::from_uniform_bytes(&bytes)
-    }
-}
+use circuits::gadgets;
+use primitives::accounts;
+use primitives::notes;
 
 mod proof_agg {
     use core::array;
 
     use halo2curves::{ff::Field, group::Group};
     use midnight_circuits::hash::poseidon::PoseidonState;
-    use midnight_circuits::hash::sha256::{
-        NB_SHA256_ADVICE_COLS, NB_SHA256_FIXED_COLS, Sha256Chip, Sha256Config,
-    };
     use midnight_circuits::instructions::map::{MapCPU, MapInstructions};
     use midnight_circuits::types::Instantiable;
     use midnight_circuits::{
@@ -180,7 +72,6 @@ mod proof_agg {
     };
     use midnight_curves::Bls12;
     use midnight_proofs::poly::kzg::params::ParamsKZG;
-    use midnight_proofs::utils::SerdeFormat;
     use midnight_proofs::{
         circuit::{Layouter, SimpleFloorPlanner, Value},
         plonk::{
@@ -190,18 +81,16 @@ mod proof_agg {
         poly::{EvaluationDomain, kzg::KZGCommitmentScheme},
         transcript::{CircuitTranscript, Transcript},
     };
-    use rand::{Rng, SeedableRng, rngs::{OsRng, StdRng}};
+    use rand::rngs::OsRng;
     use rayon::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::env;
-    use std::fs::File;
-    use std::io::{BufReader, Write};
-    use std::path::Path;
     use std::sync::Arc;
     use std::time::Instant;
 
     #[cfg(feature = "dev-curves")]
     use midnight_curves::bn256::Bn256;
+
+    use crate::srs::filecoin_srs_agg;
     #[cfg(feature = "dev-curves")]
     type FBN = midnight_curves::bn256::Fr;
 
@@ -263,141 +152,6 @@ mod proof_agg {
                 self.roots_set_root,
             ]
         }
-    }
-
-    macro_rules! ensure {
-        ($cond:expr, $($arg:tt)*) => {
-            if !$cond {
-                return Err(io_other(format!($($arg)*)));
-            }
-        };
-    }
-    fn io_other(msg: impl Into<String>) -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::Other, msg.into())
-    }
-
-    // Deterministic mock SRS for testing only MUST NOT be used in production
-    pub fn mock_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>, std::io::Error> {
-        ensure!(
-            k <= 20,
-            "No Filecoin SRS available for circuits of size k={}",
-            k
-        );
-    
-        let srs_dir = env::var("SRS_DIR").unwrap_or_else(|_| "./examples/assets".into());
-        let srs_path = format!("{srs_dir}/bls_mock_2p{k}");
-        let fetching_path = if Path::new(&srs_path).exists() {
-            srs_path.clone()
-        } else {
-            format!("{srs_dir}/bls_mock_2p20")
-        };
-    
-        // If the (mock) params file we're about to read doesn't exist, create it via unsafe_setup.
-        if !Path::new(&fetching_path).exists() {
-            std::fs::create_dir_all(&srs_dir).map_err(|e| {
-                io_other(format!("Failed to create SRS_DIR '{}': {e}", srs_dir))
-            })?;
-    
-            let rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64);
-    
-            let params = ParamsKZG::<Bls12>::unsafe_setup(20, rng);
-    
-            let mut buf = Vec::new();
-            params
-                .write_custom(&mut buf, SerdeFormat::RawBytesUnchecked)
-                .map_err(|e| io_other(format!("Failed to serialize mock params: {e}")))?;
-    
-            let mut file = File::create(&fetching_path).map_err(|e| {
-                io_other(format!("Failed to create mock SRS file '{}': {e}", fetching_path))
-            })?;
-            file.write_all(&buf)
-                .map_err(|e| io_other(format!("Failed to write mock SRS file '{}': {e}", fetching_path)))?;
-        }
-    
-        let params_fs = File::open(Path::new(&fetching_path)).map_err(|e| {
-            io_other(format!(
-                "Failed to open SRS file at '{}': {e}. (Did you set SRS_DIR?)",
-                fetching_path
-            ))
-        })?;
-    
-        let mut params: ParamsKZG<Bls12> = ParamsKZG::read_custom::<_>(
-            &mut BufReader::new(params_fs),
-            SerdeFormat::RawBytesUnchecked,
-        )
-        .map_err(|e| io_other(format!("Failed to read SRS params from '{}': {e}", fetching_path)))?;
-    
-        // If we loaded the MAX_K file, downsize and cache the per-k file
-        if fetching_path != srs_path {
-            params.downsize(k);
-    
-            let mut buf = Vec::new();
-            params
-                .write_custom(&mut buf, SerdeFormat::RawBytesUnchecked)
-                .map_err(|e| io_other(format!("Failed to serialize downsized params: {e}")))?;
-    
-            let mut file = File::create(&srs_path).map_err(|e| {
-                io_other(format!("Failed to create mock SRS cache file '{}': {e}", srs_path))
-            })?;
-            file.write_all(&buf)
-                .map_err(|e| io_other(format!("Failed to write mock SRS cache '{}': {e}", srs_path)))?;
-        }
-    
-        Ok(params)
-    }
-
-    pub fn filecoin_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>, std::io::Error> {
-        ensure!(
-            k <= 20,
-            "No Filecoin SRS available for circuits of size k={}",
-            k
-        );
-
-        let srs_dir = env::var("SRS_DIR").unwrap_or_else(|_| "./examples/assets".into());
-        let srs_path = format!("{srs_dir}/bls_filecoin_2p{k}");
-        let fetching_path = if Path::new(&srs_path).exists() {
-            srs_path.clone()
-        } else {
-            format!("{srs_dir}/bls_filecoin_2p20")
-        };
-
-        let params_fs = File::open(Path::new(&fetching_path)).map_err(|e| {
-            io_other(format!(
-                "Failed to open SRS file at '{}': {e}. (Did you set SRS_DIR?)",
-                fetching_path
-            ))
-        })?;
-
-        let mut params: ParamsKZG<Bls12> = ParamsKZG::read_custom::<_>(
-            &mut BufReader::new(params_fs),
-            SerdeFormat::RawBytesUnchecked,
-        )
-        .map_err(|e| {
-            io_other(format!(
-                "Failed to read SRS params from '{}': {e}",
-                fetching_path
-            ))
-        })?;
-
-        if fetching_path != srs_path {
-            params.downsize(k);
-
-            let mut buf = Vec::new();
-            params
-                .write_custom(&mut buf, SerdeFormat::RawBytesUnchecked)
-                .map_err(|e| io_other(format!("Failed to serialize downsized params: {e}")))?;
-
-            let mut file = File::create(&srs_path).map_err(|e| {
-                io_other(format!(
-                    "Failed to create SRS cache file '{}': {e}",
-                    srs_path
-                ))
-            })?;
-            file.write_all(&buf[..])
-                .map_err(|e| io_other(format!("Failed to write SRS cache '{}': {e}", srs_path)))?;
-        }
-
-        Ok(params)
     }
 
     #[derive(Clone, Debug)]
@@ -872,12 +626,6 @@ mod proof_agg {
                 .collect();
         }
         level_states[0]
-    }
-
-    // ✅ Single Poseidon hash of all 7 would-be public inputs (host-side)
-    fn host_instance_hash(items: [F; 7]) -> F {
-        use midnight_circuits::instructions::hash::HashCPU;
-        <PoseidonChip<F> as HashCPU<F, F>>::hash(&items)
     }
 
     fn verify_and_extract_acc(
@@ -1384,8 +1132,8 @@ mod proof_agg {
         }
 
         leaf_plans.par_iter().for_each(|p| {
-            let inst_l = host_instance_hash(p.left_items);
-            let inst_r = host_instance_hash(p.right_items);
+            let inst_l = crate::primitives::hash::host_instance_hash(p.left_items);
+            let inst_r = crate::primitives::hash::host_instance_hash(p.right_items);
             assert_eq!(
                 inst_l, p.left_state,
                 "left client instance mismatch (leaf {})",
@@ -1790,7 +1538,21 @@ mod proof_agg {
             let native_chip = <NativeChip<F> as ComposableChip<F>>::new(&config.0, &());
             let core_decomp_chip = P2RDecompositionChip::new(&config.1, &(AGG_K as usize - 1));
             let scalar_chip = NativeGadget::new(core_decomp_chip.clone(), native_chip.clone());
-            let curve_chip = ForeignEccChip::new(&config.2, &scalar_chip, &scalar_chip);
+            let curve_chip: ForeignEccChip<
+                midnight_curves::Fq,
+                midnight_curves::G1Projective,
+                midnight_curves::G1Projective,
+                NativeGadget<
+                    midnight_curves::Fq,
+                    P2RDecompositionChip<midnight_curves::Fq>,
+                    NativeChip<midnight_curves::Fq>,
+                >,
+                NativeGadget<
+                    midnight_curves::Fq,
+                    P2RDecompositionChip<midnight_curves::Fq>,
+                    NativeChip<midnight_curves::Fq>,
+                >,
+            > = ForeignEccChip::new(&config.2, &scalar_chip, &scalar_chip);
             let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
             let verifier_chip: VerifierGadget<_> =
                 VerifierGadget::<S>::new(&curve_chip, &scalar_chip, &poseidon_chip);
@@ -2008,12 +1770,9 @@ mod proof_agg {
 
 use proof_agg::{
     AggAccumulator, ClientProof as AggClientProof, FinalAggCircuit, accumulator_as_public_input,
-    aggregate_client_proofs_cached, filecoin_srs_agg, prepare_agg_setup,
+    aggregate_client_proofs_cached, prepare_agg_setup,
 };
 
-const UTXO_COMMIT_TAG: u64 = 0x0001;
-const UTXO_NULLIFY_TAG: u64 = 0x0002;
-const AMOUNT_BITS: u32 = 128;
 const AMOUNT_GEN_BITS: u32 = 120;
 const BATCH_SIZE: usize = 4;
 
@@ -2025,260 +1784,6 @@ pub struct Utxo {
     pub asset_id: F,
     pub amount: u128,
     pub randomness: F,
-}
-
-#[derive(Clone, Default)]
-pub struct Spend2Output2;
-
-impl Relation for Spend2Output2 {
-    type Instance = F;
-
-    type Witness = (
-        MapMt<F, PoseidonChip<F>>,
-        JubjubScalar,
-        F,
-        Utxo,
-        Utxo,
-        Utxo,
-        Utxo,
-        JubjubSubgroup,
-        JubjubSubgroup,
-    );
-
-    fn format_instance(instance: &Self::Instance) -> Result<Vec<F>, Error> {
-        Ok(vec![*instance])
-    }
-
-    fn circuit(
-        &self,
-        std_lib: &ZkStdLib,
-        layouter: &mut impl Layouter<F>,
-        _instance: Value<Self::Instance>,
-        witness: Value<Self::Witness>,
-    ) -> Result<(), Error> {
-        let commit_map_val = witness.clone().map(|(m, _, _, _, _, _, _, _, _)| m);
-
-        let sk_val = witness.clone().map(|(_, sk, _, _, _, _, _, _, _)| sk);
-        let alpha_val = witness.clone().map(|(_, _, alpha, _, _, _, _, _, _)| alpha);
-
-        let old1_val = witness.clone().map(|(_, _, _, o1, _, _, _, _, _)| o1);
-        let old2_val = witness.clone().map(|(_, _, _, _, o2, _, _, _, _)| o2);
-        let new1_val = witness.clone().map(|(_, _, _, _, _, n1, _, _, _)| n1);
-        let new2_val = witness.clone().map(|(_, _, _, _, _, _, n2, _, _)| n2);
-
-        let pk1_out_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _)| k1);
-        let pk2_out_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2);
-
-        let sk: AssignedScalarOfNativeCurve<Jubjub> = std_lib.jubjub().assign(layouter, sk_val)?;
-        let generator = std_lib
-            .jubjub()
-            .assign_fixed(layouter, JubjubSubgroup::generator())?;
-        let pk_sender = std_lib.jubjub().mul(layouter, &sk, &generator)?;
-        let pk_sender_fields = std_lib.jubjub().as_public_input(layouter, &pk_sender)?;
-        let (pk_sx, pk_sy) = (pk_sender_fields[0].clone(), pk_sender_fields[1].clone());
-
-        let alpha_native_value = std_lib.assign(layouter, alpha_val)?;
-        std_lib.assert_non_zero(layouter, &alpha_native_value)?;
-        let alpha: AssignedScalarOfNativeCurve<Jubjub> =
-            std_lib.jubjub().convert(layouter, &alpha_native_value)?;
-        let blind = std_lib.jubjub().mul(layouter, &alpha, &generator)?;
-        let pk_blinded = std_lib.jubjub().add(layouter, &pk_sender, &blind)?;
-        let pk_blinded_fields = std_lib.jubjub().as_public_input(layouter, &pk_blinded)?;
-        let (pk_bx, pk_by) = (pk_blinded_fields[0].clone(), pk_blinded_fields[1].clone());
-
-        let old1_asg = assign_utxo(std_lib, layouter, &old1_val)?;
-        let old2_asg = assign_utxo(std_lib, layouter, &old2_val)?;
-        let new1_asg = assign_utxo(std_lib, layouter, &new1_val)?;
-        let new2_asg = assign_utxo(std_lib, layouter, &new2_val)?;
-
-        let old_c1 = compute_commitment_from_parts(std_lib, layouter, &old1_asg, &pk_sx, &pk_sy)?;
-        let old_c2 = compute_commitment_from_parts(std_lib, layouter, &old2_asg, &pk_sx, &pk_sy)?;
-
-        let mut commit_map_gadget = std_lib.map_gadget().clone();
-        commit_map_gadget.init(layouter, commit_map_val)?;
-
-        let one = std_lib.assign_fixed(layouter, F::ONE)?;
-
-        let v1 = commit_map_gadget.get(layouter, &old_c1)?;
-        let v2 = commit_map_gadget.get(layouter, &old_c2)?;
-        std_lib.assert_equal(layouter, &v1, &one)?;
-        std_lib.assert_equal(layouter, &v2, &one)?;
-
-        let root = commit_map_gadget.succinct_repr();
-
-        let nf1 = compute_nullifier(std_lib, layouter, &old_c1, &pk_sx, &pk_sy)?;
-        let nf2 = compute_nullifier(std_lib, layouter, &old_c2, &pk_sx, &pk_sy)?;
-        std_lib.assert_not_equal(layouter, &nf1, &nf2)?;
-
-        let pk1_out: AssignedNativePoint<Jubjub> =
-            std_lib.jubjub().assign(layouter, pk1_out_val)?;
-        let pk1_fields = std_lib.jubjub().as_public_input(layouter, &pk1_out)?;
-        let (pk1x, pk1y) = (pk1_fields[0].clone(), pk1_fields[1].clone());
-        let pk2_out: AssignedNativePoint<Jubjub> =
-            std_lib.jubjub().assign(layouter, pk2_out_val)?;
-        let pk2_fields = std_lib.jubjub().as_public_input(layouter, &pk2_out)?;
-        let (pk2x, pk2y) = (pk2_fields[0].clone(), pk2_fields[1].clone());
-
-        let new_c1 = compute_commitment_from_parts(std_lib, layouter, &new1_asg, &pk1x, &pk1y)?;
-        let new_c2 = compute_commitment_from_parts(std_lib, layouter, &new2_asg, &pk2x, &pk2y)?;
-        std_lib.assert_not_equal(layouter, &new_c1, &new_c2)?;
-
-        check_value_conservation_assigned(
-            std_lib, layouter, &old1_asg, &old2_asg, &new1_asg, &new2_asg,
-        )?;
-
-        let instance_hash = std_lib.poseidon(
-            layouter,
-            &[
-                root.clone(),
-                pk_bx.clone(),
-                pk_by.clone(),
-                new_c1.clone(),
-                new_c2.clone(),
-                nf1.clone(),
-                nf2.clone(),
-            ],
-        )?;
-
-        std_lib.constrain_as_public_input(layouter, &instance_hash)?;
-        Ok(())
-    }
-
-    fn used_chips(&self) -> ZkStdLibArch {
-        ZkStdLibArch {
-            jubjub: true,
-            poseidon: true,
-            sha256: false,
-            sha512: false,
-            secp256k1: false,
-            bls12_381: false,
-            base64: false,
-            nr_pow2range_cols: 1,
-            automaton: false,
-        }
-    }
-
-    fn write_relation<W: std::io::Write>(&self, _writer: &mut W) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn read_relation<R: std::io::Read>(_reader: &mut R) -> std::io::Result<Self> {
-        Ok(Self)
-    }
-}
-
-#[derive(Clone)]
-struct AssignedUtxo {
-    id: AssignedNative<F>,
-    amount_f: AssignedNative<F>,
-    amount_big: AssignedBigUint<F>,
-    randomness: AssignedNative<F>,
-}
-
-fn assign_utxo<L: Layouter<F>>(
-    std_lib: &ZkStdLib,
-    layouter: &mut L,
-    utxo_val: &Value<Utxo>,
-) -> Result<AssignedUtxo, Error> {
-    let id = std_lib.assign(layouter, utxo_val.clone().map(|u| u.asset_id))?;
-    let amount_f = std_lib.assign(layouter, utxo_val.clone().map(|u| F::from_u128(u.amount)))?;
-    let randomness = std_lib.assign(layouter, utxo_val.clone().map(|u| u.randomness))?;
-    let big = std_lib.biguint();
-
-    let bits_f =
-        std_lib.assigned_to_le_bits(layouter, &amount_f, Some(AMOUNT_BITS as usize), true)?;
-    let amount_big = big.from_le_bits(layouter, &bits_f)?;
-
-    Ok(AssignedUtxo {
-        id,
-        amount_f,
-        amount_big,
-        randomness,
-    })
-}
-
-fn compute_commitment_from_parts<L: Layouter<F>>(
-    std_lib: &ZkStdLib,
-    layouter: &mut L,
-    utxo: &AssignedUtxo,
-    pk_x: &AssignedNative<F>,
-    pk_y: &AssignedNative<F>,
-) -> Result<AssignedNative<F>, Error> {
-    let tag = std_lib.assign_fixed(layouter, F::from(UTXO_COMMIT_TAG))?;
-    let zero = std_lib.assign_fixed(layouter, F::ZERO)?;
-    let h1 = std_lib.poseidon(layouter, &[tag, utxo.id.clone(), utxo.amount_f.clone()])?;
-    let h2 = std_lib.poseidon(
-        layouter,
-        &[pk_x.clone(), pk_y.clone(), utxo.randomness.clone()],
-    )?;
-    std_lib.poseidon(layouter, &[h1, h2, zero])
-}
-
-fn compute_nullifier<L: Layouter<F>>(
-    std_lib: &ZkStdLib,
-    layouter: &mut L,
-    commitment: &AssignedNative<F>,
-    pk_x: &AssignedNative<F>,
-    pk_y: &AssignedNative<F>,
-) -> Result<AssignedNative<F>, Error> {
-    let tag = std_lib.assign_fixed(layouter, F::from(UTXO_NULLIFY_TAG))?;
-    let zero = std_lib.assign_fixed(layouter, F::ZERO)?;
-    let h = std_lib.poseidon(layouter, &[tag, commitment.clone(), pk_x.clone()])?;
-    std_lib.poseidon(layouter, &[h, pk_y.clone(), zero])
-}
-
-fn check_value_conservation_assigned<L: Layouter<F>>(
-    std_lib: &ZkStdLib,
-    layouter: &mut L,
-    in1: &AssignedUtxo,
-    in2: &AssignedUtxo,
-    out1: &AssignedUtxo,
-    out2: &AssignedUtxo,
-) -> Result<(), Error> {
-    std_lib.assert_equal(layouter, &in1.id, &in2.id)?;
-    std_lib.assert_equal(layouter, &in1.id, &out1.id)?;
-    std_lib.assert_equal(layouter, &in1.id, &out2.id)?;
-
-    let big = std_lib.biguint();
-    let sum_in = big.add(layouter, &in1.amount_big, &in2.amount_big)?;
-    let sum_out = big.add(layouter, &out1.amount_big, &out2.amount_big)?;
-    big.assert_equal(layouter, &sum_in, &sum_out)
-}
-
-fn host_commit(id: F, amt_u128: u128, pk_x: F, pk_y: F, rand: F) -> F {
-    let tag = F::from(UTXO_COMMIT_TAG);
-    let amt_f = F::from_u128(amt_u128);
-    let h1 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[tag, id, amt_f]);
-    let h2 = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[pk_x, pk_y, rand]);
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h1, h2, F::ZERO])
-}
-
-fn host_nullify(commit: F, pk_x: F, pk_y: F) -> F {
-    let tag = F::from(UTXO_NULLIFY_TAG);
-    let h = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[tag, commit, pk_x]);
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h, pk_y, F::ZERO])
-}
-
-// ✅ Single Poseidon hash of all 7 would-be public inputs (host-side)
-fn host_instance_hash(items: [F; 7]) -> F {
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&items)
-}
-
-#[derive(Clone, Debug)]
-struct Note {
-    utxo: Utxo,
-    commit: F,
-    spent: bool,
-    confirmed_at_root_idx: usize,
-}
-
-#[derive(Clone)]
-struct Account {
-    id: usize,
-    sk: JubjubScalar,
-    pk_point: JubjubSubgroup,
-    pk_x: F,
-    pk_y: F,
-    wallet: Vec<Note>,
 }
 
 fn main() {
@@ -2304,7 +1809,7 @@ fn main() {
     let agg_setup = prepare_agg_setup(&srs, vk.vk(), LEAF_VK_NAME, K, BATCH_SIZE);
 
     // ✅ Cache FINAL aggregation vk/pk once (depends only on cached agg_setup for this batch size).
-    let final_agg_srs = proof_agg::filecoin_srs_agg(proof_agg::AGG_K).unwrap();
+    let final_agg_srs = srs::filecoin_srs_agg(proof_agg::AGG_K).unwrap();
     let default_final_circuit = FinalAggCircuit {
         child_vk: agg_setup.child_vk().clone(),
         child_vk_name: agg_setup.child_vk_name().to_string(),
@@ -2383,7 +1888,7 @@ fn main() {
     }
 
     let genesis_root = commitment_map.succinct_repr();
-    println!("Initial commitment root: {:?}", genesis_root);
+    println!("Initial commitment root: {genesis_root:?}");
 
     commitment_root_history.push(genesis_root);
     commitment_map_history.push(commitment_map.clone());
@@ -2570,7 +2075,7 @@ fn main() {
                 nf1,
                 nf2,
             ];
-            let instance: F = host_instance_hash(public_items);
+            let instance: F = crate::primitives::hash::host_instance_hash(public_items);
 
             let witness = (
                 historic_commit_map,
@@ -2597,7 +2102,7 @@ fn main() {
             );
 
             let stats = cost_model(&Spend2Output2);
-            println!("client circuit stats: {:?}", stats);
+            println!("client circuit stats: {stats:?}");
 
             client_proofs.push(AggClientProof {
                 state: instance,
@@ -2796,114 +2301,114 @@ fn main() {
                     Nullifier-set transition: {:?} -> {:?}\n\
                     Historic-roots-set transition: {:?} -> {:?}\n\
                     Final accumulator PI length: {} field elements",
-                    batch_idx,
-                    agg_result.root_state.subroot,
-                    agg_result.root_state.c_pre,
-                    agg_result.root_state.c_post,
-                    agg_result.root_state.n_pre,
-                    agg_result.root_state.n_post,
-                    pre_roots_set_root,
-                    post_roots_set_root,
-                    final_acc_pi.len()
-                );
-            }
-
-            // Commit batch to “chain state”
-            accounts = shadow_accounts;
-            nullifier_map = shadow_nullifier_map;
-            commitment_map = shadow_commitment_map;
-
-            commitment_roots_set = shadow_commitment_roots_set;
-            commitment_root_history.push(commitment_map.succinct_repr());
-            commitment_map_history.push(commitment_map.clone());
-
-            println!(
-                "After batch {} committed commitment root: {:?}",
                 batch_idx,
-                commitment_map.succinct_repr()
+                agg_result.root_state.subroot,
+                agg_result.root_state.c_pre,
+                agg_result.root_state.c_post,
+                agg_result.root_state.n_pre,
+                agg_result.root_state.n_post,
+                pre_roots_set_root,
+                post_roots_set_root,
+                final_acc_pi.len()
             );
-
-            // NEW: Demonstrate replay protection:
-            // Attempt to apply the SAME client proofs again on the updated state.
-            // This should fail because nullifiers are already present.
-            println!("REPLAY attempt:");
-            println!("  c_pre  = {:?}", agg_result.root_state.c_pre);
-            println!("  c_post = {:?}", agg_result.root_state.c_post);
-            println!("  n_pre  = {:?}", agg_result.root_state.n_pre);
-            println!("  n_post = {:?}", agg_result.root_state.n_post);
-
-            println!(
-                "  roots_set has c_pre?  {:?}",
-                commitment_roots_set.get(&agg_result.root_state.c_pre)
-            );
-            println!(
-                "  roots_set has c_post? {:?}",
-                commitment_roots_set.get(&agg_result.root_state.c_post)
-            );
-
-            println!(
-                "  nullifier_map root == n_post? {}",
-                nullifier_map.succinct_repr() == agg_result.root_state.n_post
-            );
-            println!(
-                "REPLAY using commitment_map root: {:?}",
-                commitment_map.succinct_repr()
-            );
-            println!(
-                "REPLAY using nullifier_map  root: {:?}",
-                nullifier_map.succinct_repr()
-            );
-
-            let replay_commit_map = commitment_map.clone(); // current POST state
-            let replay_null_map = nullifier_map.clone(); // current POST state
-            let replay_roots_set_map = commitment_roots_set.clone(); // head AFTER applying batch
-
-            println!(
-                "REPLAY using commitment_map root: {:?}",
-                replay_commit_map.succinct_repr()
-            );
-            println!(
-                "REPLAY using nullifier_map  root: {:?}",
-                replay_null_map.succinct_repr()
-            );
-
-            let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = aggregate_client_proofs_cached(
-                    &agg_setup,
-                    &srs,
-                    vk.vk(),
-                    &client_proofs,
-                    replay_commit_map.clone(),
-                    replay_null_map.clone(),
-                    replay_roots_set_map.clone(),
-                );
-            }));
-            match replay {
-                Ok(_) => println!("❌ Replay unexpectedly succeeded (BUG)"),
-                Err(_) => println!(
-                    "✅ Replay correctly rejected (nullifiers already spent / state already advanced)"
-                ),
-            }
-
-            batch_idx += 1;
         }
 
+        // Commit batch to “chain state”
+        accounts = shadow_accounts;
+        nullifier_map = shadow_nullifier_map;
+        commitment_map = shadow_commitment_map;
+
+        commitment_roots_set = shadow_commitment_roots_set;
+        commitment_root_history.push(commitment_map.succinct_repr());
+        commitment_map_history.push(commitment_map.clone());
+
         println!(
-            "\nFinal commitment root: {:?}",
+            "After batch {} committed commitment root: {:?}",
+            batch_idx,
             commitment_map.succinct_repr()
         );
 
-        for acc in &accounts {
-            let bal: u128 = acc
-                .wallet
-                .iter()
-                .filter(|n| !n.spent)
-                .fold(0u128, |s, n| s.saturating_add(n.utxo.amount));
-            println!(
-                "Account {} unspent notes: {}, balance {}",
-                acc.id,
-                acc.wallet.iter().filter(|n| !n.spent).count(),
-                bal
+        // NEW: Demonstrate replay protection:
+        // Attempt to apply the SAME client proofs again on the updated state.
+        // This should fail because nullifiers are already present.
+        println!("REPLAY attempt:");
+        println!("  c_pre  = {:?}", agg_result.root_state.c_pre);
+        println!("  c_post = {:?}", agg_result.root_state.c_post);
+        println!("  n_pre  = {:?}", agg_result.root_state.n_pre);
+        println!("  n_post = {:?}", agg_result.root_state.n_post);
+
+        println!(
+            "  roots_set has c_pre?  {:?}",
+            commitment_roots_set.get(&agg_result.root_state.c_pre)
+        );
+        println!(
+            "  roots_set has c_post? {:?}",
+            commitment_roots_set.get(&agg_result.root_state.c_post)
+        );
+
+        println!(
+            "  nullifier_map root == n_post? {}",
+            nullifier_map.succinct_repr() == agg_result.root_state.n_post
+        );
+        println!(
+            "REPLAY using commitment_map root: {:?}",
+            commitment_map.succinct_repr()
+        );
+        println!(
+            "REPLAY using nullifier_map  root: {:?}",
+            nullifier_map.succinct_repr()
+        );
+
+        let replay_commit_map = commitment_map.clone(); // current POST state
+        let replay_null_map = nullifier_map.clone(); // current POST state
+        let replay_roots_set_map = commitment_roots_set.clone(); // head AFTER applying batch
+
+        println!(
+            "REPLAY using commitment_map root: {:?}",
+            replay_commit_map.succinct_repr()
+        );
+        println!(
+            "REPLAY using nullifier_map  root: {:?}",
+            replay_null_map.succinct_repr()
+        );
+
+        let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = aggregate_client_proofs_cached(
+                &agg_setup,
+                &srs,
+                vk.vk(),
+                &client_proofs,
+                replay_commit_map.clone(),
+                replay_null_map.clone(),
+                replay_roots_set_map.clone(),
             );
+        }));
+        match replay {
+            Ok(_) => println!("❌ Replay unexpectedly succeeded (BUG)"),
+            Err(_) => println!(
+                "✅ Replay correctly rejected (nullifiers already spent / state already advanced)"
+            ),
         }
+
+        batch_idx += 1;
     }
+
+    println!(
+        "\nFinal commitment root: {:?}",
+        commitment_map.succinct_repr()
+    );
+
+    for acc in &accounts {
+        let bal: u128 = acc
+            .wallet
+            .iter()
+            .filter(|n| !n.spent)
+            .fold(0u128, |s, n| s.saturating_add(n.utxo.amount));
+        println!(
+            "Account {} unspent notes: {}, balance {}",
+            acc.id,
+            acc.wallet.iter().filter(|n| !n.spent).count(),
+            bal
+        );
+    }
+}

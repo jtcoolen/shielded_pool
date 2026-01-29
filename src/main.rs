@@ -473,14 +473,12 @@ mod proof_agg {
     pub struct AggPublicInputs {
         pub state: AggState,
         pub pi_acc: AggAccumulator,
-        pub level: F,
     }
     impl AggPublicInputs {
         pub fn to_fields(&self) -> Vec<F> {
             let mut out = Vec::new();
             out.extend_from_slice(&self.state.to_fields());
             out.extend(AssignedAccumulator::as_public_input(&self.pi_acc));
-            out.push(self.level);
             out
         }
     }
@@ -508,7 +506,6 @@ mod proof_agg {
         left_acc: Value<Accumulator<S>>,
         right_acc: Value<Accumulator<S>>,
         fixed_base_names: Vec<String>,
-        prev_level: Value<F>,
         is_leaf: bool,
     }
 
@@ -540,7 +537,6 @@ mod proof_agg {
                 left_acc: Value::unknown(),
                 right_acc: Value::unknown(),
                 fixed_base_names: self.fixed_base_names.clone(),
-                prev_level: Value::unknown(),
                 is_leaf: self.is_leaf,
             }
         }
@@ -566,14 +562,6 @@ mod proof_agg {
             let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
 
             //let _sha2_chip = Sha256Chip::new(&config.4, &scalar_chip);
-
-            let prev_level = scalar_chip.assign(&mut layouter, self.prev_level)?;
-            scalar_chip.assert_equal_to_fixed(
-                &mut layouter,
-                &prev_level,
-                self.expected_prev_level,
-            )?;
-            let next_level = scalar_chip.add_constant(&mut layouter, &prev_level, F::ONE)?;
 
             let child_vk_val: AssignedNative<F> =
                 native_chip.assign_fixed(&mut layouter, self.child_vk.transcript_repr)?;
@@ -740,11 +728,9 @@ mod proof_agg {
             } else {
                 let mut left_pi = assigned_left_pi_base;
                 left_pi.extend(verifier_chip.as_public_input(&mut layouter, &left_acc)?);
-                left_pi.push(prev_level.clone());
 
                 let mut right_pi = assigned_right_pi_base;
                 right_pi.extend(verifier_chip.as_public_input(&mut layouter, &right_acc)?);
-                right_pi.push(prev_level.clone());
 
                 (left_pi, right_pi)
             };
@@ -789,7 +775,6 @@ mod proof_agg {
             for x in next_acc_pi.iter() {
                 native_chip.constrain_as_public_input(&mut layouter, x)?;
             }
-            native_chip.constrain_as_public_input(&mut layouter, &next_level)?;
 
             core_decomp_chip.load(&mut layouter)
         }
@@ -1142,7 +1127,6 @@ mod proof_agg {
                     left_acc: Value::unknown(),
                     right_acc: Value::unknown(),
                     fixed_base_names: fixed_base_names.clone(),
-                    prev_level: Value::unknown(),
                     is_leaf,
                 };
                 let (vk, pk) = keygen_vk_pk(&agg_srs_leaf, &default_circuit, K_LEAF);
@@ -1165,7 +1149,6 @@ mod proof_agg {
                     left_acc: Value::unknown(),
                     right_acc: Value::unknown(),
                     fixed_base_names: fixed_base_names.clone(),
-                    prev_level: Value::unknown(),
                     is_leaf,
                 };
                 let (vk, pk) = keygen_vk_pk(&agg_srs_internal, &default_circuit, K_INTERNAL);
@@ -1433,7 +1416,6 @@ mod proof_agg {
                     left_acc: Value::known(trivial_combined.clone()),
                     right_acc: Value::known(trivial_combined.clone()),
                     fixed_base_names: combined_fixed_base_names.clone(),
-                    prev_level: Value::known(F::ZERO),
                     is_leaf: true,
                 };
 
@@ -1463,7 +1445,6 @@ mod proof_agg {
                 let public_inputs = AggPublicInputs {
                     state,
                     pi_acc: accumulated_pi.clone(),
-                    level: F::ONE,
                 };
                 let public_inputs_fields = public_inputs.to_fields();
 
@@ -1595,7 +1576,6 @@ mod proof_agg {
                         left_acc: Value::known(left.pi_acc.clone()),
                         right_acc: Value::known(right.pi_acc.clone()),
                         fixed_base_names: combined_fixed_base_names.clone(),
-                        prev_level: Value::known(F::from(child_level as u64)),
                         is_leaf: false,
                     };
 
@@ -1610,7 +1590,6 @@ mod proof_agg {
                     let public_inputs = AggPublicInputs {
                         state,
                         pi_acc: accumulated_pi.clone(),
-                        level: F::from(parent_level as u64),
                     };
                     let public_inputs_fields = public_inputs.to_fields();
 
@@ -1940,9 +1919,6 @@ mod proof_agg {
             )?;
             right_pi_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-            let level: AssignedNative<F> =
-                scalar_chip.assign_fixed(&mut layouter, self.child_level)?;
-
             let mut left_pi: Vec<AssignedNative<F>> = Vec::new();
             left_pi.push(l_c_pre.clone());
             left_pi.push(l_c_post.clone());
@@ -1951,7 +1927,6 @@ mod proof_agg {
             left_pi.push(l_subroot.clone());
             left_pi.push(l_roots_set_root.clone()); // ---- FIX (Issue 1): include in PI
             left_pi.extend(verifier_chip.as_public_input(&mut layouter, &left_pi_acc)?);
-            left_pi.push(level.clone());
 
             let mut right_pi: Vec<AssignedNative<F>> = Vec::new();
             right_pi.push(r_c_pre.clone());
@@ -1961,7 +1936,6 @@ mod proof_agg {
             right_pi.push(r_subroot.clone());
             right_pi.push(r_roots_set_root.clone()); // ---- FIX (Issue 1): include in PI
             right_pi.extend(verifier_chip.as_public_input(&mut layouter, &right_pi_acc)?);
-            right_pi.push(level);
 
             let id_point: AssignedForeignPoint<
                 midnight_curves::Fq,

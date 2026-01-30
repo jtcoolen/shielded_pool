@@ -339,6 +339,7 @@ fn main() {
             let pk_bx = pkb_fields[0];
             let pk_by = pkb_fields[1];
 
+            // Keep these around if other parts of your system (like ClientProof) still want them.
             let public_items = [
                 root_before,
                 pk_bx,
@@ -348,7 +349,19 @@ fn main() {
                 nf1,
                 nf2,
             ];
-            let instance: F = host_instance_hash(public_items);
+
+            let state: F = host_instance_hash(public_items);
+
+            // Instance is now the *tuple of public inputs* (unhashed), in the same order as format_instance()
+            let instance = transfer_circuit::Spend2Output2PublicInputs {
+                root: root_before,
+                pk_bx,
+                pk_by,
+                new_c1: new1_commit,
+                new_c2: new2_commit,
+                nf1,
+                nf2,
+            };
 
             let witness = (
                 historic_commit_map,
@@ -368,6 +381,7 @@ fn main() {
                     &srs, &pk, &relation, &instance, witness, OsRng,
                 )
                 .expect("Proof generation failed");
+
             println!(
                 "[batch {}, tx {}] proof gen: {:?}",
                 batch_idx,
@@ -379,7 +393,7 @@ fn main() {
             println!("client circuit stats: {:?}", stats);
 
             client_proofs.push(rollup_ivc_proofs::ClientProof {
-                state: instance,
+                state,
                 proof: proof.clone(),
                 public_items,
             });

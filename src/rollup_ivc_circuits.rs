@@ -258,6 +258,11 @@ impl<T: Clone> ClientPublicItems<T> {
             self.nf2.clone(),
         ]
     }
+
+    #[inline]
+    pub fn as_vec(&self) -> Vec<T> {
+        Vec::from(self.as_array())
+    }
 }
 
 impl<T> ClientPublicItems<T> {
@@ -560,8 +565,8 @@ pub fn base_step(
 ) -> Result<
     (
         AggStateFields<AssignedNative<F>>,
-        Vec<AssignedNative<F>>,
-        Vec<AssignedNative<F>>,
+        Vec<AssignedNative<F>>, // left child public inputs (for proof verification)
+        Vec<AssignedNative<F>>, // right child public inputs (for proof verification)
     ),
     Error,
 > {
@@ -589,9 +594,9 @@ pub fn base_step(
         &one,
     )?;
 
-    // Client instance hashes.
-    let inst_left = ctx.hash_client_instance(layouter, &left)?;
-    let inst_right = ctx.hash_client_instance(layouter, &right)?;
+    // Hash client public inputs inside the base circuit (used for leaf subroot / rollup binding).
+    let inst_left_hash = ctx.hash_client_instance(layouter, &left)?;
+    let inst_right_hash = ctx.hash_client_instance(layouter, &right)?;
 
     // Apply transaction effects.
     ctx.apply_transaction_effects(layouter, &mut commit_map, &mut null_map, &left, &zero, &one)?;
@@ -605,7 +610,7 @@ pub fn base_step(
     )?;
 
     // Leaf subroot.
-    let subroot = ctx.hash2(layouter, &inst_left, &inst_right)?;
+    let subroot = ctx.hash2(layouter, &inst_left_hash, &inst_right_hash)?;
 
     Ok((
         AggStateFields {
@@ -616,8 +621,8 @@ pub fn base_step(
             subroot,
             commitment_roots_set_root,
         },
-        vec![inst_left],
-        vec![inst_right],
+        left.as_vec(),  // <-- verify client proof with its 7 unhashed public inputs
+        right.as_vec(), // <-- verify client proof with its 7 unhashed public inputs
     ))
 }
 

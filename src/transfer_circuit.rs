@@ -28,6 +28,32 @@ const UTXO_NULLIFY_TAG: u64 = 0x0002;
 const AMOUNT_BITS: u32 = 128;
 pub(crate) const AMOUNT_GEN_BITS: u32 = 120;
 
+/// Public inputs (unhashed): these are constrained individually as public inputs, in this exact order.
+#[derive(Clone, Copy, Debug)]
+pub struct Spend2Output2PublicInputs {
+    pub root: F,
+    pub pk_bx: F,
+    pub pk_by: F,
+    pub new_c1: F,
+    pub new_c2: F,
+    pub nf1: F,
+    pub nf2: F,
+}
+
+impl Default for Spend2Output2PublicInputs {
+    fn default() -> Self {
+        Self {
+            root: F::ZERO,
+            pk_bx: F::ZERO,
+            pk_by: F::ZERO,
+            new_c1: F::ZERO,
+            new_c2: F::ZERO,
+            nf1: F::ZERO,
+            nf2: F::ZERO,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Utxo {
     pub asset_id: F,
@@ -39,7 +65,7 @@ pub struct Utxo {
 pub struct Spend2Output2;
 
 impl Relation for Spend2Output2 {
-    type Instance = F;
+    type Instance = Spend2Output2PublicInputs;
 
     type Witness = (
         MapMt<F, PoseidonChip<F>>,
@@ -54,7 +80,15 @@ impl Relation for Spend2Output2 {
     );
 
     fn format_instance(instance: &Self::Instance) -> Result<Vec<F>, Error> {
-        Ok(vec![*instance])
+        Ok(vec![
+            instance.root,
+            instance.pk_bx,
+            instance.pk_by,
+            instance.new_c1,
+            instance.new_c2,
+            instance.nf1,
+            instance.nf2,
+        ])
     }
 
     fn circuit(
@@ -122,6 +156,7 @@ impl Relation for Spend2Output2 {
             std_lib.jubjub().assign(layouter, pk1_out_val)?;
         let pk1_fields = std_lib.jubjub().as_public_input(layouter, &pk1_out)?;
         let (pk1x, pk1y) = (pk1_fields[0].clone(), pk1_fields[1].clone());
+
         let pk2_out: AssignedNativePoint<Jubjub> =
             std_lib.jubjub().assign(layouter, pk2_out_val)?;
         let pk2_fields = std_lib.jubjub().as_public_input(layouter, &pk2_out)?;
@@ -135,20 +170,15 @@ impl Relation for Spend2Output2 {
             std_lib, layouter, &old1_asg, &old2_asg, &new1_asg, &new2_asg,
         )?;
 
-        let instance_hash = std_lib.poseidon(
-            layouter,
-            &[
-                root.clone(),
-                pk_bx.clone(),
-                pk_by.clone(),
-                new_c1.clone(),
-                new_c2.clone(),
-                nf1.clone(),
-                nf2.clone(),
-            ],
-        )?;
+        // Unhashed public inputs: constrain each value directly as a public input (in the same order as format_instance).
+        std_lib.constrain_as_public_input(layouter, &root)?;
+        std_lib.constrain_as_public_input(layouter, &pk_bx)?;
+        std_lib.constrain_as_public_input(layouter, &pk_by)?;
+        std_lib.constrain_as_public_input(layouter, &new_c1)?;
+        std_lib.constrain_as_public_input(layouter, &new_c2)?;
+        std_lib.constrain_as_public_input(layouter, &nf1)?;
+        std_lib.constrain_as_public_input(layouter, &nf2)?;
 
-        std_lib.constrain_as_public_input(layouter, &instance_hash)?;
         Ok(())
     }
 

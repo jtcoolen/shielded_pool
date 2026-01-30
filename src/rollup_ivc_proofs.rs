@@ -448,14 +448,14 @@ fn prove_leaf(
         leaf_vk,
         &leaf_fixed_bases,
         &left.proof,
-        &[left.state],
+        &left.public_items,
     )?;
     let acc_r = verify_and_extract_acc(
         leaf_srs,
         leaf_vk,
         &leaf_fixed_bases,
         &right.proof,
-        &[right.state],
+        &right.public_items,
     )?;
 
     let pi_acc = collapse_acc(Accumulator::accumulate(&[

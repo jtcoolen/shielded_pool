@@ -7,20 +7,15 @@ use midnight_circuits::{
     biguint::AssignedBigUint,
     compact_std_lib::{self, Relation, ZkStdLib, ZkStdLibArch, cost_model},
     ecc::native::AssignedScalarOfNativeCurve,
-    field::{NativeChip, NativeGadget, decomposition::chip::P2RDecompositionChip},
-    hash::{
-        poseidon::{PoseidonChip, PoseidonState},
-        sha256::Sha256Chip,
-    },
+    hash::poseidon::{PoseidonChip, PoseidonState},
     instructions::{
         AssertionInstructions, AssignmentInstructions, ConversionInstructions,
-        DecompositionInstructions, EccInstructions, HashInstructions, PublicInputInstructions,
-        ZeroInstructions,
+        DecompositionInstructions, EccInstructions, PublicInputInstructions, ZeroInstructions,
         hash::HashCPU,
         map::{MapCPU, MapInstructions},
     },
     map::cpu::MapMt,
-    types::{AssignedByte, AssignedNative, AssignedNativePoint, Instantiable},
+    types::{AssignedNative, AssignedNativePoint, Instantiable},
 };
 
 use midnight_curves::{Fq as F, Fr as JubjubScalar, JubjubExtended as Jubjub, JubjubSubgroup};
@@ -150,9 +145,6 @@ mod proof_agg {
 
     use halo2curves::{ff::Field, group::Group};
     use midnight_circuits::hash::poseidon::PoseidonState;
-    use midnight_circuits::hash::sha256::{
-        NB_SHA256_ADVICE_COLS, NB_SHA256_FIXED_COLS, Sha256Chip, Sha256Config,
-    };
     use midnight_circuits::instructions::map::{MapCPU, MapInstructions};
     use midnight_circuits::types::Instantiable;
     use midnight_circuits::{
@@ -170,7 +162,7 @@ mod proof_agg {
             NB_POSEIDON_ADVICE_COLS, NB_POSEIDON_FIXED_COLS, PoseidonChip, PoseidonConfig,
         },
         instructions::{
-            ArithInstructions, AssertionInstructions, AssignmentInstructions, HashInstructions,
+            AssertionInstructions, AssignmentInstructions, HashInstructions,
             PublicInputInstructions,
         },
         types::{AssignedForeignPoint, AssignedNative, ComposableChip},
@@ -191,7 +183,7 @@ mod proof_agg {
         transcript::{CircuitTranscript, Transcript},
     };
     use rand::{
-        Rng, SeedableRng,
+        SeedableRng,
         rngs::{OsRng, StdRng},
     };
     use rayon::prelude::*;

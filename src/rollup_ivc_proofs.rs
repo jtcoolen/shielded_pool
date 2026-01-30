@@ -15,15 +15,15 @@ use midnight_circuits::{
 use midnight_curves::Bls12;
 use midnight_proofs::{
     circuit::Value,
-    plonk::{ConstraintSystem, VerifyingKey, create_proof},
-    poly::{
-        EvaluationDomain,
-        kzg::{KZGCommitmentScheme, params::ParamsKZG},
-    },
+    plonk::{VerifyingKey, create_proof},
+    poly::kzg::{KZGCommitmentScheme, params::ParamsKZG},
     transcript::{CircuitTranscript, Transcript},
 };
 
-use crate::{rollup_ivc, setup};
+use crate::{
+    rollup_ivc_circuits::{self, VkData},
+    setup_ivc,
+};
 
 pub type S = BlstrsEmulation;
 type F = <S as SelfEmulation>::F;
@@ -199,7 +199,9 @@ fn collapse_acc(mut acc: Accumulator<S>) -> Accumulator<S> {
     acc
 }
 
-fn agg_state_as_values(state: &rollup_ivc::AggState) -> Result<[Value<F>; 6], AggregationError> {
+fn agg_state_as_values(
+    state: &rollup_ivc_circuits::AggState,
+) -> Result<[Value<F>; 6], AggregationError> {
     let fields = state.to_fields();
     match fields.as_slice() {
         [a, b, c, d, e, f] => Ok([
@@ -219,8 +221,8 @@ fn agg_state_as_values(state: &rollup_ivc::AggState) -> Result<[Value<F>; 6], Ag
 
 #[derive(Clone, Debug)]
 pub struct AggPublicInputs {
-    pub state: rollup_ivc::AggState,
-    pub pi_acc: rollup_ivc::AggAccumulator,
+    pub state: rollup_ivc_circuits::AggState,
+    pub pi_acc: rollup_ivc_circuits::AggAccumulator,
 }
 
 impl AggPublicInputs {
@@ -239,10 +241,10 @@ impl AggPublicInputs {
 
 #[derive(Clone, Debug)]
 pub struct TreeNode {
-    pub state: rollup_ivc::AggState,
+    pub state: rollup_ivc_circuits::AggState,
     pub proof: Vec<u8>,
-    pub proof_acc: rollup_ivc::AggAccumulator,
-    pub pi_acc: rollup_ivc::AggAccumulator,
+    pub proof_acc: rollup_ivc_circuits::AggAccumulator,
+    pub pi_acc: rollup_ivc_circuits::AggAccumulator,
 }
 
 #[derive(Clone, Debug)]
@@ -254,10 +256,10 @@ pub struct ClientProof {
 
 #[derive(Clone, Debug)]
 pub struct AggregationResult {
-    pub root_state: rollup_ivc::AggState,
+    pub root_state: rollup_ivc_circuits::AggState,
     pub left_top: TreeNode,
     pub right_top: TreeNode,
-    pub child_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
+    pub child_vk: VkData,
     pub child_vk_name: String,
     pub fixed_base_names: Vec<String>,
     pub fixed_bases: BTreeMap<String, C>,
@@ -274,11 +276,11 @@ struct LeafPlan<'a> {
     pre_commitment_map: SendableMap,
     pre_nullifier_map: SendableMap,
     pre_roots_map: SendableMap,
-    expected_state: rollup_ivc::AggState,
+    expected_state: rollup_ivc_circuits::AggState,
 }
 
 fn validate_inputs(
-    setup: &setup::AggSetup,
+    setup: &setup_ivc::AggSetup,
     client_proofs: &[ClientProof],
 ) -> Result<(), AggregationError> {
     ensure(
@@ -369,7 +371,7 @@ fn plan_leaves<'a>(
             let (c1, n1) = apply_tx_effects(c_map, n_map, left.public_items);
             let (c2, n2) = apply_tx_effects(c1, n1, right.public_items);
 
-            let expected_state = rollup_ivc::AggState {
+            let expected_state = rollup_ivc_circuits::AggState {
                 c_pre,
                 c_post: c2.succinct_repr(),
                 n_pre,
@@ -399,7 +401,7 @@ fn plan_leaves<'a>(
 ////////////////////////////////////////////////////////////////////////////////
 
 fn prove_leaf(
-    setup: &setup::AggSetup,
+    setup: &setup_ivc::AggSetup,
     leaf_srs: &ParamsKZG<Bls12>,
     leaf_vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
     plan: &LeafPlan<'_>,
@@ -421,7 +423,7 @@ fn prove_leaf(
 
     let (left, right) = plan.children;
 
-    let circuit = rollup_ivc::LeafAggCircuit {
+    let circuit = rollup_ivc_circuits::LeafAggCircuit {
         child_vk: leaf_vk_data,
         child_vk_name: leaf_vk_name,
 
@@ -481,7 +483,7 @@ fn prove_leaf(
             F,
             KZGCommitmentScheme<E>,
             CircuitTranscript<PoseidonState<F>>,
-            rollup_ivc::LeafAggCircuit,
+            rollup_ivc_circuits::LeafAggCircuit,
         >(
             agg_srs1,
             leaf_pk.as_ref(),
@@ -514,7 +516,7 @@ fn prove_leaf(
 }
 
 fn prove_parent(
-    setup: &setup::AggSetup,
+    setup: &setup_ivc::AggSetup,
     parent_level: usize,
     child_level: usize,
     children: (&TreeNode, &TreeNode),
@@ -541,7 +543,7 @@ fn prove_parent(
     let fixed_base_names = setup.fixed_base_names.clone();
     let fixed_bases = setup.fixed_bases.clone();
 
-    let state = rollup_ivc::AggState {
+    let state = rollup_ivc_circuits::AggState {
         c_pre: left.state.c_pre,
         c_post: right.state.c_post,
         n_pre: left.state.n_pre,
@@ -550,7 +552,7 @@ fn prove_parent(
         commitment_roots_set_root: left.state.commitment_roots_set_root,
     };
 
-    let circuit = rollup_ivc::InternalAggCircuit {
+    let circuit = rollup_ivc_circuits::InternalAggCircuit {
         child_vk: child_keys.vk_data.clone(),
         child_vk_name: child_keys.name.clone(),
 
@@ -591,7 +593,7 @@ fn prove_parent(
             F,
             KZGCommitmentScheme<E>,
             CircuitTranscript<PoseidonState<F>>,
-            rollup_ivc::InternalAggCircuit,
+            rollup_ivc_circuits::InternalAggCircuit,
         >(
             agg_srs2,
             parent_keys.pk.as_ref(),
@@ -629,7 +631,7 @@ fn prove_parent(
 
 /// Reduce one level: [n0,n1,n2,n3,...] -> [p0,p1,...], pairing without indexing.
 fn build_next_level(
-    setup: &setup::AggSetup,
+    setup: &setup_ivc::AggSetup,
     parent_level: usize,
     child_level: usize,
     nodes: Vec<TreeNode>,
@@ -646,7 +648,7 @@ fn build_next_level(
 /// Recursively build internal levels to the top pair, returning a tuple (left,right) instead
 /// of “unpacking from a vec”.
 fn build_to_top_pair(
-    setup: &setup::AggSetup,
+    setup: &setup_ivc::AggSetup,
     child_level: usize,
     nodes: Vec<TreeNode>,
 ) -> Result<(usize, (TreeNode, TreeNode)), AggregationError> {
@@ -661,14 +663,14 @@ fn build_to_top_pair(
 }
 
 fn finalize(
-    setup: &setup::AggSetup,
+    setup: &setup_ivc::AggSetup,
     client_proofs: &[ClientProof],
     child_level: usize,
     top: (TreeNode, TreeNode),
 ) -> Result<AggregationResult, AggregationError> {
     let (left_top, right_top) = top;
 
-    let root_state = rollup_ivc::AggState {
+    let root_state = rollup_ivc_circuits::AggState {
         c_pre: left_top.state.c_pre,
         c_post: right_top.state.c_post,
         n_pre: left_top.state.n_pre,
@@ -686,11 +688,11 @@ fn finalize(
     )?;
 
     let child_keys = setup.agg_store.get(child_level);
-    let child_vk = (
-        child_keys.vk_data.domain.clone(),
-        child_keys.vk_data.cs.clone(),
-        child_keys.vk_data.transcript_repr,
-    );
+    let child_vk = VkData {
+        domain: child_keys.vk_data.domain.clone(),
+        cs: child_keys.vk_data.cs.clone(),
+        transcript_repr: child_keys.vk_data.transcript_repr,
+    };
 
     Ok(AggregationResult {
         root_state,
@@ -708,7 +710,7 @@ fn finalize(
 ////////////////////////////////////////////////////////////////////////////////
 
 pub fn try_aggregate_client_proofs_cached(
-    setup: &setup::AggSetup,
+    setup: &setup_ivc::AggSetup,
     leaf_srs: &ParamsKZG<Bls12>,
     leaf_vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
     client_proofs: &[ClientProof],
@@ -745,7 +747,7 @@ pub fn try_aggregate_client_proofs_cached(
 
 /// Backwards-compatible wrapper that preserves the old signature.
 pub fn aggregate_client_proofs_cached(
-    setup: &setup::AggSetup,
+    setup: &setup_ivc::AggSetup,
     leaf_srs: &ParamsKZG<Bls12>,
     leaf_vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
     client_proofs: &[ClientProof],

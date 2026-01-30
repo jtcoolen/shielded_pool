@@ -23,12 +23,12 @@ use midnight_circuits::{
     verifier::{BlstrsEmulation, SelfEmulation},
 };
 
-mod keccak;
-mod proof;
-mod rollup_ivc;
-mod setup;
-mod srs;
-mod transfer;
+mod keccak_transcript;
+mod rollup_ivc_circuits;
+mod rollup_ivc_proofs;
+mod setup_ivc;
+mod transfer_circuit;
+mod trusted_setup;
 
 pub type S = BlstrsEmulation;
 type F = <S as SelfEmulation>::F;
@@ -74,18 +74,18 @@ fn main() {
     const NUM_SEED_DEPOSITS_PER_ACCOUNT: usize = 50;
     const NUM_TRANSFERS: usize = 120;
 
-    let srs = srs::filecoin_srs_agg(K).unwrap();
-    let relation = transfer::Spend2Output2;
+    let srs = trusted_setup::filecoin_srs_agg(K).unwrap();
+    let relation = transfer_circuit::Spend2Output2;
     let vk = compact_std_lib::setup_vk(&srs, &relation);
     let pk = compact_std_lib::setup_pk(&relation, &vk);
 
     // ✅ Cache AGG keys once (for the fixed batch size).
-    let agg_setup = setup::prepare_agg_setup(&srs, vk.vk(), LEAF_VK_NAME, K, BATCH_SIZE);
+    let agg_setup = setup_ivc::prepare_agg_setup(&srs, vk.vk(), LEAF_VK_NAME, K, BATCH_SIZE);
 
     // ✅ Cache FINAL aggregation vk/pk once (depends only on cached agg_setup for this batch size).
-    let final_agg_srs = srs::filecoin_srs_agg(AGG_K).unwrap();
-    let default_final_circuit = rollup_ivc::WrapStepCircuit {
-        child_vk: agg_setup.child_vk().clone(),
+    let final_agg_srs = trusted_setup::filecoin_srs_agg(AGG_K).unwrap();
+    let default_final_circuit = rollup_ivc_circuits::WrapStepCircuit {
+        child_vk: agg_setup.child_vk(),
         child_vk_name: agg_setup.child_vk_name().to_string(),
         left_proof: Value::unknown(),
         right_proof: Value::unknown(),
@@ -116,12 +116,12 @@ fn main() {
 
     let mut commitment_roots_set = MapMt::<F, PoseidonChip<F>>::new(&F::ZERO);
 
-    let mut accounts: Vec<transfer::Account> = (0..NUM_ACCOUNTS)
+    let mut accounts: Vec<transfer_circuit::Account> = (0..NUM_ACCOUNTS)
         .map(|i| {
             let sk = JubjubScalar::random(&mut OsRng);
             let pk_point = JubjubSubgroup::generator() * sk;
             let fields = AssignedNativePoint::<Jubjub>::as_public_input(&pk_point);
-            transfer::Account {
+            transfer_circuit::Account {
                 id: i,
                 sk,
                 pk_point,
@@ -134,14 +134,14 @@ fn main() {
 
     for acc in &mut accounts {
         for _ in 0..NUM_SEED_DEPOSITS_PER_ACCOUNT {
-            let hi: u128 = rng.r#gen::<u128>() >> (128 - transfer::AMOUNT_GEN_BITS);
+            let hi: u128 = rng.r#gen::<u128>() >> (128 - transfer_circuit::AMOUNT_GEN_BITS);
             let amt: u128 = hi;
-            let utxo = transfer::Utxo {
+            let utxo = transfer_circuit::Utxo {
                 asset_id,
                 amount: amt,
                 randomness: F::random(&mut rng),
             };
-            let commit = transfer::host_commit(
+            let commit = transfer_circuit::host_commit(
                 utxo.asset_id,
                 utxo.amount,
                 acc.pk_x,
@@ -151,7 +151,7 @@ fn main() {
 
             commitment_map.insert(&commit, &F::ONE);
 
-            acc.wallet.push(transfer::Note {
+            acc.wallet.push(transfer_circuit::Note {
                 utxo,
                 commit,
                 spent: false,
@@ -168,7 +168,7 @@ fn main() {
     commitment_roots_set.insert(&genesis_root, &F::ONE);
 
     let choose_sender = |rng: &mut ChaCha8Rng,
-                         accs: &mut [transfer::Account],
+                         accs: &mut [transfer_circuit::Account],
                          latest_confirmed_root_idx: usize|
      -> Option<usize> {
         let viable: Vec<usize> = accs
@@ -208,7 +208,7 @@ fn main() {
 
         let latest_confirmed_root_idx = commitment_root_history.len() - 1;
 
-        let mut client_proofs: Vec<proof::ClientProof> = Vec::new();
+        let mut client_proofs: Vec<rollup_ivc_proofs::ClientProof> = Vec::new();
 
         println!(
             "\n=== Starting batch {} from commitment root {:?} ===",
@@ -300,25 +300,25 @@ fn main() {
             };
             let out2_amt: u128 = total - out1_amt;
 
-            let new1 = transfer::Utxo {
+            let new1 = transfer_circuit::Utxo {
                 asset_id,
                 amount: out1_amt,
                 randomness: F::random(&mut rng),
             };
-            let new2 = transfer::Utxo {
+            let new2 = transfer_circuit::Utxo {
                 asset_id,
                 amount: out2_amt,
                 randomness: F::random(&mut rng),
             };
 
-            let new1_commit = transfer::host_commit(
+            let new1_commit = transfer_circuit::host_commit(
                 new1.asset_id,
                 new1.amount,
                 shadow_accounts[r1].pk_x,
                 shadow_accounts[r1].pk_y,
                 new1.randomness,
             );
-            let new2_commit = transfer::host_commit(
+            let new2_commit = transfer_circuit::host_commit(
                 new2.asset_id,
                 new2.amount,
                 shadow_accounts[r2].pk_x,
@@ -326,8 +326,8 @@ fn main() {
                 new2.randomness,
             );
 
-            let nf1 = transfer::host_nullify(old1.commit, sender.pk_x, sender.pk_y);
-            let nf2 = transfer::host_nullify(old2.commit, sender.pk_x, sender.pk_y);
+            let nf1 = transfer_circuit::host_nullify(old1.commit, sender.pk_x, sender.pk_y);
+            let nf2 = transfer_circuit::host_nullify(old2.commit, sender.pk_x, sender.pk_y);
 
             shadow_nullifier_map.insert(&nf1, &F::ONE);
             shadow_nullifier_map.insert(&nf2, &F::ONE);
@@ -363,10 +363,11 @@ fn main() {
             );
 
             let now = Instant::now();
-            let proof = compact_std_lib::prove::<transfer::Spend2Output2, PoseidonState<F>>(
-                &srs, &pk, &relation, &instance, witness, OsRng,
-            )
-            .expect("Proof generation failed");
+            let proof =
+                compact_std_lib::prove::<transfer_circuit::Spend2Output2, PoseidonState<F>>(
+                    &srs, &pk, &relation, &instance, witness, OsRng,
+                )
+                .expect("Proof generation failed");
             println!(
                 "[batch {}, tx {}] proof gen: {:?}",
                 batch_idx,
@@ -374,10 +375,10 @@ fn main() {
                 now.elapsed()
             );
 
-            let stats = cost_model(&transfer::Spend2Output2);
+            let stats = cost_model(&transfer_circuit::Spend2Output2);
             println!("client circuit stats: {:?}", stats);
 
-            client_proofs.push(proof::ClientProof {
+            client_proofs.push(rollup_ivc_proofs::ClientProof {
                 state: instance,
                 proof: proof.clone(),
                 public_items,
@@ -391,13 +392,13 @@ fn main() {
             shadow_accounts[sender_idx].wallet[i_old2].spent = true;
 
             let confirm_at_idx = commitment_root_history.len();
-            shadow_accounts[r1].wallet.push(transfer::Note {
+            shadow_accounts[r1].wallet.push(transfer_circuit::Note {
                 utxo: new1,
                 commit: new1_commit,
                 spent: false,
                 confirmed_at_root_idx: confirm_at_idx,
             });
-            shadow_accounts[r2].wallet.push(transfer::Note {
+            shadow_accounts[r2].wallet.push(transfer_circuit::Note {
                 utxo: new2,
                 commit: new2_commit,
                 spent: false,
@@ -429,7 +430,7 @@ fn main() {
         );
 
         let now = Instant::now();
-        let agg_result = proof::aggregate_client_proofs_cached(
+        let agg_result = rollup_ivc_proofs::aggregate_client_proofs_cached(
             &agg_setup,
             &srs,
             vk.vk(),
@@ -463,17 +464,17 @@ fn main() {
             use midnight_proofs::poly::kzg::KZGCommitmentScheme;
             use midnight_proofs::transcript::CircuitTranscript;
 
-            let mut final_acc: rollup_ivc::AggAccumulator =
-                rollup_ivc::AggAccumulator::accumulate(&[
+            let mut final_acc: rollup_ivc_circuits::AggAccumulator =
+                rollup_ivc_circuits::AggAccumulator::accumulate(&[
                     agg_result.left_top.proof_acc.clone(),
                     agg_result.left_top.pi_acc.clone(),
                     agg_result.right_top.proof_acc.clone(),
                     agg_result.right_top.pi_acc.clone(),
                 ]);
             final_acc.collapse();
-            let final_acc_pi = rollup_ivc::accumulator_as_public_input(&final_acc);
+            let final_acc_pi = rollup_ivc_circuits::accumulator_as_public_input(&final_acc);
 
-            let final_circuit = rollup_ivc::WrapStepCircuit {
+            let final_circuit = rollup_ivc_circuits::WrapStepCircuit {
                 child_vk: agg_result.child_vk.clone(),
                 child_vk_name: agg_result.child_vk_name.clone(),
                 left_proof: Value::known(agg_result.left_top.proof.clone()),
@@ -503,12 +504,13 @@ fn main() {
 
             // ✅ Use cached final_pk/final_vk/final_agg_srs (no per-batch keygen).
             let final_proof_bytes = {
-                let mut transcript = CircuitTranscript::<keccak::KeccakTranscript>::init();
+                let mut transcript =
+                    CircuitTranscript::<keccak_transcript::KeccakTranscript>::init();
                 create_proof::<
                     F,
                     KZGCommitmentScheme<midnight_curves::Bls12>,
-                    CircuitTranscript<keccak::KeccakTranscript>,
-                    rollup_ivc::WrapStepCircuit,
+                    CircuitTranscript<keccak_transcript::KeccakTranscript>,
+                    rollup_ivc_circuits::WrapStepCircuit,
                 >(
                     &final_agg_srs,
                     &final_pk,
@@ -525,7 +527,9 @@ fn main() {
             println!("final proof size (bytes): {}", final_proof_bytes.len());
 
             let mut transcript =
-                CircuitTranscript::<keccak::KeccakTranscript>::init_from_bytes(&final_proof_bytes);
+                CircuitTranscript::<keccak_transcript::KeccakTranscript>::init_from_bytes(
+                    &final_proof_bytes,
+                );
             let committed_bases: &[&[midnight_curves::G1Projective]] =
                 &[&[midnight_curves::G1Projective::identity()]];
             let instances: &[&[&[F]]] = &[&[&final_public_inputs]];
@@ -533,7 +537,7 @@ fn main() {
             let dual_msm = prepare::<
                 F,
                 KZGCommitmentScheme<midnight_curves::Bls12>,
-                CircuitTranscript<keccak::KeccakTranscript>,
+                CircuitTranscript<keccak_transcript::KeccakTranscript>,
             >(&final_vk, committed_bases, instances, &mut transcript)
             .expect("Final aggregation verification preparation failed");
 
@@ -607,7 +611,7 @@ fn main() {
         let replay_roots_set_map = commitment_roots_set.clone(); // head AFTER applying batch
 
         let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = proof::aggregate_client_proofs_cached(
+            let _ = rollup_ivc_proofs::aggregate_client_proofs_cached(
                 &agg_setup,
                 &srs,
                 vk.vk(),

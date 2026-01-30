@@ -33,6 +33,45 @@ use midnight_proofs::{
 };
 
 ////////////////////////////////////////////////////////////////////////////////
+// Small utilities (local helpers)
+////////////////////////////////////////////////////////////////////////////////
+
+fn alloc<T>(n: usize, mut f: impl FnMut() -> T) -> Vec<T> {
+    (0..n).map(|_| f()).collect()
+}
+
+fn first<const N: usize, T: Copy>(xs: &[T], what: &'static str) -> [T; N] {
+    xs.get(..N)
+        .unwrap_or_else(|| panic!("not enough columns for {what}: need {N}, got {}", xs.len()))
+        .try_into()
+        .unwrap()
+}
+
+fn try_array_from_fn<const N: usize, T, E>(
+    mut f: impl FnMut(usize) -> Result<T, E>,
+) -> Result<[T; N], E> {
+    let mut v = Vec::with_capacity(N);
+    for i in 0..N {
+        v.push(f(i)?);
+    }
+    Ok(v.try_into().ok().unwrap())
+}
+
+/// Project `Value<[F; N]>` into `[Value<F>; N]`.
+fn project_value_array<const N: usize, F: Copy>(v: Value<[F; N]>) -> [Value<F>; N] {
+    core::array::from_fn(|i| v.as_ref().map(|arr| arr[i]))
+}
+
+/// Assign `[Value<F>; N]` into `[AssignedNative<F>; N]`
+fn assign_values<const N: usize>(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    values: [Value<F>; N],
+) -> Result<[AssignedNative<F>; N], Error> {
+    try_array_from_fn(|i| ctx.scalar.assign(layouter, values[i]))
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Types & constants
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -118,45 +157,36 @@ pub struct VkData {
 // Circuit configuration
 ////////////////////////////////////////////////////////////////////////////////
 
-pub fn configure_agg_circuit(
-    meta: &mut ConstraintSystem<F>,
-) -> (
-    NativeConfig,
-    P2RDecompositionConfig,
-    ForeignEccConfig<C>,
-    PoseidonConfig<F>,
-) {
+#[derive(Clone, Debug)]
+pub struct AggCircuitConfig {
+    pub native: NativeConfig,
+    pub decomp: P2RDecompositionConfig,
+    pub curve: ForeignEccConfig<C>,
+    pub poseidon: PoseidonConfig<F>,
+}
+
+pub fn configure_agg_circuit(meta: &mut ConstraintSystem<F>) -> AggCircuitConfig {
     // Ensure we allocate enough columns for all sub-chips (not just ECC).
     let nb_advice_cols = nb_foreign_ecc_chip_columns::<F, C, C, NG>().max(NB_POSEIDON_ADVICE_COLS);
 
     // Native arith uses NB_ARITH_COLS + 4 fixed columns; Poseidon needs NB_POSEIDON_FIXED_COLS.
     let nb_fixed_cols = (NB_ARITH_COLS + 4).max(NB_POSEIDON_FIXED_COLS);
 
-    let advice_columns: Vec<_> = (0..nb_advice_cols).map(|_| meta.advice_column()).collect();
-    let fixed_columns: Vec<_> = (0..nb_fixed_cols).map(|_| meta.fixed_column()).collect();
+    let advice_columns = alloc(nb_advice_cols, || meta.advice_column());
+    let fixed_columns = alloc(nb_fixed_cols, || meta.fixed_column());
 
-    let committed_instance_column = meta.instance_column();
-    let instance_column = meta.instance_column();
-
-    debug_assert!(advice_columns.len() >= NB_ARITH_COLS);
-    debug_assert!(fixed_columns.len() >= NB_ARITH_COLS + 4);
-    debug_assert!(advice_columns.len() >= NB_POSEIDON_ADVICE_COLS);
-    debug_assert!(fixed_columns.len() >= NB_POSEIDON_FIXED_COLS);
+    let instance_cols = [meta.instance_column(), meta.instance_column()];
 
     let native_config = NativeChip::configure(
         meta,
         &(
-            advice_columns[..NB_ARITH_COLS]
-                .try_into()
-                .expect("NB_ARITH_COLS advice columns"),
-            fixed_columns[..NB_ARITH_COLS + 4]
-                .try_into()
-                .expect("NB_ARITH_COLS+4 fixed columns"),
-            [committed_instance_column, instance_column],
+            first::<NB_ARITH_COLS, _>(&advice_columns, "native advice"),
+            first::<{ NB_ARITH_COLS + 4 }, _>(&fixed_columns, "native fixed"),
+            instance_cols,
         ),
     );
 
-    let core_decomp_config = {
+    let decomp_config = {
         // NOTE: matches original pattern; Pow2Range uses a slice of native advice.
         let pow2_config = Pow2RangeChip::configure(meta, &advice_columns[1..NB_ARITH_COLS]);
         P2RDecompositionChip::configure(meta, &(native_config.clone(), pow2_config))
@@ -169,21 +199,17 @@ pub fn configure_agg_circuit(
     let poseidon_config = PoseidonChip::configure(
         meta,
         &(
-            advice_columns[..NB_POSEIDON_ADVICE_COLS]
-                .try_into()
-                .expect("Poseidon advice columns"),
-            fixed_columns[..NB_POSEIDON_FIXED_COLS]
-                .try_into()
-                .expect("Poseidon fixed columns"),
+            first::<NB_POSEIDON_ADVICE_COLS, _>(&advice_columns, "poseidon advice"),
+            first::<NB_POSEIDON_FIXED_COLS, _>(&fixed_columns, "poseidon fixed"),
         ),
     );
 
-    (
-        native_config,
-        core_decomp_config,
-        curve_config,
-        poseidon_config,
-    )
+    AggCircuitConfig {
+        native: native_config,
+        decomp: decomp_config,
+        curve: curve_config,
+        poseidon: poseidon_config,
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -232,15 +258,17 @@ impl<T: Clone> ClientPublicItems<T> {
             self.nf2.clone(),
         ]
     }
+}
 
+impl<T> ClientPublicItems<T> {
     #[inline]
-    pub fn commitments(&self) -> [T; 2] {
-        [self.new_c1.clone(), self.new_c2.clone()]
+    pub fn commitments(&self) -> impl Iterator<Item = &T> {
+        core::iter::once(&self.new_c1).chain(core::iter::once(&self.new_c2))
     }
 
     #[inline]
-    pub fn nullifiers(&self) -> [T; 2] {
-        [self.nf1.clone(), self.nf2.clone()]
+    pub fn nullifiers(&self) -> impl Iterator<Item = &T> {
+        core::iter::once(&self.nf1).chain(core::iter::once(&self.nf2))
     }
 }
 
@@ -315,20 +343,12 @@ pub struct AggCtx {
 }
 
 impl AggCtx {
-    pub fn new(
-        cfg: &(
-            NativeConfig,
-            P2RDecompositionConfig,
-            ForeignEccConfig<C>,
-            PoseidonConfig<F>,
-        ),
-        k_minus_1: usize,
-    ) -> Self {
-        let native = <NativeChip<F> as ComposableChip<F>>::new(&cfg.0, &());
-        let core_decomp = P2RDecompositionChip::new(&cfg.1, &k_minus_1);
+    pub fn new(cfg: &AggCircuitConfig, k_minus_1: usize) -> Self {
+        let native = <NativeChip<F> as ComposableChip<F>>::new(&cfg.native, &());
+        let core_decomp = P2RDecompositionChip::new(&cfg.decomp, &k_minus_1);
         let scalar = NativeGadget::new(core_decomp.clone(), native.clone());
-        let curve = ForeignEccChip::new(&cfg.2, &scalar, &scalar);
-        let poseidon = PoseidonChip::new(&cfg.3, &native);
+        let curve = ForeignEccChip::new(&cfg.curve, &scalar, &scalar);
+        let poseidon = PoseidonChip::new(&cfg.poseidon, &native);
         let verifier = VerifierGadget::<S>::new(&curve, &scalar, &poseidon);
 
         Self {
@@ -356,40 +376,78 @@ impl AggCtx {
     pub fn zero(&self, layouter: &mut impl Layouter<F>) -> Result<AssignedNative<F>, Error> {
         self.scalar.assign_fixed(layouter, F::ZERO)
     }
-}
 
-////////////////////////////////////////////////////////////////////////////////
-// Small reusable helpers (DRY)
-////////////////////////////////////////////////////////////////////////////////
+    #[inline]
+    pub fn assert_eq(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        a: &AssignedNative<F>,
+        b: &AssignedNative<F>,
+    ) -> Result<(), Error> {
+        self.scalar.assert_equal(layouter, a, b)
+    }
 
-#[inline]
-fn assert_equal(
-    ctx: &AggCtx,
-    layouter: &mut impl Layouter<F>,
-    a: &AssignedNative<F>,
-    b: &AssignedNative<F>,
-) -> Result<(), Error> {
-    ctx.scalar.assert_equal(layouter, a, b)
-}
+    #[inline]
+    pub fn hash2(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        a: &AssignedNative<F>,
+        b: &AssignedNative<F>,
+    ) -> Result<AssignedNative<F>, Error> {
+        self.poseidon.hash(layouter, &[a.clone(), b.clone()])
+    }
 
-#[inline]
-fn hash_pair(
-    ctx: &AggCtx,
-    layouter: &mut impl Layouter<F>,
-    a: &AssignedNative<F>,
-    b: &AssignedNative<F>,
-) -> Result<AssignedNative<F>, Error> {
-    ctx.poseidon.hash(layouter, &[a.clone(), b.clone()])
-}
+    #[inline]
+    pub fn hash_client_instance(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        items: &ClientPublicItems<AssignedNative<F>>,
+    ) -> Result<AssignedNative<F>, Error> {
+        self.poseidon.hash(layouter, &items.as_array())
+    }
 
-#[inline]
-fn hash_client_instance(
-    ctx: &AggCtx,
-    layouter: &mut impl Layouter<F>,
-    items: &ClientPublicItems<AssignedNative<F>>,
-) -> Result<AssignedNative<F>, Error> {
-    let arr = items.as_array();
-    ctx.poseidon.hash(layouter, &arr)
+    pub fn assign_vkdata(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        name: &str,
+        vk: &VkData,
+    ) -> Result<AssignedVk<S>, Error> {
+        let vk_repr: AssignedNative<F> = self.native.assign_fixed(layouter, vk.transcript_repr)?;
+        self.verifier.assign_vk(name, &vk.domain, &vk.cs, vk_repr)
+    }
+
+    fn verify_map_membership_is_one(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        map: &MapGadget,
+        key: &AssignedNative<F>,
+        one: &AssignedNative<F>,
+    ) -> Result<(), Error> {
+        let v = map.get(layouter, key)?;
+        self.assert_eq(layouter, &v, one)
+    }
+
+    fn apply_transaction_effects(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        commit_map: &mut MapGadget,
+        null_map: &mut MapGadget,
+        items: &ClientPublicItems<AssignedNative<F>>,
+        zero: &AssignedNative<F>,
+        one: &AssignedNative<F>,
+    ) -> Result<(), Error> {
+        for commitment in items.commitments() {
+            commit_map.insert(layouter, commitment, one)?;
+        }
+
+        for nullifier in items.nullifiers() {
+            let existing = null_map.get(layouter, nullifier)?;
+            self.assert_eq(layouter, &existing, zero)?;
+            null_map.insert(layouter, nullifier, one)?;
+        }
+
+        Ok(())
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -408,15 +466,15 @@ pub fn assign_state_array(
         n_post,
         subroot,
         commitment_roots_set_root,
-    ] = fields;
+    ] = assign_values(ctx, layouter, fields)?;
 
     Ok(AggStateFields {
-        c_pre: ctx.scalar.assign(layouter, c_pre)?,
-        c_post: ctx.scalar.assign(layouter, c_post)?,
-        n_pre: ctx.scalar.assign(layouter, n_pre)?,
-        n_post: ctx.scalar.assign(layouter, n_post)?,
-        subroot: ctx.scalar.assign(layouter, subroot)?,
-        commitment_roots_set_root: ctx.scalar.assign(layouter, commitment_roots_set_root)?,
+        c_pre,
+        c_post,
+        n_pre,
+        n_post,
+        subroot,
+        commitment_roots_set_root,
     })
 }
 
@@ -426,9 +484,7 @@ pub fn assign_state_value(
     state: Value<AggState>,
 ) -> Result<AggStateFields<AssignedNative<F>>, Error> {
     let fields: Value<[F; AGG_STATE_WIDTH]> = state.map(|s| s.to_fields());
-    let projected: [Value<F>; AGG_STATE_WIDTH] =
-        core::array::from_fn(|i| fields.as_ref().map(|arr| arr[i]));
-    assign_state_array(ctx, layouter, projected)
+    assign_state_array(ctx, layouter, project_value_array(fields))
 }
 
 #[inline]
@@ -441,26 +497,17 @@ fn assign_client_items(
     layouter: &mut impl Layouter<F>,
     items: Value<[F; CLIENT_ITEMS_WIDTH]>,
 ) -> Result<ClientPublicItems<AssignedNative<F>>, Error> {
-    let typed = items.map(ClientPublicItems::<F>::from);
+    let [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2] =
+        assign_values(ctx, layouter, project_value_array(items))?;
 
     Ok(ClientPublicItems {
-        root_before: ctx
-            .scalar
-            .assign(layouter, typed.as_ref().map(|i| i.root_before))?,
-        pk_bx: ctx
-            .scalar
-            .assign(layouter, typed.as_ref().map(|i| i.pk_bx))?,
-        pk_by: ctx
-            .scalar
-            .assign(layouter, typed.as_ref().map(|i| i.pk_by))?,
-        new_c1: ctx
-            .scalar
-            .assign(layouter, typed.as_ref().map(|i| i.new_c1))?,
-        new_c2: ctx
-            .scalar
-            .assign(layouter, typed.as_ref().map(|i| i.new_c2))?,
-        nf1: ctx.scalar.assign(layouter, typed.as_ref().map(|i| i.nf1))?,
-        nf2: ctx.scalar.assign(layouter, typed.as_ref().map(|i| i.nf2))?,
+        root_before,
+        pk_bx,
+        pk_by,
+        new_c1,
+        new_c2,
+        nf1,
+        nf2,
     })
 }
 
@@ -468,24 +515,24 @@ fn assign_client_items(
 // Map helpers
 ////////////////////////////////////////////////////////////////////////////////
 
-fn init_map(
-    ctx: &AggCtx,
-    layouter: &mut impl Layouter<F>,
-    map: Value<Map>,
-) -> Result<MapGadget, Error> {
-    let mut gadget = MapGadget::new(&ctx.scalar, &ctx.poseidon);
-    gadget.init(layouter, map)?;
-    Ok(gadget)
-}
-
 fn init_map_with_root(
     ctx: &AggCtx,
     layouter: &mut impl Layouter<F>,
     map: Value<Map>,
 ) -> Result<(MapGadget, AssignedNative<F>), Error> {
-    let gadget = init_map(ctx, layouter, map)?;
+    let mut gadget = MapGadget::new(&ctx.scalar, &ctx.poseidon);
+    gadget.init(layouter, map)?;
     let root = gadget.succinct_repr();
     Ok((gadget, root))
+}
+
+fn init_map(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    map: Value<Map>,
+) -> Result<MapGadget, Error> {
+    let (gadget, _) = init_map_with_root(ctx, layouter, map)?;
+    Ok(gadget)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -534,15 +581,8 @@ pub fn base_step(
     let right = assign_client_items(ctx, layouter, right_items)?;
 
     // Membership: tx_root ∈ historic_commitment_roots_set.
-    verify_commitment_root_membership(
-        ctx,
-        layouter,
-        &commitment_roots_set_map,
-        &left.root_before,
-        &one,
-    )?;
-    verify_commitment_root_membership(
-        ctx,
+    ctx.verify_map_membership_is_one(layouter, &commitment_roots_set_map, &left.root_before, &one)?;
+    ctx.verify_map_membership_is_one(
         layouter,
         &commitment_roots_set_map,
         &right.root_before,
@@ -550,21 +590,12 @@ pub fn base_step(
     )?;
 
     // Client instance hashes.
-    let inst_left = hash_client_instance(ctx, layouter, &left)?;
-    let inst_right = hash_client_instance(ctx, layouter, &right)?;
+    let inst_left = ctx.hash_client_instance(layouter, &left)?;
+    let inst_right = ctx.hash_client_instance(layouter, &right)?;
 
     // Apply transaction effects.
-    apply_transaction_effects(
-        ctx,
-        layouter,
-        &mut commit_map,
-        &mut null_map,
-        &left,
-        &zero,
-        &one,
-    )?;
-    apply_transaction_effects(
-        ctx,
+    ctx.apply_transaction_effects(layouter, &mut commit_map, &mut null_map, &left, &zero, &one)?;
+    ctx.apply_transaction_effects(
         layouter,
         &mut commit_map,
         &mut null_map,
@@ -573,59 +604,21 @@ pub fn base_step(
         &one,
     )?;
 
-    let c_post = commit_map.succinct_repr();
-    let n_post = null_map.succinct_repr();
-
     // Leaf subroot.
-    let subroot = hash_pair(ctx, layouter, &inst_left, &inst_right)?;
+    let subroot = ctx.hash2(layouter, &inst_left, &inst_right)?;
 
     Ok((
         AggStateFields {
             c_pre,
-            c_post,
+            c_post: commit_map.succinct_repr(),
             n_pre,
-            n_post,
+            n_post: null_map.succinct_repr(),
             subroot,
             commitment_roots_set_root,
         },
         vec![inst_left],
         vec![inst_right],
     ))
-}
-
-fn verify_commitment_root_membership(
-    ctx: &AggCtx,
-    layouter: &mut impl Layouter<F>,
-    commitment_roots_set_map: &MapGadget,
-    root: &AssignedNative<F>,
-    one: &AssignedNative<F>,
-) -> Result<(), Error> {
-    let membership = commitment_roots_set_map.get(layouter, root)?;
-    assert_equal(ctx, layouter, &membership, one)
-}
-
-fn apply_transaction_effects(
-    ctx: &AggCtx,
-    layouter: &mut impl Layouter<F>,
-    commit_map: &mut MapGadget,
-    null_map: &mut MapGadget,
-    items: &ClientPublicItems<AssignedNative<F>>,
-    zero: &AssignedNative<F>,
-    one: &AssignedNative<F>,
-) -> Result<(), Error> {
-    // Insert commitments.
-    for commitment in &items.commitments() {
-        commit_map.insert(layouter, commitment, one)?;
-    }
-
-    // Nullifiers: must be new, then mark as spent.
-    for nullifier in &items.nullifiers() {
-        let existing = null_map.get(layouter, nullifier)?;
-        assert_equal(ctx, layouter, &existing, zero)?;
-        null_map.insert(layouter, nullifier, one)?;
-    }
-
-    Ok(())
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -658,17 +651,16 @@ pub fn fold_step(
     let right = assign_state_array(ctx, layouter, right_child_state)?;
 
     // Stitch constraints.
-    assert_equal(ctx, layouter, &left.c_post, &right.c_pre)?;
-    assert_equal(ctx, layouter, &left.n_post, &right.n_pre)?;
-    assert_equal(
-        ctx,
+    ctx.assert_eq(layouter, &left.c_post, &right.c_pre)?;
+    ctx.assert_eq(layouter, &left.n_post, &right.n_pre)?;
+    ctx.assert_eq(
         layouter,
         &left.commitment_roots_set_root,
         &right.commitment_roots_set_root,
     )?;
 
     // Parent subroot.
-    let subroot = hash_pair(ctx, layouter, &left.subroot, &right.subroot)?;
+    let subroot = ctx.hash2(layouter, &left.subroot, &right.subroot)?;
 
     let output_state = AggStateFields {
         c_pre: left.c_pre.clone(),
@@ -714,14 +706,12 @@ pub fn wrap_step(
     let pre_commitment_roots_set_root = commitment_roots_set_map.succinct_repr();
 
     // Bind both children to THIS commitment-roots-set root.
-    assert_equal(
-        ctx,
+    ctx.assert_eq(
         layouter,
         left_commitment_roots_set_root,
         &pre_commitment_roots_set_root,
     )?;
-    assert_equal(
-        ctx,
+    ctx.assert_eq(
         layouter,
         right_commitment_roots_set_root,
         &pre_commitment_roots_set_root,
@@ -729,19 +719,18 @@ pub fn wrap_step(
 
     // Membership: c_pre must already be in set.
     let pre_exists = commitment_roots_set_map.get(layouter, c_pre)?;
-    assert_equal(ctx, layouter, &pre_exists, &one)?;
+    ctx.assert_eq(layouter, &pre_exists, &one)?;
 
     // Replay protection: c_post must be new.
     let post_exists = commitment_roots_set_map.get(layouter, c_post)?;
-    assert_equal(ctx, layouter, &post_exists, &zero)?;
+    ctx.assert_eq(layouter, &post_exists, &zero)?;
 
     // Insert c_post and bind expected resulting root.
     commitment_roots_set_map.insert(layouter, c_post, &one)?;
     let expected_post_commitment_roots_set_root_assigned = ctx
         .scalar
         .assign(layouter, expected_post_commitment_roots_set_root)?;
-    assert_equal(
-        ctx,
+    ctx.assert_eq(
         layouter,
         &commitment_roots_set_map.succinct_repr(),
         &expected_post_commitment_roots_set_root_assigned,
@@ -819,29 +808,6 @@ pub fn neutralize_pi_acc_for_client_children(
     Ok(())
 }
 
-/// Build the public inputs used to verify a child proof:
-/// - client proof: `base_pi` only
-/// - aggregation proof: `base_pi || pi_acc_public_inputs`
-pub fn build_child_public_inputs(
-    ctx: &AggCtx,
-    layouter: &mut impl Layouter<F>,
-    children_are_client_proofs: bool,
-    mut base_pi: Vec<AssignedNative<F>>,
-    child_pi_acc: Option<&AssignedAccumulator<S>>,
-) -> Result<Vec<AssignedNative<F>>, Error> {
-    if children_are_client_proofs {
-        return Ok(base_pi);
-    }
-
-    let acc = child_pi_acc.ok_or_else(|| {
-        // `Error::Synthesis` is a constructor (fn(String) -> Error), so we must CALL it.
-        Error::Synthesis("missing child pi_acc for aggregation child proof".to_owned())
-    })?;
-
-    base_pi.extend(ctx.verifier.as_public_input(layouter, acc)?);
-    Ok(base_pi)
-}
-
 pub fn prepare_proof_acc(
     ctx: &AggCtx,
     layouter: &mut impl Layouter<F>,
@@ -917,20 +883,19 @@ pub fn recursive_partial_verify(
     )?;
 
     // 2) Build child public inputs.
-    let left_child_pi = build_child_public_inputs(
-        ctx,
-        layouter,
-        children_are_client_proofs,
-        left_base_pi,
-        Some(&left_pi_acc_assigned),
-    )?;
-    let right_child_pi = build_child_public_inputs(
-        ctx,
-        layouter,
-        children_are_client_proofs,
-        right_base_pi,
-        Some(&right_pi_acc_assigned),
-    )?;
+    let mut left_child_pi = left_base_pi;
+    let mut right_child_pi = right_base_pi;
+
+    if !children_are_client_proofs {
+        left_child_pi.extend(
+            ctx.verifier
+                .as_public_input(layouter, &left_pi_acc_assigned)?,
+        );
+        right_child_pi.extend(
+            ctx.verifier
+                .as_public_input(layouter, &right_pi_acc_assigned)?,
+        );
+    }
 
     // 3) Prepare proof accumulators.
     let id_point = ctx.id_point(layouter)?;
@@ -971,26 +936,25 @@ pub fn recursive_partial_verify(
 // Public input exposure
 ////////////////////////////////////////////////////////////////////////////////
 
+fn expose_with<L: Layouter<F>>(
+    layouter: &mut L,
+    values: impl IntoIterator<Item = AssignedNative<F>>,
+    mut constrain: impl FnMut(&mut L, &AssignedNative<F>) -> Result<(), Error>,
+) -> Result<(), Error> {
+    for v in values {
+        constrain(layouter, &v)?;
+    }
+    Ok(())
+}
+
 pub fn expose_native(
     ctx: &AggCtx,
     layouter: &mut impl Layouter<F>,
     values: impl IntoIterator<Item = AssignedNative<F>>,
 ) -> Result<(), Error> {
-    for value in values {
-        ctx.native.constrain_as_public_input(layouter, &value)?;
-    }
-    Ok(())
-}
-
-pub fn expose_scalar(
-    ctx: &AggCtx,
-    layouter: &mut impl Layouter<F>,
-    values: impl IntoIterator<Item = AssignedNative<F>>,
-) -> Result<(), Error> {
-    for value in values {
-        ctx.scalar.constrain_as_public_input(layouter, &value)?;
-    }
-    Ok(())
+    expose_with(layouter, values, |l, v| {
+        ctx.native.constrain_as_public_input(l, v)
+    })
 }
 
 /// Expose the canonical aggregation-node outputs:
@@ -1005,6 +969,65 @@ fn expose_agg_node_outputs(
     let next_acc_pi = ctx.verifier.as_public_input(layouter, next_acc)?;
     expose_native(ctx, layouter, next_acc_pi)?;
     Ok(())
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Shared synthesize helper for 2-child aggregation circuits
+////////////////////////////////////////////////////////////////////////////////
+
+fn synthesize_two_child<const K: u32, L: Layouter<F>>(
+    config: AggCircuitConfig,
+    layouter: &mut L,
+    child_vk_name: &str,
+    child_vk: &VkData,
+    fixed_base_names: &[String],
+    children_are_client_proofs: bool,
+    left_proof: Value<Vec<u8>>,
+    right_proof: Value<Vec<u8>>,
+    left_pi_acc: Value<Accumulator<S>>,
+    right_pi_acc: Value<Accumulator<S>>,
+    step: impl FnOnce(
+        &AggCtx,
+        &mut L,
+    ) -> Result<
+        (
+            AggStateFields<AssignedNative<F>>,
+            Vec<AssignedNative<F>>,
+            Vec<AssignedNative<F>>,
+        ),
+        Error,
+    >,
+) -> Result<(), Error> {
+    let ctx = AggCtx::new(&config, (K as usize).saturating_sub(1));
+
+    // 1) Assign and bind child verification key.
+    let assigned_vk = ctx.assign_vkdata(layouter, child_vk_name, child_vk)?;
+
+    // 2) Run the circuit-specific state transition.
+    let (out_state, left_base_pi, right_base_pi) = step(&ctx, layouter)?;
+
+    // 3) Recursive partial verification.
+    let rpv_out = recursive_partial_verify(
+        &ctx,
+        layouter,
+        RecursivePartialVerifyInput {
+            assigned_vk: &assigned_vk,
+            children_are_client_proofs,
+            fixed_base_names,
+            left_base_pi,
+            right_base_pi,
+            left_proof,
+            right_proof,
+            left_pi_acc,
+            right_pi_acc,
+        },
+    )?;
+
+    // 4) Public outputs.
+    expose_agg_node_outputs(&ctx, layouter, out_state, &rpv_out.next_acc)?;
+
+    // 5) Load shared tables/lookups.
+    ctx.load(layouter)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1038,12 +1061,7 @@ pub struct BaseStepCircuit<const K: u32> {
 }
 
 impl<const K: u32> Circuit<F> for BaseStepCircuit<K> {
-    type Config = (
-        NativeConfig,
-        P2RDecompositionConfig,
-        ForeignEccConfig<C>,
-        PoseidonConfig<F>,
-    );
+    type Config = AggCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
     type Params = ();
 
@@ -1073,52 +1091,29 @@ impl<const K: u32> Circuit<F> for BaseStepCircuit<K> {
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
-        let ctx = AggCtx::new(&config, (K as usize).saturating_sub(1));
-
-        // 1) Assign and bind child verification key (client VK).
-        let vk_repr: AssignedNative<F> = ctx
-            .native
-            .assign_fixed(&mut layouter, self.child_vk.transcript_repr)?;
-        let assigned_vk = ctx.verifier.assign_vk(
+        synthesize_two_child::<K, _>(
+            config,
+            &mut layouter,
             &self.child_vk_name,
-            &self.child_vk.domain,
-            &self.child_vk.cs,
-            vk_repr,
-        )?;
-
-        // 2) Leaf base_step.
-        let (out_state, left_base_pi, right_base_pi) = base_step(
-            &ctx,
-            &mut layouter,
-            self.pre_commitment_map.clone(),
-            self.pre_nullifier_map.clone(),
-            self.pre_commitment_roots_set_map.clone(),
-            self.left_items.clone(),
-            self.right_items.clone(),
-        )?;
-
-        // 3) Recursive partial verification (children are client proofs).
-        let rpv_out = recursive_partial_verify(
-            &ctx,
-            &mut layouter,
-            RecursivePartialVerifyInput {
-                assigned_vk: &assigned_vk,
-                children_are_client_proofs: true,
-                fixed_base_names: &self.fixed_base_names,
-                left_base_pi,
-                right_base_pi,
-                left_proof: self.left_proof.clone(),
-                right_proof: self.right_proof.clone(),
-                left_pi_acc: self.left_pi_acc.clone(),
-                right_pi_acc: self.right_pi_acc.clone(),
+            &self.child_vk,
+            &self.fixed_base_names,
+            true, // children are client proofs
+            self.left_proof.clone(),
+            self.right_proof.clone(),
+            self.left_pi_acc.clone(),
+            self.right_pi_acc.clone(),
+            |ctx, layouter| {
+                base_step(
+                    ctx,
+                    layouter,
+                    self.pre_commitment_map.clone(),
+                    self.pre_nullifier_map.clone(),
+                    self.pre_commitment_roots_set_map.clone(),
+                    self.left_items.clone(),
+                    self.right_items.clone(),
+                )
             },
-        )?;
-
-        // 4) Public outputs.
-        expose_agg_node_outputs(&ctx, &mut layouter, out_state, &rpv_out.next_acc)?;
-
-        // 5) Load shared tables/lookups.
-        ctx.load(&mut layouter)
+        )
     }
 }
 
@@ -1150,12 +1145,7 @@ pub struct FoldStepCircuit<const K: u32> {
 }
 
 impl<const K: u32> Circuit<F> for FoldStepCircuit<K> {
-    type Config = (
-        NativeConfig,
-        P2RDecompositionConfig,
-        ForeignEccConfig<C>,
-        PoseidonConfig<F>,
-    );
+    type Config = AggCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
     type Params = ();
 
@@ -1182,49 +1172,19 @@ impl<const K: u32> Circuit<F> for FoldStepCircuit<K> {
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
-        let ctx = AggCtx::new(&config, (K as usize).saturating_sub(1));
-
-        // 1) Assign and bind child verification key (aggregation VK).
-        let vk_repr: AssignedNative<F> = ctx
-            .native
-            .assign_fixed(&mut layouter, self.child_vk.transcript_repr)?;
-        let assigned_vk = ctx.verifier.assign_vk(
+        synthesize_two_child::<K, _>(
+            config,
+            &mut layouter,
             &self.child_vk_name,
-            &self.child_vk.domain,
-            &self.child_vk.cs,
-            vk_repr,
-        )?;
-
-        // 2) Internal fold_step (stitch child states + hash subroots).
-        let (out_state, left_base_pi, right_base_pi) = fold_step(
-            &ctx,
-            &mut layouter,
-            self.left_child_state,
-            self.right_child_state,
-        )?;
-
-        // 3) Recursive partial verification (children are aggregation proofs).
-        let rpv_out = recursive_partial_verify(
-            &ctx,
-            &mut layouter,
-            RecursivePartialVerifyInput {
-                assigned_vk: &assigned_vk,
-                children_are_client_proofs: false,
-                fixed_base_names: &self.fixed_base_names,
-                left_base_pi,
-                right_base_pi,
-                left_proof: self.left_proof.clone(),
-                right_proof: self.right_proof.clone(),
-                left_pi_acc: self.left_pi_acc.clone(),
-                right_pi_acc: self.right_pi_acc.clone(),
-            },
-        )?;
-
-        // 4) Public outputs.
-        expose_agg_node_outputs(&ctx, &mut layouter, out_state, &rpv_out.next_acc)?;
-
-        // 5) Load shared tables/lookups.
-        ctx.load(&mut layouter)
+            &self.child_vk,
+            &self.fixed_base_names,
+            false, // children are aggregation proofs
+            self.left_proof.clone(),
+            self.right_proof.clone(),
+            self.left_pi_acc.clone(),
+            self.right_pi_acc.clone(),
+            |ctx, layouter| fold_step(ctx, layouter, self.left_child_state, self.right_child_state),
+        )
     }
 }
 
@@ -1251,7 +1211,7 @@ pub fn accumulator_as_public_input(acc: &AggAccumulator) -> Vec<F> {
 /// - exposes final accumulator PI
 #[derive(Clone, Debug)]
 pub struct WrapStepCircuit {
-    pub child_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
+    pub child_vk: VkData,
     pub child_vk_name: String,
 
     pub left_proof: Value<Vec<u8>>,
@@ -1270,12 +1230,7 @@ pub struct WrapStepCircuit {
 }
 
 impl Circuit<F> for WrapStepCircuit {
-    type Config = (
-        NativeConfig,
-        P2RDecompositionConfig,
-        ForeignEccConfig<C>,
-        PoseidonConfig<F>,
-    );
+    type Config = AggCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
     type Params = ();
 
@@ -1311,26 +1266,26 @@ impl Circuit<F> for WrapStepCircuit {
         let agg = assign_state_value(&ctx, &mut layouter, self.agg_state.clone())?;
 
         // Public: c_pre, c_post, n_pre, n_post
-        expose_scalar(&ctx, &mut layouter, agg.boundary4())?;
+        expose_native(&ctx, &mut layouter, agg.boundary4())?;
 
         // --------------------- Assign children states and stitch checks ---------------------
         let left = assign_state_value(&ctx, &mut layouter, self.left_child_state.clone())?;
         let right = assign_state_value(&ctx, &mut layouter, self.right_child_state.clone())?;
 
         // left.c_post == right.c_pre, left.n_post == right.n_pre
-        assert_equal(&ctx, &mut layouter, &left.c_post, &right.c_pre)?;
-        assert_equal(&ctx, &mut layouter, &left.n_post, &right.n_pre)?;
+        ctx.assert_eq(&mut layouter, &left.c_post, &right.c_pre)?;
+        ctx.assert_eq(&mut layouter, &left.n_post, &right.n_pre)?;
 
         // Children stitch to declared boundary.
-        assert_equal(&ctx, &mut layouter, &agg.c_pre, &left.c_pre)?;
-        assert_equal(&ctx, &mut layouter, &agg.c_post, &right.c_post)?;
-        assert_equal(&ctx, &mut layouter, &agg.n_pre, &left.n_pre)?;
-        assert_equal(&ctx, &mut layouter, &agg.n_post, &right.n_post)?;
+        ctx.assert_eq(&mut layouter, &agg.c_pre, &left.c_pre)?;
+        ctx.assert_eq(&mut layouter, &agg.c_post, &right.c_post)?;
+        ctx.assert_eq(&mut layouter, &agg.n_pre, &left.n_pre)?;
+        ctx.assert_eq(&mut layouter, &agg.n_post, &right.n_post)?;
 
         // Compute + expose final subroot.
-        let subroot = hash_pair(&ctx, &mut layouter, &left.subroot, &right.subroot)?;
+        let subroot = ctx.hash2(&mut layouter, &left.subroot, &right.subroot)?;
         // TODO we can avoid witnessing agg.subroot entirety
-        assert_equal(&ctx, &mut layouter, &agg.subroot, &subroot)?;
+        ctx.assert_eq(&mut layouter, &agg.subroot, &subroot)?;
         ctx.scalar
             .constrain_as_public_input(&mut layouter, &subroot)?;
 
@@ -1346,15 +1301,14 @@ impl Circuit<F> for WrapStepCircuit {
             self.post_commitment_roots_set_root.clone(),
         )?;
         // TODO we can avoid witnessing agg.commitment_roots_set_root entirety
-        assert_equal(
-            &ctx,
+        ctx.assert_eq(
             &mut layouter,
             &agg.commitment_roots_set_root,
             &pre_commitment_roots_set_root,
         )?;
 
         // Public: pre_commitment_roots_set_root, post_commitment_roots_set_root
-        expose_scalar(
+        expose_native(
             &ctx,
             &mut layouter,
             [
@@ -1364,13 +1318,7 @@ impl Circuit<F> for WrapStepCircuit {
         )?;
 
         // --------------------- Verify top aggregation proofs and fold accumulators ---------------------
-        let vk_val: AssignedNative<F> = ctx.native.assign_fixed(&mut layouter, self.child_vk.2)?;
-        let assigned_vk = ctx.verifier.assign_vk(
-            &self.child_vk_name,
-            &self.child_vk.0,
-            &self.child_vk.1,
-            vk_val,
-        )?;
+        let assigned_vk = ctx.assign_vkdata(&mut layouter, &self.child_vk_name, &self.child_vk)?;
 
         let rpv_out = recursive_partial_verify(
             &ctx,
@@ -1392,7 +1340,7 @@ impl Circuit<F> for WrapStepCircuit {
         let final_acc_pi = ctx
             .verifier
             .as_public_input(&mut layouter, &rpv_out.next_acc)?;
-        expose_scalar(&ctx, &mut layouter, final_acc_pi)?;
+        expose_native(&ctx, &mut layouter, final_acc_pi)?;
 
         ctx.load(&mut layouter)
     }

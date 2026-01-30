@@ -87,7 +87,6 @@ fn main() {
     let default_final_circuit = rollup_ivc::WrapStepCircuit {
         child_vk: agg_setup.child_vk().clone(),
         child_vk_name: agg_setup.child_vk_name().to_string(),
-        child_level: F::from(agg_setup.child_level() as u64),
         left_proof: Value::unknown(),
         right_proof: Value::unknown(),
         left_pi_acc: Value::unknown(),
@@ -477,7 +476,6 @@ fn main() {
             let final_circuit = rollup_ivc::WrapStepCircuit {
                 child_vk: agg_result.child_vk.clone(),
                 child_vk_name: agg_result.child_vk_name.clone(),
-                child_level: F::from(agg_result.child_level as u64),
                 left_proof: Value::known(agg_result.left_top.proof.clone()),
                 right_proof: Value::known(agg_result.right_top.proof.clone()),
                 left_pi_acc: Value::known(agg_result.left_top.pi_acc.clone()),

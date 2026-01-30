@@ -259,7 +259,6 @@ pub struct AggregationResult {
     pub right_top: TreeNode,
     pub child_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
     pub child_vk_name: String,
-    pub child_level: usize,
     pub fixed_base_names: Vec<String>,
     pub fixed_bases: BTreeMap<String, C>,
 }
@@ -699,7 +698,6 @@ fn finalize(
         right_top,
         child_vk,
         child_vk_name: child_keys.name.clone(),
-        child_level,
         fixed_base_names: setup.fixed_base_names.clone(),
         fixed_bases: setup.fixed_bases.clone(),
     })

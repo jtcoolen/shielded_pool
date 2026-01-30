@@ -161,7 +161,6 @@ pub struct AggSetup {
 
     pub(crate) child_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
     pub(crate) child_vk_name: String,
-    pub(crate) child_level: usize,
 }
 
 impl AggSetup {
@@ -170,9 +169,6 @@ impl AggSetup {
     }
     pub fn child_vk_name(&self) -> &str {
         &self.child_vk_name
-    }
-    pub fn child_level(&self) -> usize {
-        self.child_level
     }
     pub fn fixed_base_names(&self) -> &[String] {
         &self.fixed_base_names
@@ -372,6 +368,5 @@ pub fn prepare_agg_setup(
 
         child_vk,
         child_vk_name: child_keys.name.clone(),
-        child_level,
     }
 }

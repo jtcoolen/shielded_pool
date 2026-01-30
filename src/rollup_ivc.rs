@@ -1254,9 +1254,6 @@ pub struct WrapStepCircuit {
     pub child_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
     pub child_vk_name: String,
 
-    /// Reserved / versioning hook (kept for compatibility; not constrained here).
-    pub child_level: F,
-
     pub left_proof: Value<Vec<u8>>,
     pub right_proof: Value<Vec<u8>>,
     pub left_pi_acc: Value<AggAccumulator>,
@@ -1286,7 +1283,6 @@ impl Circuit<F> for WrapStepCircuit {
         Self {
             child_vk: self.child_vk.clone(),
             child_vk_name: self.child_vk_name.clone(),
-            child_level: self.child_level,
             left_proof: Value::unknown(),
             right_proof: Value::unknown(),
             left_pi_acc: Value::unknown(),
@@ -1333,6 +1329,8 @@ impl Circuit<F> for WrapStepCircuit {
 
         // Compute + expose final subroot.
         let subroot = hash_pair(&ctx, &mut layouter, &left.subroot, &right.subroot)?;
+        // TODO we can avoid witnessing agg.subroot entirety
+        assert_equal(&ctx, &mut layouter, &agg.subroot, &subroot)?;
         ctx.scalar
             .constrain_as_public_input(&mut layouter, &subroot)?;
 
@@ -1346,6 +1344,13 @@ impl Circuit<F> for WrapStepCircuit {
             &left.commitment_roots_set_root,
             &right.commitment_roots_set_root,
             self.post_commitment_roots_set_root.clone(),
+        )?;
+        // TODO we can avoid witnessing agg.commitment_roots_set_root entirety
+        assert_equal(
+            &ctx,
+            &mut layouter,
+            &agg.commitment_roots_set_root,
+            &pre_commitment_roots_set_root,
         )?;
 
         // Public: pre_commitment_roots_set_root, post_commitment_roots_set_root

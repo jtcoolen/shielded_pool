@@ -35,9 +35,8 @@ type Map = midnight_circuits::map::cpu::MapMt<F, PoseidonChip<F>>;
 #[derive(Clone)]
 struct SendableMap(Map);
 
-// SAFETY: `SendableMap` is only used by cloning the inner `Map` per task.
-// The code assumes cloning yields independent, thread-safe instances for read-only use
-// and for local mutation within each worker thread.
+// SAFETY: used only to move cloned maps into rayon tasks.
+// Each task works on its own cloned `Map` instance.
 unsafe impl Send for SendableMap {}
 unsafe impl Sync for SendableMap {}
 
@@ -47,33 +46,19 @@ impl SendableMap {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Side {
-    Left,
-    Right,
-}
-impl Side {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Side::Left => "left",
-            Side::Right => "right",
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum AggregationError {
     #[error("need at least one client proof")]
-    ClientProofsEmpty,
+    Empty,
 
     #[error("client proofs length must be a power of two (got {len})")]
-    ClientProofsNotPowerOfTwo { len: usize },
+    NotPowerOfTwo { len: usize },
 
     #[error("client_proofs len must match cached setup (expected {expected}, got {got})")]
-    ClientProofsLenMismatch { expected: usize, got: usize },
+    LenMismatch { expected: usize, got: usize },
 
     #[error("merged final agg requires at least 4 client proofs (got {got})")]
-    NeedAtLeastFourClientProofs { got: usize },
+    NeedAtLeastFour { got: usize },
 
     #[error("max_agg_level mismatch (expected {expected}, got {got})")]
     MaxAggLevelMismatch { expected: usize, got: usize },
@@ -81,11 +66,8 @@ pub enum AggregationError {
     #[error("leaf {leaf} {side} tx root not in historic roots set")]
     HistoricRootMissing { leaf: usize, side: &'static str },
 
-    #[error("{side} client instance mismatch (leaf {leaf})")]
+    #[error("leaf {leaf} {side} instance hash mismatch")]
     InstanceMismatch { leaf: usize, side: &'static str },
-
-    #[error("leaf {leaf} planned subroot mismatch")]
-    PlannedSubrootMismatch { leaf: usize },
 
     #[error("commit boundary mismatch")]
     CommitBoundaryMismatch,
@@ -95,6 +77,9 @@ pub enum AggregationError {
 
     #[error("roots_set_root mismatch")]
     RootsSetRootMismatch,
+
+    #[error("unexpected AggState field count (expected {expected}, got {got})")]
+    AggStateFieldCount { expected: usize, got: usize },
 
     #[error("root subroot mismatch with recomputed Poseidon tree root")]
     RootPoseidonTreeMismatch,
@@ -116,12 +101,6 @@ pub enum AggregationError {
 
     #[error("internal AGG proof failed")]
     InternalAggProofFailed,
-
-    #[error("unexpected AggState field count (expected {expected}, got {got})")]
-    UnexpectedAggStateFieldCount { expected: usize, got: usize },
-
-    #[error("expected to stop at top pair (got {got})")]
-    ExpectedTopPair { got: usize },
 }
 
 fn ensure(cond: bool, err: AggregationError) -> Result<(), AggregationError> {
@@ -133,21 +112,25 @@ fn hash_pair(a: F, b: F) -> F {
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[a, b])
 }
 
-fn poseidon_tree_root(leaf_states: &[F]) -> Result<F, AggregationError> {
-    ensure(!leaf_states.is_empty(), AggregationError::ClientProofsEmpty)?;
+// Host-side: single Poseidon hash of all 7 public items
+fn host_instance_hash(items: [F; 7]) -> F {
+    use midnight_circuits::instructions::hash::HashCPU;
+    <PoseidonChip<F> as HashCPU<F, F>>::hash(&items)
+}
+
+fn poseidon_tree_root(leaves: &[F]) -> Result<F, AggregationError> {
+    ensure(!leaves.is_empty(), AggregationError::Empty)?;
     ensure(
-        leaf_states.len().is_power_of_two(),
-        AggregationError::ClientProofsNotPowerOfTwo {
-            len: leaf_states.len(),
-        },
+        leaves.len().is_power_of_two(),
+        AggregationError::NotPowerOfTwo { len: leaves.len() },
     )?;
 
-    fn reduce_level(level: Vec<F>) -> Vec<F> {
+    fn step(level: Vec<F>) -> Vec<F> {
         level
             .chunks_exact(2)
-            .map(|chunk| match chunk {
+            .map(|pair| match pair {
                 [a, b] => hash_pair(*a, *b),
-                _ => unreachable!("chunks_exact(2) guarantees pairs"),
+                _ => unreachable!("chunks_exact(2)"),
             })
             .collect()
     }
@@ -155,28 +138,18 @@ fn poseidon_tree_root(leaf_states: &[F]) -> Result<F, AggregationError> {
     fn go(level: Vec<F>) -> F {
         match level.as_slice() {
             [root] => *root,
-            _ => go(reduce_level(level)),
+            _ => go(step(level)),
         }
     }
 
-    Ok(go(leaf_states.to_vec()))
-}
-
-// ✅ Single Poseidon hash of all 7 would-be public inputs (host-side)
-fn host_instance_hash(items: [F; 7]) -> F {
-    use midnight_circuits::instructions::hash::HashCPU;
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&items)
-}
-
-fn map_inserted(mut map: Map, key: F, value: F) -> Map {
-    map.insert(&key, &value);
-    map
+    Ok(go(leaves.to_vec()))
 }
 
 fn map_insert_many(map: Map, entries: impl IntoIterator<Item = (F, F)>) -> Map {
-    entries
-        .into_iter()
-        .fold(map, |m, (k, v)| map_inserted(m, k, v))
+    entries.into_iter().fold(map, |mut m, (k, v)| {
+        m.insert(&k, &v);
+        m
+    })
 }
 
 fn apply_tx_effects(commit_map: Map, null_map: Map, items: [F; 7]) -> (Map, Map) {
@@ -226,19 +199,18 @@ fn collapse_acc(mut acc: Accumulator<S>) -> Accumulator<S> {
     acc
 }
 
-fn state_to_value_array(state: &rollup_ivc::AggState) -> Result<[Value<F>; 6], AggregationError> {
+fn agg_state_as_values(state: &rollup_ivc::AggState) -> Result<[Value<F>; 6], AggregationError> {
     let fields = state.to_fields();
     match fields.as_slice() {
         [a, b, c, d, e, f] => Ok([
-            a.clone(),
-            b.clone(),
-            c.clone(),
-            d.clone(),
-            e.clone(),
-            f.clone(),
-        ]
-        .map(Value::known)),
-        _ => Err(AggregationError::UnexpectedAggStateFieldCount {
+            Value::known(a.clone()),
+            Value::known(b.clone()),
+            Value::known(c.clone()),
+            Value::known(d.clone()),
+            Value::known(e.clone()),
+            Value::known(f.clone()),
+        ]),
+        _ => Err(AggregationError::AggStateFieldCount {
             expected: 6,
             got: fields.len(),
         }),
@@ -262,7 +234,7 @@ impl AggPublicInputs {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Host-side structures + aggregation
+// Host-side structures
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone, Debug)]
@@ -280,21 +252,6 @@ pub struct ClientProof {
     pub public_items: [F; 7],
 }
 
-#[derive(Clone)]
-struct LeafPlan {
-    i: usize,
-    left_items: [F; 7],
-    right_items: [F; 7],
-    pre_commitment_map: SendableMap,
-    pre_nullifier_map: SendableMap,
-    pre_roots_map: SendableMap,
-    expected_state: rollup_ivc::AggState,
-    left_state: F,
-    right_state: F,
-    left_proof: Vec<u8>,
-    right_proof: Vec<u8>,
-}
-
 #[derive(Clone, Debug)]
 pub struct AggregationResult {
     pub root_state: rollup_ivc::AggState,
@@ -307,59 +264,47 @@ pub struct AggregationResult {
     pub fixed_bases: BTreeMap<String, C>,
 }
 
-struct ValidatedDims {
-    num_leaves: usize,
-    max_agg_level: usize,
+////////////////////////////////////////////////////////////////////////////////
+// Planning layer (validated, less error by construction)
+////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Clone)]
+struct LeafPlan<'a> {
+    i: usize,
+    children: (&'a ClientProof, &'a ClientProof),
+    pre_commitment_map: SendableMap,
+    pre_nullifier_map: SendableMap,
+    pre_roots_map: SendableMap,
+    expected_state: rollup_ivc::AggState,
 }
 
-fn log_start(pre_commitment_map: &Map, pre_nullifier_map: &Map, client_proofs: &[ClientProof]) {
-    println!(
-        "[agg] start c_pre(map) = {:?}",
-        pre_commitment_map.succinct_repr()
-    );
-    println!(
-        "[agg] start n_pre(map) = {:?}",
-        pre_nullifier_map.succinct_repr()
-    );
-
-    if let Some(first) = client_proofs.first() {
-        let [root_before, ..] = first.public_items;
-        println!("[agg] client_proofs[0].root_before = {:?}", root_before);
-    }
-}
-
-fn validate_dims(
+fn validate_inputs(
     setup: &setup::AggSetup,
     client_proofs: &[ClientProof],
-) -> Result<ValidatedDims, AggregationError> {
+) -> Result<(), AggregationError> {
     ensure(
         client_proofs.len() == setup.num_leaves,
-        AggregationError::ClientProofsLenMismatch {
+        AggregationError::LenMismatch {
             expected: setup.num_leaves,
             got: client_proofs.len(),
         },
     )?;
-    ensure(
-        !client_proofs.is_empty(),
-        AggregationError::ClientProofsEmpty,
-    )?;
+    ensure(!client_proofs.is_empty(), AggregationError::Empty)?;
     ensure(
         client_proofs.len().is_power_of_two(),
-        AggregationError::ClientProofsNotPowerOfTwo {
+        AggregationError::NotPowerOfTwo {
             len: client_proofs.len(),
         },
     )?;
 
     let num_leaves = client_proofs.len();
-    let max_level: usize = (num_leaves as u32).trailing_zeros() as usize;
-
+    let max_level = (num_leaves as u32).trailing_zeros() as usize;
     ensure(
         max_level >= 2,
-        AggregationError::NeedAtLeastFourClientProofs { got: num_leaves },
+        AggregationError::NeedAtLeastFour { got: num_leaves },
     )?;
 
     let max_agg_level = max_level - 1;
-
     ensure(
         max_agg_level == setup.max_agg_level,
         AggregationError::MaxAggLevelMismatch {
@@ -368,440 +313,361 @@ fn validate_dims(
         },
     )?;
 
-    Ok(ValidatedDims {
-        num_leaves,
-        max_agg_level,
-    })
+    Ok(())
 }
 
-fn check_roots_membership(
-    roots_map: &Map,
+fn check_client(
+    roots: &Map,
     leaf: usize,
-    side: Side,
-    items: [F; 7],
+    side: &'static str,
+    proof: &ClientProof,
 ) -> Result<(), AggregationError> {
-    let [tx_root, ..] = items;
+    let [tx_root, ..] = proof.public_items;
+
     ensure(
-        roots_map.get(&tx_root) == F::ONE,
-        AggregationError::HistoricRootMissing {
-            leaf,
-            side: side.as_str(),
-        },
-    )
+        roots.get(&tx_root) == F::ONE,
+        AggregationError::HistoricRootMissing { leaf, side },
+    )?;
+
+    ensure(
+        host_instance_hash(proof.public_items) == proof.state,
+        AggregationError::InstanceMismatch { leaf, side },
+    )?;
+
+    Ok(())
 }
 
-fn plan_leaf_level(
-    client_proofs: &[ClientProof],
+fn plan_leaves<'a>(
+    client_proofs: &'a [ClientProof],
     pre_commitment_map: Map,
     pre_nullifier_map: Map,
-    pre_commitment_roots_map: Map,
-    batch_roots_set_root: F,
-) -> Result<Vec<LeafPlan>, AggregationError> {
+    roots_map: Map,
+    roots_set_root: F,
+) -> Result<Vec<LeafPlan<'a>>, AggregationError> {
     let init = (
         Vec::with_capacity(client_proofs.len() / 2),
         pre_commitment_map,
         pre_nullifier_map,
     );
 
-    let (plans, _final_commit, _final_null) = client_proofs.chunks_exact(2).enumerate().try_fold(
+    let (plans, _c, _n) = client_proofs.chunks_exact(2).enumerate().try_fold(
         init,
-        |(mut plans, commit_map, null_map), (i, pair)| {
-            let (left, right) = match pair {
+        |(mut plans, c_map, n_map), (i, chunk)| {
+            let (left, right) = match chunk {
                 [l, r] => (l, r),
-                _ => unreachable!("chunks_exact(2) guarantees pairs"),
+                _ => unreachable!("chunks_exact(2)"),
             };
 
-            check_roots_membership(&pre_commitment_roots_map, i, Side::Left, left.public_items)?;
-            check_roots_membership(
-                &pre_commitment_roots_map,
-                i,
-                Side::Right,
-                right.public_items,
-            )?;
+            check_client(&roots_map, i, "left", left)?;
+            check_client(&roots_map, i, "right", right)?;
 
-            let c_pre = commit_map.succinct_repr();
-            let n_pre = null_map.succinct_repr();
+            let c_pre = c_map.succinct_repr();
+            let n_pre = n_map.succinct_repr();
 
-            let pre_commit_map_for_leaf = commit_map.clone();
-            let pre_null_map_for_leaf = null_map.clone();
-            let pre_roots_map_for_leaf = pre_commitment_roots_map.clone();
+            let pre_c_for_leaf = c_map.clone();
+            let pre_n_for_leaf = n_map.clone();
 
-            let (commit_after_left, null_after_left) =
-                apply_tx_effects(commit_map, null_map, left.public_items);
-            let (commit_after_both, null_after_both) =
-                apply_tx_effects(commit_after_left, null_after_left, right.public_items);
-
-            let c_post = commit_after_both.succinct_repr();
-            let n_post = null_after_both.succinct_repr();
+            let (c1, n1) = apply_tx_effects(c_map, n_map, left.public_items);
+            let (c2, n2) = apply_tx_effects(c1, n1, right.public_items);
 
             let expected_state = rollup_ivc::AggState {
                 c_pre,
-                c_post,
+                c_post: c2.succinct_repr(),
                 n_pre,
-                n_post,
+                n_post: n2.succinct_repr(),
                 subroot: hash_pair(left.state, right.state),
-                commitment_roots_set_root: batch_roots_set_root,
+                commitment_roots_set_root: roots_set_root,
             };
 
-            let plan = LeafPlan {
+            plans.push(LeafPlan {
                 i,
-                left_items: left.public_items,
-                right_items: right.public_items,
-                pre_commitment_map: SendableMap(pre_commit_map_for_leaf),
-                pre_nullifier_map: SendableMap(pre_null_map_for_leaf),
-                pre_roots_map: SendableMap(pre_roots_map_for_leaf),
+                children: (left, right),
+                pre_commitment_map: SendableMap(pre_c_for_leaf),
+                pre_nullifier_map: SendableMap(pre_n_for_leaf),
+                pre_roots_map: SendableMap(roots_map.clone()),
                 expected_state,
-                left_state: left.state,
-                right_state: right.state,
-                left_proof: left.proof.clone(),
-                right_proof: right.proof.clone(),
-            };
+            });
 
-            plans.push(plan);
-            Ok((plans, commit_after_both, null_after_both))
+            Ok((plans, c2, n2))
         },
     )?;
 
     Ok(plans)
 }
 
-fn build_leaf_nodes(
+////////////////////////////////////////////////////////////////////////////////
+// Proof construction
+////////////////////////////////////////////////////////////////////////////////
+
+fn prove_leaf(
     setup: &setup::AggSetup,
     leaf_srs: &ParamsKZG<Bls12>,
     leaf_vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
-    leaf_plans: &[LeafPlan],
-) -> Result<Vec<TreeNode>, AggregationError> {
+    plan: &LeafPlan<'_>,
+) -> Result<TreeNode, AggregationError> {
     let agg_srs1 = &setup.agg_srs_leaf;
     let agg_srs2 = &setup.agg_srs_internal;
 
-    let combined_fixed_base_names = setup.fixed_base_names.clone();
-    let combined_fixed_bases = setup.fixed_bases.clone();
-    let trivial_combined = setup.trivial_combined.clone();
-
-    let leaf_level = 1usize;
-    let leaf_keys = setup.agg_store.get(leaf_level);
-    let leaf_agg_vk_name = leaf_keys.name.clone();
-
-    let leaf_vk_data_cl = setup.leaf_vk_data.clone();
-    let leaf_vk_name_string = setup.leaf_vk_name.clone();
+    let leaf_keys = setup.agg_store.get(1);
     let leaf_pk = leaf_keys.pk.clone();
     let leaf_vk_arc = leaf_keys.vk.clone();
+
+    let fixed_base_names = setup.fixed_base_names.clone();
+    let fixed_bases = setup.fixed_bases.clone();
+    let trivial = setup.trivial_combined.clone();
+
+    let leaf_vk_data = setup.leaf_vk_data.clone();
+    let leaf_vk_name = setup.leaf_vk_name.clone();
     let leaf_fixed_bases = setup.leaf_fixed_bases.clone();
 
-    leaf_plans
-        .par_iter()
-        .map(|p| -> Result<TreeNode, AggregationError> {
-            let inst_l = host_instance_hash(p.left_items);
-            let inst_r = host_instance_hash(p.right_items);
+    let (left, right) = plan.children;
 
-            ensure(
-                inst_l == p.left_state,
-                AggregationError::InstanceMismatch {
-                    leaf: p.i,
-                    side: Side::Left.as_str(),
-                },
-            )?;
-            ensure(
-                inst_r == p.right_state,
-                AggregationError::InstanceMismatch {
-                    leaf: p.i,
-                    side: Side::Right.as_str(),
-                },
-            )?;
+    let circuit = rollup_ivc::LeafAggCircuit {
+        child_vk: leaf_vk_data,
+        child_vk_name: leaf_vk_name,
 
-            let planned_subroot = hash_pair(inst_l, inst_r);
-            ensure(
-                planned_subroot == p.expected_state.subroot,
-                AggregationError::PlannedSubrootMismatch { leaf: p.i },
-            )?;
+        left_items: Value::known(left.public_items),
+        right_items: Value::known(right.public_items),
 
-            let circuit = rollup_ivc::LeafAggCircuit {
-                child_vk: leaf_vk_data_cl.clone(),
-                child_vk_name: leaf_vk_name_string.clone(),
+        pre_commitment_map: Value::known(plan.pre_commitment_map.clone_inner()),
+        pre_nullifier_map: Value::known(plan.pre_nullifier_map.clone_inner()),
+        pre_commitment_roots_set_map: Value::known(plan.pre_roots_map.clone_inner()),
 
-                left_items: Value::known(p.left_items),
-                right_items: Value::known(p.right_items),
+        left_proof: Value::known(left.proof.clone()),
+        right_proof: Value::known(right.proof.clone()),
 
-                pre_commitment_map: Value::known(p.pre_commitment_map.clone_inner()),
-                pre_nullifier_map: Value::known(p.pre_nullifier_map.clone_inner()),
-                pre_commitment_roots_set_map: Value::known(p.pre_roots_map.clone_inner()),
+        left_pi_acc: Value::known(trivial.clone()),
+        right_pi_acc: Value::known(trivial.clone()),
 
-                left_proof: Value::known(p.left_proof.clone()),
-                right_proof: Value::known(p.right_proof.clone()),
-
-                // Naming updated: these are pi-acc witnesses (placeholders for client children).
-                left_pi_acc: Value::known(trivial_combined.clone()),
-                right_pi_acc: Value::known(trivial_combined.clone()),
-
-                fixed_base_names: combined_fixed_base_names.clone(),
-            };
-
-            let proof_acc_left = verify_and_extract_acc(
-                leaf_srs,
-                leaf_vk,
-                &leaf_fixed_bases,
-                &p.left_proof,
-                &[p.left_state],
-            )?;
-            let proof_acc_right = verify_and_extract_acc(
-                leaf_srs,
-                leaf_vk,
-                &leaf_fixed_bases,
-                &p.right_proof,
-                &[p.right_state],
-            )?;
-
-            let accumulated_pi = collapse_acc(Accumulator::accumulate(&[
-                proof_acc_left,
-                trivial_combined.clone(),
-                proof_acc_right,
-                trivial_combined.clone(),
-            ]));
-
-            let public_inputs = AggPublicInputs {
-                state: p.expected_state,
-                pi_acc: accumulated_pi.clone(),
-            };
-            let public_inputs_fields = public_inputs.to_fields();
-
-            let start = Instant::now();
-            let proof = {
-                let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
-                create_proof::<
-                    F,
-                    KZGCommitmentScheme<E>,
-                    CircuitTranscript<PoseidonState<F>>,
-                    rollup_ivc::LeafAggCircuit,
-                >(
-                    agg_srs1,
-                    leaf_pk.as_ref(),
-                    &[circuit],
-                    1,
-                    &[&[&[], &public_inputs_fields]],
-                    OsRng,
-                    &mut transcript,
-                )
-                .map_err(|_| AggregationError::LeafAggProofFailed)?;
-                transcript.finalize()
-            };
-
-            println!("proof size (bytes): {}", proof.len());
-            println!(
-                "Leaf AGG {} ({}) created in {:?}",
-                p.i,
-                leaf_agg_vk_name,
-                start.elapsed()
-            );
-
-            ensure(
-                accumulated_pi.check(&agg_srs2.s_g2().into(), &combined_fixed_bases),
-                AggregationError::PiAccumulatorDidNotCheck("leaf accumulated PI"),
-            )?;
-
-            let proof_acc = verify_and_extract_acc(
-                agg_srs1,
-                leaf_vk_arc.as_ref(),
-                &leaf_keys.fixed_bases,
-                &proof,
-                &public_inputs_fields,
-            )?;
-
-            Ok(TreeNode {
-                state: public_inputs.state,
-                proof,
-                proof_acc,
-                pi_acc: accumulated_pi,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-}
-
-fn build_internal_levels(
-    setup: &setup::AggSetup,
-    agg_srs2: &ParamsKZG<Bls12>,
-    combined_fixed_base_names: Vec<String>,
-    combined_fixed_bases: BTreeMap<String, C>,
-    child_level: usize,
-    current_level: Vec<TreeNode>,
-) -> Result<(usize, Vec<TreeNode>), AggregationError> {
-    if current_level.len() <= 2 {
-        return Ok((child_level, current_level));
-    }
-
-    let parent_level = child_level + 1;
-
-    let parent_keys = setup.agg_store.get(parent_level);
-    let parent_vk_name = parent_keys.name.clone();
-
-    println!(
-        "\nBuilding AGG level {} ({}) with {} nodes...",
-        parent_level,
-        parent_vk_name,
-        current_level.len() / 2
-    );
-
-    let child_keys = setup.agg_store.get(child_level);
-    let child_vk_data = child_keys.vk_data.clone();
-    let child_vk_name = child_keys.name.clone();
-
-    let parent_pk = parent_keys.pk.clone();
-    let parent_vk = parent_keys.vk.clone();
-
-    let next_level: Vec<TreeNode> = current_level
-        .par_chunks_exact(2)
-        .enumerate()
-        .map(|(i, chunk)| -> Result<TreeNode, AggregationError> {
-            let (left, right) = match chunk {
-                [l, r] => (l, r),
-                _ => unreachable!("par_chunks_exact(2) guarantees pairs"),
-            };
-
-            ensure(
-                left.state.c_post == right.state.c_pre,
-                AggregationError::CommitBoundaryMismatch,
-            )?;
-            ensure(
-                left.state.n_post == right.state.n_pre,
-                AggregationError::NullBoundaryMismatch,
-            )?;
-            ensure(
-                left.state.commitment_roots_set_root == right.state.commitment_roots_set_root,
-                AggregationError::RootsSetRootMismatch,
-            )?;
-
-            let state = rollup_ivc::AggState {
-                c_pre: left.state.c_pre,
-                c_post: right.state.c_post,
-                n_pre: left.state.n_pre,
-                n_post: right.state.n_post,
-                subroot: hash_pair(left.state.subroot, right.state.subroot),
-                commitment_roots_set_root: left.state.commitment_roots_set_root,
-            };
-
-            let left_child_state = state_to_value_array(&left.state)?;
-            let right_child_state = state_to_value_array(&right.state)?;
-
-            let circuit = rollup_ivc::InternalAggCircuit {
-                child_vk: child_vk_data.clone(),
-                child_vk_name: child_vk_name.clone(),
-
-                left_child_state,
-                right_child_state,
-
-                left_proof: Value::known(left.proof.clone()),
-                right_proof: Value::known(right.proof.clone()),
-
-                // Naming updated: these are child pi-acc witnesses.
-                left_pi_acc: Value::known(left.pi_acc.clone()),
-                right_pi_acc: Value::known(right.pi_acc.clone()),
-
-                fixed_base_names: combined_fixed_base_names.clone(),
-            };
-
-            let accumulated_pi = collapse_acc(Accumulator::accumulate(&[
-                left.proof_acc.clone(),
-                left.pi_acc.clone(),
-                right.proof_acc.clone(),
-                right.pi_acc.clone(),
-            ]));
-
-            let public_inputs = AggPublicInputs {
-                state,
-                pi_acc: accumulated_pi.clone(),
-            };
-            let public_inputs_fields = public_inputs.to_fields();
-
-            let start = Instant::now();
-            let proof = {
-                let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
-                create_proof::<
-                    F,
-                    KZGCommitmentScheme<E>,
-                    CircuitTranscript<PoseidonState<F>>,
-                    rollup_ivc::InternalAggCircuit,
-                >(
-                    agg_srs2,
-                    parent_pk.as_ref(),
-                    &[circuit],
-                    1,
-                    &[&[&[], &public_inputs_fields]],
-                    OsRng,
-                    &mut transcript,
-                )
-                .map_err(|_| AggregationError::InternalAggProofFailed)?;
-                transcript.finalize()
-            };
-
-            println!(
-                "Level {} node {} ({}) created in {:?}",
-                parent_level,
-                i,
-                parent_vk_name,
-                start.elapsed()
-            );
-
-            ensure(
-                accumulated_pi.check(&agg_srs2.s_g2().into(), &combined_fixed_bases),
-                AggregationError::PiAccumulatorDidNotCheck("internal level accumulated PI"),
-            )?;
-
-            let proof_acc = verify_and_extract_acc(
-                agg_srs2,
-                parent_vk.as_ref(),
-                &parent_keys.fixed_bases,
-                &proof,
-                &public_inputs_fields,
-            )?;
-
-            Ok(TreeNode {
-                state: public_inputs.state,
-                proof,
-                proof_acc,
-                pi_acc: accumulated_pi,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    build_internal_levels(
-        setup,
-        agg_srs2,
-        combined_fixed_base_names,
-        combined_fixed_bases,
-        parent_level,
-        next_level,
-    )
-}
-
-fn finalize_result(
-    setup: &setup::AggSetup,
-    client_proofs: &[ClientProof],
-    child_level: usize,
-    top_pair: Vec<TreeNode>,
-) -> Result<AggregationResult, AggregationError> {
-    ensure(
-        top_pair.len() == 2,
-        AggregationError::ExpectedTopPair {
-            got: top_pair.len(),
-        },
-    )?;
-
-    let (left_top, right_top) = match top_pair.as_slice() {
-        [l, r] => (l.clone(), r.clone()),
-        _ => unreachable!("checked len == 2"),
+        fixed_base_names: fixed_base_names.clone(),
     };
 
+    let acc_l = verify_and_extract_acc(
+        leaf_srs,
+        leaf_vk,
+        &leaf_fixed_bases,
+        &left.proof,
+        &[left.state],
+    )?;
+    let acc_r = verify_and_extract_acc(
+        leaf_srs,
+        leaf_vk,
+        &leaf_fixed_bases,
+        &right.proof,
+        &[right.state],
+    )?;
+
+    let pi_acc = collapse_acc(Accumulator::accumulate(&[
+        acc_l,
+        trivial.clone(),
+        acc_r,
+        trivial.clone(),
+    ]));
+
     ensure(
-        left_top.state.c_post == right_top.state.c_pre,
+        pi_acc.check(&agg_srs2.s_g2().into(), &fixed_bases),
+        AggregationError::PiAccumulatorDidNotCheck("leaf accumulated PI"),
+    )?;
+
+    let public_inputs = AggPublicInputs {
+        state: plan.expected_state,
+        pi_acc: pi_acc.clone(),
+    };
+    let public_inputs_fields = public_inputs.to_fields();
+
+    let start = Instant::now();
+    let proof = {
+        let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
+        create_proof::<
+            F,
+            KZGCommitmentScheme<E>,
+            CircuitTranscript<PoseidonState<F>>,
+            rollup_ivc::LeafAggCircuit,
+        >(
+            agg_srs1,
+            leaf_pk.as_ref(),
+            &[circuit],
+            1,
+            &[&[&[], &public_inputs_fields]],
+            OsRng,
+            &mut transcript,
+        )
+        .map_err(|_| AggregationError::LeafAggProofFailed)?;
+        transcript.finalize()
+    };
+
+    println!("Leaf AGG {} created in {:?}", plan.i, start.elapsed());
+
+    let proof_acc = verify_and_extract_acc(
+        agg_srs1,
+        leaf_vk_arc.as_ref(),
+        &leaf_keys.fixed_bases,
+        &proof,
+        &public_inputs_fields,
+    )?;
+
+    Ok(TreeNode {
+        state: public_inputs.state,
+        proof,
+        proof_acc,
+        pi_acc,
+    })
+}
+
+fn prove_parent(
+    setup: &setup::AggSetup,
+    parent_level: usize,
+    child_level: usize,
+    children: (&TreeNode, &TreeNode),
+) -> Result<TreeNode, AggregationError> {
+    let (left, right) = children;
+
+    ensure(
+        left.state.c_post == right.state.c_pre,
         AggregationError::CommitBoundaryMismatch,
     )?;
     ensure(
-        left_top.state.n_post == right_top.state.n_pre,
+        left.state.n_post == right.state.n_pre,
         AggregationError::NullBoundaryMismatch,
     )?;
     ensure(
-        left_top.state.commitment_roots_set_root == right_top.state.commitment_roots_set_root,
+        left.state.commitment_roots_set_root == right.state.commitment_roots_set_root,
         AggregationError::RootsSetRootMismatch,
     )?;
+
+    let child_keys = setup.agg_store.get(child_level);
+    let parent_keys = setup.agg_store.get(parent_level);
+
+    let agg_srs2 = &setup.agg_srs_internal;
+    let fixed_base_names = setup.fixed_base_names.clone();
+    let fixed_bases = setup.fixed_bases.clone();
+
+    let state = rollup_ivc::AggState {
+        c_pre: left.state.c_pre,
+        c_post: right.state.c_post,
+        n_pre: left.state.n_pre,
+        n_post: right.state.n_post,
+        subroot: hash_pair(left.state.subroot, right.state.subroot),
+        commitment_roots_set_root: left.state.commitment_roots_set_root,
+    };
+
+    let circuit = rollup_ivc::InternalAggCircuit {
+        child_vk: child_keys.vk_data.clone(),
+        child_vk_name: child_keys.name.clone(),
+
+        left_child_state: agg_state_as_values(&left.state)?,
+        right_child_state: agg_state_as_values(&right.state)?,
+
+        left_proof: Value::known(left.proof.clone()),
+        right_proof: Value::known(right.proof.clone()),
+
+        left_pi_acc: Value::known(left.pi_acc.clone()),
+        right_pi_acc: Value::known(right.pi_acc.clone()),
+
+        fixed_base_names: fixed_base_names.clone(),
+    };
+
+    let pi_acc = collapse_acc(Accumulator::accumulate(&[
+        left.proof_acc.clone(),
+        left.pi_acc.clone(),
+        right.proof_acc.clone(),
+        right.pi_acc.clone(),
+    ]));
+
+    ensure(
+        pi_acc.check(&agg_srs2.s_g2().into(), &fixed_bases),
+        AggregationError::PiAccumulatorDidNotCheck("internal accumulated PI"),
+    )?;
+
+    let public_inputs = AggPublicInputs {
+        state,
+        pi_acc: pi_acc.clone(),
+    };
+    let public_inputs_fields = public_inputs.to_fields();
+
+    let start = Instant::now();
+    let proof = {
+        let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
+        create_proof::<
+            F,
+            KZGCommitmentScheme<E>,
+            CircuitTranscript<PoseidonState<F>>,
+            rollup_ivc::InternalAggCircuit,
+        >(
+            agg_srs2,
+            parent_keys.pk.as_ref(),
+            &[circuit],
+            1,
+            &[&[&[], &public_inputs_fields]],
+            OsRng,
+            &mut transcript,
+        )
+        .map_err(|_| AggregationError::InternalAggProofFailed)?;
+        transcript.finalize()
+    };
+
+    println!(
+        "Internal level {} node created in {:?}",
+        parent_level,
+        start.elapsed()
+    );
+
+    let proof_acc = verify_and_extract_acc(
+        agg_srs2,
+        parent_keys.vk.as_ref(),
+        &parent_keys.fixed_bases,
+        &proof,
+        &public_inputs_fields,
+    )?;
+
+    Ok(TreeNode {
+        state: public_inputs.state,
+        proof,
+        proof_acc,
+        pi_acc,
+    })
+}
+
+/// Reduce one level: [n0,n1,n2,n3,...] -> [p0,p1,...], pairing without indexing.
+fn build_next_level(
+    setup: &setup::AggSetup,
+    parent_level: usize,
+    child_level: usize,
+    nodes: Vec<TreeNode>,
+) -> Result<Vec<TreeNode>, AggregationError> {
+    nodes
+        .par_chunks_exact(2)
+        .map(|chunk| match chunk {
+            [l, r] => prove_parent(setup, parent_level, child_level, (l, r)),
+            _ => unreachable!("par_chunks_exact(2)"),
+        })
+        .collect()
+}
+
+/// Recursively build internal levels to the top pair, returning a tuple (left,right) instead
+/// of “unpacking from a vec”.
+fn build_to_top_pair(
+    setup: &setup::AggSetup,
+    child_level: usize,
+    nodes: Vec<TreeNode>,
+) -> Result<(usize, (TreeNode, TreeNode)), AggregationError> {
+    match nodes.as_slice() {
+        [left, right] => Ok((child_level, (left.clone(), right.clone()))),
+        _ => {
+            let parent_level = child_level + 1;
+            let next = build_next_level(setup, parent_level, child_level, nodes)?;
+            build_to_top_pair(setup, parent_level, next)
+        }
+    }
+}
+
+fn finalize(
+    setup: &setup::AggSetup,
+    client_proofs: &[ClientProof],
+    child_level: usize,
+    top: (TreeNode, TreeNode),
+) -> Result<AggregationResult, AggregationError> {
+    let (left_top, right_top) = top;
 
     let root_state = rollup_ivc::AggState {
         c_pre: left_top.state.c_pre,
@@ -812,8 +678,8 @@ fn finalize_result(
         commitment_roots_set_root: left_top.state.commitment_roots_set_root,
     };
 
-    let leaf_states = client_proofs.iter().map(|p| p.state).collect::<Vec<F>>();
-    let expected_root = poseidon_tree_root(&leaf_states)?;
+    let expected_root =
+        poseidon_tree_root(&client_proofs.iter().map(|p| p.state).collect::<Vec<F>>())?;
 
     ensure(
         root_state.subroot == expected_root,
@@ -821,7 +687,7 @@ fn finalize_result(
     )?;
 
     let child_keys = setup.agg_store.get(child_level);
-    let child_vk_tuple = (
+    let child_vk = (
         child_keys.vk_data.domain.clone(),
         child_keys.vk_data.cs.clone(),
         child_keys.vk_data.transcript_repr,
@@ -831,7 +697,7 @@ fn finalize_result(
         root_state,
         left_top,
         right_top,
-        child_vk: child_vk_tuple,
+        child_vk,
         child_vk_name: child_keys.name.clone(),
         child_level,
         fixed_base_names: setup.fixed_base_names.clone(),
@@ -839,10 +705,10 @@ fn finalize_result(
     })
 }
 
-/// Aggregation using cached keys (`AggSetup`). No vk/pk computation occurs here.
-///
-/// NOTE: Added `pre_commitment_roots_map` so leaf circuits can accept “lagging” tx roots
-/// (proofs that reference any historic confirmed root).
+////////////////////////////////////////////////////////////////////////////////
+// Public API
+////////////////////////////////////////////////////////////////////////////////
+
 pub fn try_aggregate_client_proofs_cached(
     setup: &setup::AggSetup,
     leaf_srs: &ParamsKZG<Bls12>,
@@ -852,35 +718,31 @@ pub fn try_aggregate_client_proofs_cached(
     pre_nullifier_map: Map,
     pre_commitment_roots_map: Map,
 ) -> Result<AggregationResult, AggregationError> {
-    // logging + validation (kept out of the “tree construction”)
-    log_start(&pre_commitment_map, &pre_nullifier_map, client_proofs);
-    let dims = validate_dims(setup, client_proofs)?;
+    validate_inputs(setup, client_proofs)?;
 
-    // ---- tree construction (plans -> leaf proofs -> internal proofs -> finalize)
-    let batch_roots_set_root = pre_commitment_roots_map.succinct_repr();
+    // Bind a single roots-set root across the whole agg tree (host side).
+    let roots_set_root = pre_commitment_roots_map.succinct_repr();
 
-    println!("\nCreating {} leaf AGG nodes...", dims.num_leaves / 2);
-
-    let leaf_plans = plan_leaf_level(
+    // 1) plan leaves (invariants checked once)
+    let leaf_plans = plan_leaves(
         client_proofs,
         pre_commitment_map,
         pre_nullifier_map,
         pre_commitment_roots_map,
-        batch_roots_set_root,
+        roots_set_root,
     )?;
 
-    let leaf_nodes = build_leaf_nodes(setup, leaf_srs, leaf_vk, &leaf_plans)?;
+    // 2) prove leaves (parallel)
+    let leaf_nodes = leaf_plans
+        .par_iter()
+        .map(|p| prove_leaf(setup, leaf_srs, leaf_vk, p))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let (child_level, top_pair) = build_internal_levels(
-        setup,
-        &setup.agg_srs_internal,
-        setup.fixed_base_names.clone(),
-        setup.fixed_bases.clone(),
-        1usize,
-        leaf_nodes,
-    )?;
+    // 3) build internal levels to (left,right) tuple
+    let (child_level, top_pair) = build_to_top_pair(setup, 1, leaf_nodes)?;
 
-    finalize_result(setup, client_proofs, child_level, top_pair)
+    // 4) finalize
+    finalize(setup, client_proofs, child_level, top_pair)
 }
 
 /// Backwards-compatible wrapper that preserves the old signature.
@@ -902,5 +764,5 @@ pub fn aggregate_client_proofs_cached(
         pre_nullifier_map,
         pre_commitment_roots_map,
     )
-    .expect("aggregation failed")
+    .expect("aggregation failed") // TODO remove expect
 }

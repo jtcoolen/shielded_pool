@@ -190,7 +190,10 @@ mod proof_agg {
         poly::{EvaluationDomain, kzg::KZGCommitmentScheme},
         transcript::{CircuitTranscript, Transcript},
     };
-    use rand::{Rng, SeedableRng, rngs::{OsRng, StdRng}};
+    use rand::{
+        Rng, SeedableRng,
+        rngs::{OsRng, StdRng},
+    };
     use rayon::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::env;
@@ -283,7 +286,7 @@ mod proof_agg {
             "No Filecoin SRS available for circuits of size k={}",
             k
         );
-    
+
         let srs_dir = env::var("SRS_DIR").unwrap_or_else(|_| "./examples/assets".into());
         let srs_path = format!("{srs_dir}/bls_mock_2p{k}");
         let fetching_path = if Path::new(&srs_path).exists() {
@@ -291,58 +294,76 @@ mod proof_agg {
         } else {
             format!("{srs_dir}/bls_mock_2p20")
         };
-    
+
         // If the (mock) params file we're about to read doesn't exist, create it via unsafe_setup.
         if !Path::new(&fetching_path).exists() {
-            std::fs::create_dir_all(&srs_dir).map_err(|e| {
-                io_other(format!("Failed to create SRS_DIR '{}': {e}", srs_dir))
-            })?;
-    
+            std::fs::create_dir_all(&srs_dir)
+                .map_err(|e| io_other(format!("Failed to create SRS_DIR '{}': {e}", srs_dir)))?;
+
             let rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64);
-    
+
             let params = ParamsKZG::<Bls12>::unsafe_setup(20, rng);
-    
+
             let mut buf = Vec::new();
             params
                 .write_custom(&mut buf, SerdeFormat::RawBytesUnchecked)
                 .map_err(|e| io_other(format!("Failed to serialize mock params: {e}")))?;
-    
+
             let mut file = File::create(&fetching_path).map_err(|e| {
-                io_other(format!("Failed to create mock SRS file '{}': {e}", fetching_path))
+                io_other(format!(
+                    "Failed to create mock SRS file '{}': {e}",
+                    fetching_path
+                ))
             })?;
-            file.write_all(&buf)
-                .map_err(|e| io_other(format!("Failed to write mock SRS file '{}': {e}", fetching_path)))?;
+            file.write_all(&buf).map_err(|e| {
+                io_other(format!(
+                    "Failed to write mock SRS file '{}': {e}",
+                    fetching_path
+                ))
+            })?;
         }
-    
+
         let params_fs = File::open(Path::new(&fetching_path)).map_err(|e| {
             io_other(format!(
                 "Failed to open SRS file at '{}': {e}. (Did you set SRS_DIR?)",
                 fetching_path
             ))
         })?;
-    
+
         let mut params: ParamsKZG<Bls12> = ParamsKZG::read_custom::<_>(
             &mut BufReader::new(params_fs),
             SerdeFormat::RawBytesUnchecked,
         )
-        .map_err(|e| io_other(format!("Failed to read SRS params from '{}': {e}", fetching_path)))?;
-    
+        .map_err(|e| {
+            io_other(format!(
+                "Failed to read SRS params from '{}': {e}",
+                fetching_path
+            ))
+        })?;
+
         // If we loaded the MAX_K file, downsize and cache the per-k file
         if fetching_path != srs_path {
             params.downsize(k);
-    
+
             let mut buf = Vec::new();
             params
                 .write_custom(&mut buf, SerdeFormat::RawBytesUnchecked)
                 .map_err(|e| io_other(format!("Failed to serialize downsized params: {e}")))?;
-    
+
             let mut file = File::create(&srs_path).map_err(|e| {
-                io_other(format!("Failed to create mock SRS cache file '{}': {e}", srs_path))
+                io_other(format!(
+                    "Failed to create mock SRS cache file '{}': {e}",
+                    srs_path
+                ))
             })?;
-            file.write_all(&buf)
-                .map_err(|e| io_other(format!("Failed to write mock SRS cache '{}': {e}", srs_path)))?;
+            file.write_all(&buf).map_err(|e| {
+                io_other(format!(
+                    "Failed to write mock SRS cache '{}': {e}",
+                    srs_path
+                ))
+            })?;
         }
-    
+
         Ok(params)
     }
 
@@ -2770,114 +2791,114 @@ fn main() {
                     Nullifier-set transition: {:?} -> {:?}\n\
                     Historic-roots-set transition: {:?} -> {:?}\n\
                     Final accumulator PI length: {} field elements",
-                    batch_idx,
-                    agg_result.root_state.subroot,
-                    agg_result.root_state.c_pre,
-                    agg_result.root_state.c_post,
-                    agg_result.root_state.n_pre,
-                    agg_result.root_state.n_post,
-                    pre_roots_set_root,
-                    post_roots_set_root,
-                    final_acc_pi.len()
-                );
-            }
-
-            // Commit batch to “chain state”
-            accounts = shadow_accounts;
-            nullifier_map = shadow_nullifier_map;
-            commitment_map = shadow_commitment_map;
-
-            commitment_roots_set = shadow_commitment_roots_set;
-            commitment_root_history.push(commitment_map.succinct_repr());
-            commitment_map_history.push(commitment_map.clone());
-
-            println!(
-                "After batch {} committed commitment root: {:?}",
                 batch_idx,
-                commitment_map.succinct_repr()
+                agg_result.root_state.subroot,
+                agg_result.root_state.c_pre,
+                agg_result.root_state.c_post,
+                agg_result.root_state.n_pre,
+                agg_result.root_state.n_post,
+                pre_roots_set_root,
+                post_roots_set_root,
+                final_acc_pi.len()
             );
-
-            // NEW: Demonstrate replay protection:
-            // Attempt to apply the SAME client proofs again on the updated state.
-            // This should fail because nullifiers are already present.
-            println!("REPLAY attempt:");
-            println!("  c_pre  = {:?}", agg_result.root_state.c_pre);
-            println!("  c_post = {:?}", agg_result.root_state.c_post);
-            println!("  n_pre  = {:?}", agg_result.root_state.n_pre);
-            println!("  n_post = {:?}", agg_result.root_state.n_post);
-
-            println!(
-                "  roots_set has c_pre?  {:?}",
-                commitment_roots_set.get(&agg_result.root_state.c_pre)
-            );
-            println!(
-                "  roots_set has c_post? {:?}",
-                commitment_roots_set.get(&agg_result.root_state.c_post)
-            );
-
-            println!(
-                "  nullifier_map root == n_post? {}",
-                nullifier_map.succinct_repr() == agg_result.root_state.n_post
-            );
-            println!(
-                "REPLAY using commitment_map root: {:?}",
-                commitment_map.succinct_repr()
-            );
-            println!(
-                "REPLAY using nullifier_map  root: {:?}",
-                nullifier_map.succinct_repr()
-            );
-
-            let replay_commit_map = commitment_map.clone(); // current POST state
-            let replay_null_map = nullifier_map.clone(); // current POST state
-            let replay_roots_set_map = commitment_roots_set.clone(); // head AFTER applying batch
-
-            println!(
-                "REPLAY using commitment_map root: {:?}",
-                replay_commit_map.succinct_repr()
-            );
-            println!(
-                "REPLAY using nullifier_map  root: {:?}",
-                replay_null_map.succinct_repr()
-            );
-
-            let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = aggregate_client_proofs_cached(
-                    &agg_setup,
-                    &srs,
-                    vk.vk(),
-                    &client_proofs,
-                    replay_commit_map.clone(),
-                    replay_null_map.clone(),
-                    replay_roots_set_map.clone(),
-                );
-            }));
-            match replay {
-                Ok(_) => println!("❌ Replay unexpectedly succeeded (BUG)"),
-                Err(_) => println!(
-                    "✅ Replay correctly rejected (nullifiers already spent / state already advanced)"
-                ),
-            }
-
-            batch_idx += 1;
         }
 
+        // Commit batch to “chain state”
+        accounts = shadow_accounts;
+        nullifier_map = shadow_nullifier_map;
+        commitment_map = shadow_commitment_map;
+
+        commitment_roots_set = shadow_commitment_roots_set;
+        commitment_root_history.push(commitment_map.succinct_repr());
+        commitment_map_history.push(commitment_map.clone());
+
         println!(
-            "\nFinal commitment root: {:?}",
+            "After batch {} committed commitment root: {:?}",
+            batch_idx,
             commitment_map.succinct_repr()
         );
 
-        for acc in &accounts {
-            let bal: u128 = acc
-                .wallet
-                .iter()
-                .filter(|n| !n.spent)
-                .fold(0u128, |s, n| s.saturating_add(n.utxo.amount));
-            println!(
-                "Account {} unspent notes: {}, balance {}",
-                acc.id,
-                acc.wallet.iter().filter(|n| !n.spent).count(),
-                bal
+        // NEW: Demonstrate replay protection:
+        // Attempt to apply the SAME client proofs again on the updated state.
+        // This should fail because nullifiers are already present.
+        println!("REPLAY attempt:");
+        println!("  c_pre  = {:?}", agg_result.root_state.c_pre);
+        println!("  c_post = {:?}", agg_result.root_state.c_post);
+        println!("  n_pre  = {:?}", agg_result.root_state.n_pre);
+        println!("  n_post = {:?}", agg_result.root_state.n_post);
+
+        println!(
+            "  roots_set has c_pre?  {:?}",
+            commitment_roots_set.get(&agg_result.root_state.c_pre)
+        );
+        println!(
+            "  roots_set has c_post? {:?}",
+            commitment_roots_set.get(&agg_result.root_state.c_post)
+        );
+
+        println!(
+            "  nullifier_map root == n_post? {}",
+            nullifier_map.succinct_repr() == agg_result.root_state.n_post
+        );
+        println!(
+            "REPLAY using commitment_map root: {:?}",
+            commitment_map.succinct_repr()
+        );
+        println!(
+            "REPLAY using nullifier_map  root: {:?}",
+            nullifier_map.succinct_repr()
+        );
+
+        let replay_commit_map = commitment_map.clone(); // current POST state
+        let replay_null_map = nullifier_map.clone(); // current POST state
+        let replay_roots_set_map = commitment_roots_set.clone(); // head AFTER applying batch
+
+        println!(
+            "REPLAY using commitment_map root: {:?}",
+            replay_commit_map.succinct_repr()
+        );
+        println!(
+            "REPLAY using nullifier_map  root: {:?}",
+            replay_null_map.succinct_repr()
+        );
+
+        let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = aggregate_client_proofs_cached(
+                &agg_setup,
+                &srs,
+                vk.vk(),
+                &client_proofs,
+                replay_commit_map.clone(),
+                replay_null_map.clone(),
+                replay_roots_set_map.clone(),
             );
+        }));
+        match replay {
+            Ok(_) => println!("❌ Replay unexpectedly succeeded (BUG)"),
+            Err(_) => println!(
+                "✅ Replay correctly rejected (nullifiers already spent / state already advanced)"
+            ),
         }
+
+        batch_idx += 1;
     }
+
+    println!(
+        "\nFinal commitment root: {:?}",
+        commitment_map.succinct_repr()
+    );
+
+    for acc in &accounts {
+        let bal: u128 = acc
+            .wallet
+            .iter()
+            .filter(|n| !n.spent)
+            .fold(0u128, |s, n| s.saturating_add(n.utxo.amount));
+        println!(
+            "Account {} unspent notes: {}, balance {}",
+            acc.id,
+            acc.wallet.iter().filter(|n| !n.spent).count(),
+            bal
+        );
+    }
+}

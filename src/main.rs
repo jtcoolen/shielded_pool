@@ -508,7 +508,6 @@ mod proof_agg {
     pub struct AggCircuit<const K: u32> {
         child_vk: VkData,
         child_vk_name: String,
-        expected_prev_level: F,
 
         left_child_state: [Value<F>; AGG_STATE_WIDTH],
         right_child_state: [Value<F>; AGG_STATE_WIDTH],
@@ -545,7 +544,6 @@ mod proof_agg {
             Self {
                 child_vk: self.child_vk.clone(),
                 child_vk_name: self.child_vk_name.clone(),
-                expected_prev_level: self.expected_prev_level,
                 left_child_state: array::from_fn(|_| Value::unknown()),
                 right_child_state: array::from_fn(|_| Value::unknown()),
                 left_items: Value::unknown(),
@@ -1114,18 +1112,13 @@ mod proof_agg {
         let mut agg_levels: Vec<AggLevelKeys> = Vec::with_capacity(max_agg_level);
 
         for level in 1..=max_agg_level {
-            let (child_vk, child_vk_name, expected_prev_level, is_leaf) = if level == 1 {
-                (
-                    leaf_vk_data.clone(),
-                    leaf_vk_name.to_string(),
-                    F::ZERO,
-                    true,
-                )
+            let (child_vk, child_vk_name, is_leaf) = if level == 1 {
+                (leaf_vk_data.clone(), leaf_vk_name.to_string(), true)
             } else {
                 let child_level = level - 1;
                 let child = agg_levels[child_level - 1].vk_data.clone();
                 let child_name = agg_vk_names[child_level - 1].clone();
-                (child, child_name, F::from(child_level as u64), false)
+                (child, child_name, false)
             };
 
             let name = agg_vk_names[level - 1].clone();
@@ -1135,7 +1128,6 @@ mod proof_agg {
                 let default_circuit = LeafAggCircuit {
                     child_vk,
                     child_vk_name,
-                    expected_prev_level,
                     left_child_state: array::from_fn(|_| Value::unknown()),
                     right_child_state: array::from_fn(|_| Value::unknown()),
                     left_items: Value::unknown(),
@@ -1157,7 +1149,6 @@ mod proof_agg {
                 let default_circuit = InternalAggCircuit {
                     child_vk,
                     child_vk_name,
-                    expected_prev_level,
                     left_child_state: array::from_fn(|_| Value::unknown()),
                     right_child_state: array::from_fn(|_| Value::unknown()),
                     left_items: Value::unknown(),
@@ -1424,7 +1415,6 @@ mod proof_agg {
                 let circuit = LeafAggCircuit {
                     child_vk: leaf_vk_data_cl.clone(),
                     child_vk_name: leaf_vk_name_string.clone(),
-                    expected_prev_level: F::ZERO,
                     left_child_state: array::from_fn(|_| Value::unknown()),
                     right_child_state: array::from_fn(|_| Value::unknown()),
                     left_items: Value::known(p.left_items),
@@ -1584,7 +1574,6 @@ mod proof_agg {
                     let circuit = InternalAggCircuit {
                         child_vk: child_vk_data.clone(),
                         child_vk_name: child_vk_name.clone(),
-                        expected_prev_level: F::from(child_level as u64),
                         left_child_state: array::from_fn(|j| Value::known(l_fields[j])),
                         right_child_state: array::from_fn(|j| Value::known(r_fields[j])),
                         left_items: Value::unknown(),

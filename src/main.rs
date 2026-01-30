@@ -402,7 +402,6 @@ fn configure_agg_circuit(
     P2RDecompositionConfig,
     ForeignEccConfig<C>,
     PoseidonConfig<F>,
-    //Sha256Config,
 ) {
     let nb_advice_cols = nb_foreign_ecc_chip_columns::<F, C, C, NG>();
     let nb_fixed_cols = NB_ARITH_COLS + 4;
@@ -440,20 +439,11 @@ fn configure_agg_circuit(
         ),
     );
 
-    /*let sha2_config = Sha256Chip::configure(
-        meta,
-        &(
-            advice_columns[..NB_SHA256_ADVICE_COLS].try_into().unwrap(),
-            fixed_columns[..NB_SHA256_FIXED_COLS].try_into().unwrap(),
-        ),
-    );*/
-
     (
         native_config,
         core_decomp_config,
         curve_config,
         poseidon_config,
-        //sha2_config,
     )
 }
 
@@ -502,7 +492,6 @@ impl<const K: u32> Circuit<F> for AggCircuit<K> {
         P2RDecompositionConfig,
         ForeignEccConfig<C>,
         PoseidonConfig<F>,
-        //Sha256Config,
     );
     type FloorPlanner = SimpleFloorPlanner;
     type Params = ();
@@ -546,8 +535,6 @@ impl<const K: u32> Circuit<F> for AggCircuit<K> {
         let curve_chip = ForeignEccChip::new(&config.2, &scalar_chip, &scalar_chip);
         let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
         let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
-
-        //let _sha2_chip = Sha256Chip::new(&config.4, &scalar_chip);
 
         let child_vk_val: AssignedNative<F> =
             native_chip.assign_fixed(&mut layouter, self.child_vk.transcript_repr)?;
@@ -1707,7 +1694,6 @@ impl Circuit<F> for FinalAggCircuit {
         P2RDecompositionConfig,
         ForeignEccConfig<C>,
         PoseidonConfig<F>,
-        //Sha256Config,
     );
     type FloorPlanner = SimpleFloorPlanner;
     type Params = ();

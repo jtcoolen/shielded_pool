@@ -203,11 +203,6 @@ mod proof_agg {
     use std::sync::Arc;
     use std::time::Instant;
 
-    #[cfg(feature = "dev-curves")]
-    use midnight_curves::bn256::Bn256;
-    #[cfg(feature = "dev-curves")]
-    type FBN = midnight_curves::bn256::Fr;
-
     pub type S = BlstrsEmulation;
     type F = <S as SelfEmulation>::F;
     type C = <S as SelfEmulation>::C;
@@ -2266,12 +2261,6 @@ struct Account {
 }
 
 fn main() {
-    println!(
-        "shielded-pool dev-curves enabled? {}",
-        cfg!(feature = "dev-curves")
-    );
-    #[cfg(feature = "dev-curves")]
-    compile_error!("dev-curves is ON for shielded-pool");
     const LEAF_VK_NAME: &str = "spend2output2_vk";
 
     const K: u32 = 14;
@@ -2706,33 +2695,11 @@ fn main() {
             final_public_inputs.extend(final_acc_pi.clone());
 
             // ✅ Use cached final_pk/final_vk/final_agg_srs (no per-batch keygen).
-            #[cfg(not(feature = "dev-curves"))]
             let final_proof_bytes = {
                 let mut transcript = CircuitTranscript::<KeccakTranscript>::init();
                 create_proof::<
                     F,
                     KZGCommitmentScheme<midnight_curves::Bls12>,
-                    CircuitTranscript<KeccakTranscript>,
-                    FinalAggCircuit,
-                >(
-                    &final_agg_srs,
-                    &final_pk,
-                    &[final_circuit],
-                    1,
-                    &[&[&[], &final_public_inputs]],
-                    OsRng,
-                    &mut transcript,
-                )
-                .expect("Final aggregation proof generation should not fail");
-                transcript.finalize()
-            };
-
-            #[cfg(feature = "dev-curves")]
-            let final_proof_bytes = {
-                let mut transcript = CircuitTranscript::<KeccakTranscript>::init();
-                create_proof::<
-                    FBN,
-                    KZGCommitmentScheme<midnight_curves::bls12_381::Bls12>,
                     CircuitTranscript<KeccakTranscript>,
                     FinalAggCircuit,
                 >(

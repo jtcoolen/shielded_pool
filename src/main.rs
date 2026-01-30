@@ -28,6 +28,7 @@ use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
 
 mod keccak;
+mod srs;
 
 use core::array;
 
@@ -49,20 +50,15 @@ use midnight_circuits::{
 };
 use midnight_curves::Bls12;
 use midnight_proofs::poly::kzg::params::ParamsKZG;
-use midnight_proofs::utils::SerdeFormat;
 use midnight_proofs::{
     circuit::SimpleFloorPlanner,
     plonk::{Circuit, ConstraintSystem, ProvingKey, VerifyingKey},
     poly::{EvaluationDomain, kzg::KZGCommitmentScheme},
     transcript::CircuitTranscript,
 };
-use rand::rngs::StdRng;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
-use std::fs::File;
-use std::io::{BufReader, Write};
-use std::path::Path;
+
 use std::sync::Arc;
 
 pub type S = BlstrsEmulation;
@@ -123,159 +119,6 @@ impl AggState {
             self.roots_set_root,
         ]
     }
-}
-
-macro_rules! ensure {
-        ($cond:expr, $($arg:tt)*) => {
-            if !$cond {
-                return Err(io_other(format!($($arg)*)));
-            }
-        };
-    }
-fn io_other(msg: impl Into<String>) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, msg.into())
-}
-
-// Deterministic mock SRS for testing only MUST NOT be used in production
-pub fn mock_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>, std::io::Error> {
-    ensure!(
-        k <= 20,
-        "No Filecoin SRS available for circuits of size k={}",
-        k
-    );
-
-    let srs_dir = env::var("SRS_DIR").unwrap_or_else(|_| "./examples/assets".into());
-    let srs_path = format!("{srs_dir}/bls_mock_2p{k}");
-    let fetching_path = if Path::new(&srs_path).exists() {
-        srs_path.clone()
-    } else {
-        format!("{srs_dir}/bls_mock_2p20")
-    };
-
-    // If the (mock) params file we're about to read doesn't exist, create it via unsafe_setup.
-    if !Path::new(&fetching_path).exists() {
-        std::fs::create_dir_all(&srs_dir)
-            .map_err(|e| io_other(format!("Failed to create SRS_DIR '{}': {e}", srs_dir)))?;
-
-        let rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64);
-
-        let params = ParamsKZG::<Bls12>::unsafe_setup(20, rng);
-
-        let mut buf = Vec::new();
-        params
-            .write_custom(&mut buf, SerdeFormat::RawBytesUnchecked)
-            .map_err(|e| io_other(format!("Failed to serialize mock params: {e}")))?;
-
-        let mut file = File::create(&fetching_path).map_err(|e| {
-            io_other(format!(
-                "Failed to create mock SRS file '{}': {e}",
-                fetching_path
-            ))
-        })?;
-        file.write_all(&buf).map_err(|e| {
-            io_other(format!(
-                "Failed to write mock SRS file '{}': {e}",
-                fetching_path
-            ))
-        })?;
-    }
-
-    let params_fs = File::open(Path::new(&fetching_path)).map_err(|e| {
-        io_other(format!(
-            "Failed to open SRS file at '{}': {e}. (Did you set SRS_DIR?)",
-            fetching_path
-        ))
-    })?;
-
-    let mut params: ParamsKZG<Bls12> = ParamsKZG::read_custom::<_>(
-        &mut BufReader::new(params_fs),
-        SerdeFormat::RawBytesUnchecked,
-    )
-    .map_err(|e| {
-        io_other(format!(
-            "Failed to read SRS params from '{}': {e}",
-            fetching_path
-        ))
-    })?;
-
-    // If we loaded the MAX_K file, downsize and cache the per-k file
-    if fetching_path != srs_path {
-        params.downsize(k);
-
-        let mut buf = Vec::new();
-        params
-            .write_custom(&mut buf, SerdeFormat::RawBytesUnchecked)
-            .map_err(|e| io_other(format!("Failed to serialize downsized params: {e}")))?;
-
-        let mut file = File::create(&srs_path).map_err(|e| {
-            io_other(format!(
-                "Failed to create mock SRS cache file '{}': {e}",
-                srs_path
-            ))
-        })?;
-        file.write_all(&buf).map_err(|e| {
-            io_other(format!(
-                "Failed to write mock SRS cache '{}': {e}",
-                srs_path
-            ))
-        })?;
-    }
-
-    Ok(params)
-}
-
-pub fn filecoin_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>, std::io::Error> {
-    ensure!(
-        k <= 20,
-        "No Filecoin SRS available for circuits of size k={}",
-        k
-    );
-
-    let srs_dir = env::var("SRS_DIR").unwrap_or_else(|_| "./examples/assets".into());
-    let srs_path = format!("{srs_dir}/bls_filecoin_2p{k}");
-    let fetching_path = if Path::new(&srs_path).exists() {
-        srs_path.clone()
-    } else {
-        format!("{srs_dir}/bls_filecoin_2p20")
-    };
-
-    let params_fs = File::open(Path::new(&fetching_path)).map_err(|e| {
-        io_other(format!(
-            "Failed to open SRS file at '{}': {e}. (Did you set SRS_DIR?)",
-            fetching_path
-        ))
-    })?;
-
-    let mut params: ParamsKZG<Bls12> = ParamsKZG::read_custom::<_>(
-        &mut BufReader::new(params_fs),
-        SerdeFormat::RawBytesUnchecked,
-    )
-    .map_err(|e| {
-        io_other(format!(
-            "Failed to read SRS params from '{}': {e}",
-            fetching_path
-        ))
-    })?;
-
-    if fetching_path != srs_path {
-        params.downsize(k);
-
-        let mut buf = Vec::new();
-        params
-            .write_custom(&mut buf, SerdeFormat::RawBytesUnchecked)
-            .map_err(|e| io_other(format!("Failed to serialize downsized params: {e}")))?;
-
-        let mut file = File::create(&srs_path).map_err(|e| {
-            io_other(format!(
-                "Failed to create SRS cache file '{}': {e}",
-                srs_path
-            ))
-        })?;
-        file.write_all(&buf[..])
-            .map_err(|e| io_other(format!("Failed to write SRS cache '{}': {e}", srs_path)))?;
-    }
-
-    Ok(params)
 }
 
 #[derive(Clone, Debug)]
@@ -1604,8 +1447,8 @@ pub fn prepare_agg_setup(
     let mut agg_cs = ConstraintSystem::default();
     configure_agg_circuit(&mut agg_cs);
 
-    let agg_srs_leaf = filecoin_srs_agg(K_LEAF).unwrap();
-    let agg_srs_internal = filecoin_srs_agg(K_INTERNAL).unwrap();
+    let agg_srs_leaf = srs::filecoin_srs_agg(K_LEAF).unwrap();
+    let agg_srs_internal = srs::filecoin_srs_agg(K_INTERNAL).unwrap();
 
     assert_eq!(leaf_srs.s_g2(), agg_srs_internal.s_g2(), "s_g2 mismatch");
     assert_eq!(
@@ -2536,7 +2379,7 @@ fn main() {
     const NUM_SEED_DEPOSITS_PER_ACCOUNT: usize = 50;
     const NUM_TRANSFERS: usize = 120;
 
-    let srs = filecoin_srs_agg(K).unwrap();
+    let srs = srs::filecoin_srs_agg(K).unwrap();
     let relation = Spend2Output2;
     let vk = compact_std_lib::setup_vk(&srs, &relation);
     let pk = compact_std_lib::setup_pk(&relation, &vk);
@@ -2545,7 +2388,7 @@ fn main() {
     let agg_setup = prepare_agg_setup(&srs, vk.vk(), LEAF_VK_NAME, K, BATCH_SIZE);
 
     // ✅ Cache FINAL aggregation vk/pk once (depends only on cached agg_setup for this batch size).
-    let final_agg_srs = filecoin_srs_agg(AGG_K).unwrap();
+    let final_agg_srs = srs::filecoin_srs_agg(AGG_K).unwrap();
     let default_final_circuit = FinalAggCircuit {
         child_vk: agg_setup.child_vk().clone(),
         child_vk_name: agg_setup.child_vk_name().to_string(),

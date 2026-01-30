@@ -244,7 +244,7 @@ pub fn prepare_agg_setup(
     let mut agg_levels: Vec<AggLevelKeys> = Vec::with_capacity(max_agg_level);
 
     for level in 1..=max_agg_level {
-        let (child_vk, child_vk_name, is_leaf) = if level == 1 {
+        let (child_vk, child_vk_name, children_are_client_proofs) = if level == 1 {
             (leaf_vk_data.clone(), leaf_vk_name.to_string(), true)
         } else {
             let child_level = level - 1;
@@ -257,48 +257,61 @@ pub fn prepare_agg_setup(
         let start = Instant::now();
 
         if level == 1 {
+            // Leaf aggregation layer: BaseStepCircuit<K_LEAF>
             let default_circuit = rollup_ivc::LeafAggCircuit {
                 child_vk,
                 child_vk_name,
-                left_child_state: array::from_fn(|_| Value::unknown()),
-                right_child_state: array::from_fn(|_| Value::unknown()),
+
                 left_items: Value::unknown(),
                 right_items: Value::unknown(),
+
                 pre_commitment_map: Value::unknown(),
                 pre_nullifier_map: Value::unknown(),
-                pre_commitment_roots_map: Value::unknown(),
+                pre_commitment_roots_set_map: Value::unknown(),
+
                 left_proof: Value::unknown(),
                 right_proof: Value::unknown(),
-                left_acc: Value::unknown(),
-                right_acc: Value::unknown(),
+                left_pi_acc: Value::unknown(),
+                right_pi_acc: Value::unknown(),
+
                 fixed_base_names: fixed_base_names.clone(),
-                is_leaf,
+                // NOTE: this flag is kept only to mirror the setup logic; the circuit itself
+                // always treats its children as client proofs at level == 1.
+                // If you removed it from the circuit struct, delete this field too.
+                // children_are_client_proofs,
             };
+
             let (vk, pk) = keygen_vk_pk(&agg_srs_leaf, &default_circuit, K_LEAF);
             println!("Computed {} vk/pk in {:?}", name, start.elapsed());
             agg_levels.push(AggLevelKeys::new(level, name, vk, pk));
         } else {
+            // Internal aggregation layers: FoldStepCircuit<K_INTERNAL>
             let default_circuit = rollup_ivc::InternalAggCircuit {
                 child_vk,
                 child_vk_name,
+
                 left_child_state: array::from_fn(|_| Value::unknown()),
                 right_child_state: array::from_fn(|_| Value::unknown()),
-                left_items: Value::unknown(),
-                right_items: Value::unknown(),
-                pre_commitment_map: Value::unknown(),
-                pre_nullifier_map: Value::unknown(),
-                pre_commitment_roots_map: Value::unknown(),
+
                 left_proof: Value::unknown(),
                 right_proof: Value::unknown(),
-                left_acc: Value::unknown(),
-                right_acc: Value::unknown(),
+                left_pi_acc: Value::unknown(),
+                right_pi_acc: Value::unknown(),
+
                 fixed_base_names: fixed_base_names.clone(),
-                is_leaf,
+                // NOTE: internal nodes always treat children as aggregation proofs.
+                // If you removed `children_are_client_proofs` from the circuit struct, delete this.
+                // children_are_client_proofs,
             };
+
             let (vk, pk) = keygen_vk_pk(&agg_srs_internal, &default_circuit, K_INTERNAL);
             println!("Computed {} vk/pk in {:?}", name, start.elapsed());
             agg_levels.push(AggLevelKeys::new(level, name, vk, pk));
         }
+
+        // If you ever keygen the final wrap step here (separately), it would be:
+        // rollup_ivc::WrapStepCircuit { ... } with AGG_K (and likely its own SRS).
+        let _ = children_are_client_proofs; // silence unused if not otherwise referenced
     }
 
     let agg_store = AggKeyStore::new(agg_levels);

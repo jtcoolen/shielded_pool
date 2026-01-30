@@ -84,7 +84,7 @@ fn main() {
 
     // ✅ Cache FINAL aggregation vk/pk once (depends only on cached agg_setup for this batch size).
     let final_agg_srs = srs::filecoin_srs_agg(AGG_K).unwrap();
-    let default_final_circuit = rollup_ivc::FinalAggCircuit {
+    let default_final_circuit = rollup_ivc::WrapStepCircuit {
         child_vk: agg_setup.child_vk().clone(),
         child_vk_name: agg_setup.child_vk_name().to_string(),
         child_level: F::from(agg_setup.child_level() as u64),
@@ -96,8 +96,8 @@ fn main() {
         left_child_state: Value::unknown(),
         right_child_state: Value::unknown(),
         agg_state: Value::unknown(),
-        pre_commitment_roots_map: Value::unknown(),
-        post_commitment_roots_root: Value::unknown(),
+        pre_commitment_roots_set_map: Value::unknown(),
+        post_commitment_roots_set_root: Value::unknown(),
     };
     let final_vk = keygen_vk_with_k(&final_agg_srs, &default_final_circuit, AGG_K)
         .expect("final vk gen should not fail");
@@ -474,7 +474,7 @@ fn main() {
             final_acc.collapse();
             let final_acc_pi = rollup_ivc::accumulator_as_public_input(&final_acc);
 
-            let final_circuit = rollup_ivc::FinalAggCircuit {
+            let final_circuit = rollup_ivc::WrapStepCircuit {
                 child_vk: agg_result.child_vk.clone(),
                 child_vk_name: agg_result.child_vk_name.clone(),
                 child_level: F::from(agg_result.child_level as u64),
@@ -486,8 +486,10 @@ fn main() {
                 left_child_state: Value::known(agg_result.left_top.state),
                 right_child_state: Value::known(agg_result.right_top.state),
                 agg_state: Value::known(agg_result.root_state),
-                pre_commitment_roots_map: Value::known(pre_commitment_roots_map_for_batch.clone()),
-                post_commitment_roots_root: Value::known(post_roots_set_root),
+                pre_commitment_roots_set_map: Value::known(
+                    pre_commitment_roots_map_for_batch.clone(),
+                ),
+                post_commitment_roots_set_root: Value::known(post_roots_set_root),
             };
 
             let mut final_public_inputs: Vec<F> = vec![
@@ -508,7 +510,7 @@ fn main() {
                     F,
                     KZGCommitmentScheme<midnight_curves::Bls12>,
                     CircuitTranscript<keccak::KeccakTranscript>,
-                    rollup_ivc::FinalAggCircuit,
+                    rollup_ivc::WrapStepCircuit,
                 >(
                     &final_agg_srs,
                     &final_pk,

@@ -16,128 +16,18 @@ use midnight_circuits::{
     },
     map::cpu::MapMt,
     types::{AssignedNative, AssignedNativePoint, Instantiable},
+    verifier::AssignedVk,
 };
 use midnight_curves::{Fr as JubjubScalar, JubjubExtended as Jubjub, JubjubSubgroup};
+use midnight_proofs::plonk::{Error, create_proof, keygen_pk, keygen_vk_with_k, prepare};
 use midnight_proofs::{
     circuit::{Layouter, Value},
     transcript::Transcript,
 };
-use midnight_proofs::{
-    plonk::{Error, create_proof, keygen_pk, keygen_vk_with_k, prepare},
-    transcript::{Hashable, Sampleable, TranscriptHash},
-};
 use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
 
-use sha3::{Digest, Keccak256};
-use std::{io, io::Read};
-
-use ff::FromUniformBytes;
-use group::GroupEncoding;
-
-/// Newtype so you can refer to it as `KeccakTranscript` in generics.
-#[derive(Clone)]
-pub struct KeccakTranscript(Keccak256);
-
-impl TranscriptHash for KeccakTranscript {
-    type Input = Vec<u8>;
-    type Output = Vec<u8>; // we return 64 bytes for your existing sampling code
-
-    fn init() -> Self {
-        // Domain separation (on-chain: start transcript bytes with this literal)
-        let mut h = Keccak256::new();
-        h.update(b"Domain separator for transcript");
-        Self(h)
-    }
-
-    fn absorb(&mut self, input: &Self::Input) {
-        self.0.update(&[0]);
-        self.0.update(input);
-    }
-
-    fn squeeze(&mut self) -> Self::Output {
-        // Mutate transcript state (so multiple squeezes differ)
-        self.0.update(&[1]);
-
-        // EVM-compatible 64 bytes:
-        // out = keccak256(preimage || 0x00) || keccak256(preimage || 0x01)
-        let mut out = Vec::with_capacity(64);
-
-        let r0 = {
-            let mut t = self.0.clone();
-            t.update(&[0u8]);
-            t.finalize()
-        };
-        out.extend_from_slice(r0.as_slice());
-
-        let r1 = {
-            let mut t = self.0.clone();
-            t.update(&[1u8]);
-            t.finalize()
-        };
-        out.extend_from_slice(r1.as_slice());
-
-        debug_assert_eq!(out.len(), 64);
-        out
-    }
-}
-
-// ------------------------------------------------------------
-// Fix #1 from your error: G1Projective must be Hashable<KeccakTranscript>
-// ------------------------------------------------------------
-impl Hashable<KeccakTranscript> for midnight_curves::G1Projective {
-    fn to_input(&self) -> Vec<u8> {
-        Hashable::<KeccakTranscript>::to_bytes(self)
-    }
-
-    fn to_bytes(&self) -> Vec<u8> {
-        <Self as GroupEncoding>::to_bytes(self).as_ref().to_vec()
-    }
-
-    fn read(buffer: &mut impl Read) -> io::Result<Self> {
-        let mut bytes = <Self as GroupEncoding>::Repr::default();
-        buffer.read_exact(bytes.as_mut())?;
-
-        Option::from(Self::from_bytes(&bytes))
-            .ok_or_else(|| io::Error::other("Invalid BLS12-381 point encoding in proof"))
-    }
-}
-
-// ------------------------------------------------------------
-// Fix #2/#3 from your error: BlsScalar must be Hashable + Sampleable for KeccakTranscript
-//
-// IMPORTANT: Replace `midnight_curves::Fq` below with your actual `BlsScalar` type
-// if it is a distinct alias/type in your crate.
-// ------------------------------------------------------------
-impl Hashable<KeccakTranscript> for midnight_curves::Fq {
-    fn to_input(&self) -> Vec<u8> {
-        self.to_repr().to_vec()
-    }
-
-    fn to_bytes(&self) -> Vec<u8> {
-        self.to_repr().to_vec()
-    }
-
-    fn read(buffer: &mut impl Read) -> io::Result<Self> {
-        let mut bytes = <Self as PrimeField>::Repr::default();
-        buffer.read_exact(bytes.as_mut())?;
-
-        Option::from(Self::from_repr(bytes))
-            .ok_or_else(|| io::Error::other("Invalid BLS12-381 scalar encoding in proof"))
-    }
-}
-
-impl Sampleable<KeccakTranscript> for midnight_curves::Fq {
-    fn sample(hash_output: Vec<u8>) -> Self {
-        assert!(hash_output.len() <= 64);
-        assert!(hash_output.len() >= (midnight_curves::Fq::NUM_BITS as usize / 8) + 12);
-
-        let mut bytes = [0u8; 64];
-        bytes[..hash_output.len()].copy_from_slice(&hash_output);
-
-        midnight_curves::Fq::from_uniform_bytes(&bytes)
-    }
-}
+mod keccak;
 
 use core::array;
 
@@ -486,6 +376,651 @@ pub struct AggCircuit<const K: u32> {
     is_leaf: bool,
 }
 
+pub type CurveChip = ForeignEccChip<F, C, C, NG, NG>;
+pub type MapGadget = midnight_circuits::map::map_gadget::MapGadget<F, NG, PoseidonChip<F>>;
+pub type IdPoint = AssignedForeignPoint<
+    midnight_curves::Fq,
+    midnight_curves::G1Projective,
+    midnight_curves::G1Projective,
+>;
+
+// --------------------------- Encodings (struct <-> array) ---------------------------
+
+/// Typed encoding for the 7 public items in client proofs.
+///
+/// Canonical order: [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2]
+#[derive(Clone, Debug)]
+pub struct ClientPublicItems<T> {
+    pub root_before: T,
+    pub pk_bx: T,
+    pub pk_by: T,
+    pub new_c1: T,
+    pub new_c2: T,
+    pub nf1: T,
+    pub nf2: T,
+}
+
+impl<T> From<[T; 7]> for ClientPublicItems<T> {
+    fn from(arr: [T; 7]) -> Self {
+        let [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2] = arr;
+        Self {
+            root_before,
+            pk_bx,
+            pk_by,
+            new_c1,
+            new_c2,
+            nf1,
+            nf2,
+        }
+    }
+}
+
+impl<T> ClientPublicItems<T> {
+    pub fn into_array(self) -> [T; 7] {
+        [
+            self.root_before,
+            self.pk_bx,
+            self.pk_by,
+            self.new_c1,
+            self.new_c2,
+            self.nf1,
+            self.nf2,
+        ]
+    }
+}
+
+impl<T: Clone> ClientPublicItems<T> {
+    pub fn as_array(&self) -> [T; 7] {
+        [
+            self.root_before.clone(),
+            self.pk_bx.clone(),
+            self.pk_by.clone(),
+            self.new_c1.clone(),
+            self.new_c2.clone(),
+            self.nf1.clone(),
+            self.nf2.clone(),
+        ]
+    }
+
+    pub fn commitments(&self) -> [T; 2] {
+        [self.new_c1.clone(), self.new_c2.clone()]
+    }
+
+    pub fn nullifiers(&self) -> [T; 2] {
+        [self.nf1.clone(), self.nf2.clone()]
+    }
+}
+
+/// Typed encoding for the Agg state public inputs (6 fields).
+///
+/// Canonical order (must match `AggState::to_fields()`):
+/// [c_pre, c_post, n_pre, n_post, subroot, roots_set_root]
+#[derive(Clone, Debug)]
+pub struct AggStateFields<T> {
+    pub c_pre: T,
+    pub c_post: T,
+    pub n_pre: T,
+    pub n_post: T,
+    pub subroot: T,
+    pub roots_set_root: T,
+}
+
+impl From<AggState> for AggStateFields<F> {
+    fn from(state: AggState) -> Self {
+        Self {
+            c_pre: state.c_pre,
+            c_post: state.c_post,
+            n_pre: state.n_pre,
+            n_post: state.n_post,
+            subroot: state.subroot,
+            roots_set_root: state.roots_set_root,
+        }
+    }
+}
+
+impl<T> From<[T; AGG_STATE_WIDTH]> for AggStateFields<T> {
+    fn from(arr: [T; AGG_STATE_WIDTH]) -> Self {
+        let [c_pre, c_post, n_pre, n_post, subroot, roots_set_root] = arr;
+        Self {
+            c_pre,
+            c_post,
+            n_pre,
+            n_post,
+            subroot,
+            roots_set_root,
+        }
+    }
+}
+
+impl<T> AggStateFields<T> {
+    pub fn into_array(self) -> [T; AGG_STATE_WIDTH] {
+        [
+            self.c_pre,
+            self.c_post,
+            self.n_pre,
+            self.n_post,
+            self.subroot,
+            self.roots_set_root,
+        ]
+    }
+}
+
+impl<T: Clone> AggStateFields<T> {
+    pub fn as_array(&self) -> [T; AGG_STATE_WIDTH] {
+        [
+            self.c_pre.clone(),
+            self.c_post.clone(),
+            self.n_pre.clone(),
+            self.n_post.clone(),
+            self.subroot.clone(),
+            self.roots_set_root.clone(),
+        ]
+    }
+
+    pub fn boundary4(&self) -> [T; 4] {
+        [
+            self.c_pre.clone(),
+            self.c_post.clone(),
+            self.n_pre.clone(),
+            self.n_post.clone(),
+        ]
+    }
+
+    pub fn as_vec(&self) -> Vec<T> {
+        vec![
+            self.c_pre.clone(),
+            self.c_post.clone(),
+            self.n_pre.clone(),
+            self.n_post.clone(),
+            self.subroot.clone(),
+            self.roots_set_root.clone(),
+        ]
+    }
+}
+
+// --------------------------- Context ---------------------------
+
+#[derive(Clone)]
+pub struct AggCtx {
+    pub native: NativeChip<F>,
+    pub core_decomp: P2RDecompositionChip<F>,
+    pub scalar: NG,
+    pub curve: CurveChip,
+    pub poseidon: PoseidonChip<F>,
+    pub verifier: VerifierGadget<S>,
+}
+
+impl AggCtx {
+    pub fn new(
+        cfg: &(
+            NativeConfig,
+            P2RDecompositionConfig,
+            ForeignEccConfig<C>,
+            PoseidonConfig<F>,
+        ),
+        k_minus_1: usize,
+    ) -> Self {
+        let native = <NativeChip<F> as ComposableChip<F>>::new(&cfg.0, &());
+        let core_decomp = P2RDecompositionChip::new(&cfg.1, &k_minus_1);
+        let scalar = NativeGadget::new(core_decomp.clone(), native.clone());
+        let curve = ForeignEccChip::new(&cfg.2, &scalar, &scalar);
+        let poseidon = PoseidonChip::new(&cfg.3, &native);
+        let verifier = VerifierGadget::<S>::new(&curve, &scalar, &poseidon);
+
+        Self {
+            native,
+            core_decomp,
+            scalar,
+            curve,
+            poseidon,
+            verifier,
+        }
+    }
+
+    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+        self.core_decomp.load(layouter)
+    }
+
+    pub fn id_point(&self, layouter: &mut impl Layouter<F>) -> Result<IdPoint, Error> {
+        self.curve.assign_fixed(layouter, C::identity())
+    }
+
+    pub fn one(&self, layouter: &mut impl Layouter<F>) -> Result<AssignedNative<F>, Error> {
+        self.scalar.assign_fixed(layouter, F::ONE)
+    }
+
+    pub fn zero(&self, layouter: &mut impl Layouter<F>) -> Result<AssignedNative<F>, Error> {
+        self.scalar.assign_fixed(layouter, F::ZERO)
+    }
+}
+
+// --------------------------- State helpers ---------------------------
+
+pub fn assign_state_array(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    fields: [Value<F>; AGG_STATE_WIDTH],
+) -> Result<AggStateFields<AssignedNative<F>>, Error> {
+    let [c_pre, c_post, n_pre, n_post, subroot, roots_set_root] = fields;
+
+    Ok(AggStateFields {
+        c_pre: ctx.scalar.assign(layouter, c_pre)?,
+        c_post: ctx.scalar.assign(layouter, c_post)?,
+        n_pre: ctx.scalar.assign(layouter, n_pre)?,
+        n_post: ctx.scalar.assign(layouter, n_post)?,
+        subroot: ctx.scalar.assign(layouter, subroot)?,
+        roots_set_root: ctx.scalar.assign(layouter, roots_set_root)?,
+    })
+}
+
+pub fn assign_state_value(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    state: Value<AggState>,
+) -> Result<AggStateFields<AssignedNative<F>>, Error> {
+    let state_fields = state.map(AggStateFields::<F>::from);
+
+    Ok(AggStateFields {
+        c_pre: ctx
+            .scalar
+            .assign(layouter, state_fields.as_ref().map(|s| s.c_pre))?,
+        c_post: ctx
+            .scalar
+            .assign(layouter, state_fields.as_ref().map(|s| s.c_post))?,
+        n_pre: ctx
+            .scalar
+            .assign(layouter, state_fields.as_ref().map(|s| s.n_pre))?,
+        n_post: ctx
+            .scalar
+            .assign(layouter, state_fields.as_ref().map(|s| s.n_post))?,
+        subroot: ctx
+            .scalar
+            .assign(layouter, state_fields.as_ref().map(|s| s.subroot))?,
+        roots_set_root: ctx
+            .scalar
+            .assign(layouter, state_fields.as_ref().map(|s| s.roots_set_root))?,
+    })
+}
+
+pub fn base_pi_from_state(state: &AggStateFields<AssignedNative<F>>) -> Vec<AssignedNative<F>> {
+    state.as_vec()
+}
+
+fn assign_client_items(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    items: Value<[F; 7]>,
+) -> Result<ClientPublicItems<AssignedNative<F>>, Error> {
+    let typed_items = items.map(ClientPublicItems::<F>::from);
+
+    Ok(ClientPublicItems {
+        root_before: ctx
+            .scalar
+            .assign(layouter, typed_items.as_ref().map(|i| i.root_before))?,
+        pk_bx: ctx
+            .scalar
+            .assign(layouter, typed_items.as_ref().map(|i| i.pk_bx))?,
+        pk_by: ctx
+            .scalar
+            .assign(layouter, typed_items.as_ref().map(|i| i.pk_by))?,
+        new_c1: ctx
+            .scalar
+            .assign(layouter, typed_items.as_ref().map(|i| i.new_c1))?,
+        new_c2: ctx
+            .scalar
+            .assign(layouter, typed_items.as_ref().map(|i| i.new_c2))?,
+        nf1: ctx
+            .scalar
+            .assign(layouter, typed_items.as_ref().map(|i| i.nf1))?,
+        nf2: ctx
+            .scalar
+            .assign(layouter, typed_items.as_ref().map(|i| i.nf2))?,
+    })
+}
+
+// --------------------------- Map helpers ---------------------------
+
+fn init_map(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    map: Value<Map>,
+) -> Result<MapGadget, Error> {
+    let mut gadget = MapGadget::new(&ctx.scalar, &ctx.poseidon);
+    gadget.init(layouter, map)?;
+    Ok(gadget)
+}
+
+// --------------------------- IVC base step ---------------------------
+
+/// Leaf base step: Merkle map updates (commitment/nullifier) + historic roots membership checks.
+pub fn ivc_base_step_leaf(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    pre_commitment_map: Value<Map>,
+    pre_nullifier_map: Value<Map>,
+    pre_roots_map: Value<Map>,
+    left_items: Value<[F; 7]>,
+    right_items: Value<[F; 7]>,
+) -> Result<
+    (
+        AggStateFields<AssignedNative<F>>,
+        Vec<AssignedNative<F>>, // left base PI (instance hash)
+        Vec<AssignedNative<F>>, // right base PI (instance hash)
+    ),
+    Error,
+> {
+    let one = ctx.one(layouter)?;
+    let zero = ctx.zero(layouter)?;
+
+    // Initialize current rollup sets
+    let mut commit_map = init_map(ctx, layouter, pre_commitment_map)?;
+    let c_pre = commit_map.succinct_repr();
+
+    let mut null_map = init_map(ctx, layouter, pre_nullifier_map)?;
+    let n_pre = null_map.succinct_repr();
+
+    // Initialize historic roots set
+    let roots_map = init_map(ctx, layouter, pre_roots_map)?;
+    let roots_set_root = roots_map.succinct_repr();
+
+    // Assign transaction public items (typed)
+    let left = assign_client_items(ctx, layouter, left_items)?;
+    let right = assign_client_items(ctx, layouter, right_items)?;
+
+    // Verify membership: tx_root ∈ historic_roots_set
+    verify_root_membership(ctx, layouter, &roots_map, &left.root_before, &one)?;
+    verify_root_membership(ctx, layouter, &roots_map, &right.root_before, &one)?;
+
+    // Compute client instance hashes (hash all 7 fields in canonical order)
+    let left_arr = left.as_array();
+    let right_arr = right.as_array();
+    let inst_left = ctx.poseidon.hash(layouter, &left_arr)?;
+    let inst_right = ctx.poseidon.hash(layouter, &right_arr)?;
+
+    // Apply transaction effects to rollup sets
+    apply_transaction_effects(
+        ctx,
+        layouter,
+        &mut commit_map,
+        &mut null_map,
+        &left,
+        &zero,
+        &one,
+    )?;
+    apply_transaction_effects(
+        ctx,
+        layouter,
+        &mut commit_map,
+        &mut null_map,
+        &right,
+        &zero,
+        &one,
+    )?;
+
+    let c_post = commit_map.succinct_repr();
+    let n_post = null_map.succinct_repr();
+
+    // Aggregate subtree root for this leaf aggregation node
+    let subroot = ctx
+        .poseidon
+        .hash(layouter, &[inst_left.clone(), inst_right.clone()])?;
+
+    Ok((
+        AggStateFields {
+            c_pre,
+            c_post,
+            n_pre,
+            n_post,
+            subroot,
+            roots_set_root,
+        },
+        vec![inst_left],
+        vec![inst_right],
+    ))
+}
+
+/// Helper: Verify that a root exists in the historic roots set.
+fn verify_root_membership(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    roots_map: &MapGadget,
+    root: &AssignedNative<F>,
+    one: &AssignedNative<F>,
+) -> Result<(), Error> {
+    let membership = roots_map.get(layouter, root)?;
+    ctx.scalar.assert_equal(layouter, &membership, one)
+}
+
+/// Helper: Apply transaction effects (insert commitments, check and mark nullifiers).
+fn apply_transaction_effects(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    commit_map: &mut MapGadget,
+    null_map: &mut MapGadget,
+    items: &ClientPublicItems<AssignedNative<F>>,
+    zero: &AssignedNative<F>,
+    one: &AssignedNative<F>,
+) -> Result<(), Error> {
+    // Insert commitments
+    for commitment in &items.commitments() {
+        commit_map.insert(layouter, commitment, one)?;
+    }
+
+    // Verify nullifiers are new, then mark them as spent
+    for nullifier in &items.nullifiers() {
+        let existing = null_map.get(layouter, nullifier)?;
+        ctx.scalar.assert_equal(layouter, &existing, zero)?;
+        null_map.insert(layouter, nullifier, one)?;
+    }
+
+    Ok(())
+}
+
+/// Internal base step: stitch children states (sequential application) + compute parent subroot.
+pub fn ivc_base_step_internal(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    left_child_state: [Value<F>; AGG_STATE_WIDTH],
+    right_child_state: [Value<F>; AGG_STATE_WIDTH],
+) -> Result<
+    (
+        AggStateFields<AssignedNative<F>>,
+        Vec<AssignedNative<F>>, // left base PI (child state fields)
+        Vec<AssignedNative<F>>, // right base PI (child state fields)
+    ),
+    Error,
+> {
+    let left = assign_state_array(ctx, layouter, left_child_state)?;
+    let right = assign_state_array(ctx, layouter, right_child_state)?;
+
+    // Verify state transitions match across child boundaries
+    ctx.scalar
+        .assert_equal(layouter, &left.c_post, &right.c_pre)?;
+    ctx.scalar
+        .assert_equal(layouter, &left.n_post, &right.n_pre)?;
+    ctx.scalar
+        .assert_equal(layouter, &left.roots_set_root, &right.roots_set_root)?;
+
+    // Compute parent subroot by hashing child subroots
+    let subroot = ctx
+        .poseidon
+        .hash(layouter, &[left.subroot.clone(), right.subroot.clone()])?;
+
+    let output_state = AggStateFields {
+        c_pre: left.c_pre.clone(),
+        c_post: right.c_post.clone(),
+        n_pre: left.n_pre.clone(),
+        n_post: right.n_post.clone(),
+        subroot,
+        roots_set_root: left.roots_set_root.clone(),
+    };
+
+    Ok((
+        output_state,
+        base_pi_from_state(&left),
+        base_pi_from_state(&right),
+    ))
+}
+
+// --------------------------- IVC fold step ---------------------------
+
+/// Assign and (optionally) neutralize leaf pi-acc; return assigned accumulators.
+pub fn assign_pi_acc(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    fixed_base_names: &[String],
+    acc: Value<Accumulator<S>>,
+) -> Result<AssignedAccumulator<S>, Error> {
+    let mut accumulator = AssignedAccumulator::assign(
+        layouter,
+        &ctx.curve,
+        &ctx.scalar,
+        1,
+        1,
+        &[],
+        fixed_base_names,
+        acc,
+    )?;
+    accumulator.collapse(layouter, &ctx.curve, &ctx.scalar)?;
+    Ok(accumulator)
+}
+
+pub fn neutralize_pi_acc_if_leaf(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    is_leaf: bool,
+    acc: &mut AssignedAccumulator<S>,
+) -> Result<(), Error> {
+    if is_leaf {
+        let neutral = ctx.scalar.assign_fixed(layouter, false)?;
+        AssignedAccumulator::scale_by_bit(layouter, &ctx.scalar, &neutral, acc)?;
+        acc.collapse(layouter, &ctx.curve, &ctx.scalar)?;
+    }
+    Ok(())
+}
+
+/// Build the public inputs used to verify a child proof.
+///
+/// - For leaf children: just base_pi (client instance hash)
+/// - For internal children: base_pi (child agg state fields) || child_pi_acc public input
+pub fn build_child_public_inputs(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    is_leaf_child: bool,
+    mut base_pi: Vec<AssignedNative<F>>,
+    child_pi_acc: Option<&AssignedAccumulator<S>>,
+) -> Result<Vec<AssignedNative<F>>, Error> {
+    if !is_leaf_child {
+        let acc = child_pi_acc.expect("Internal child requires pi_acc");
+        base_pi.extend(ctx.verifier.as_public_input(layouter, acc)?);
+    }
+    Ok(base_pi)
+}
+
+pub fn prepare_proof_acc(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    assigned_vk: &AssignedVk<S>,
+    id_point: IdPoint,
+    public_inputs: &[AssignedNative<F>],
+    proof: Value<Vec<u8>>,
+) -> Result<AssignedAccumulator<S>, Error> {
+    let mut proof_acc = ctx.verifier.prepare(
+        layouter,
+        assigned_vk,
+        &[("com_instance", id_point)],
+        &[public_inputs],
+        proof,
+    )?;
+    proof_acc.collapse(layouter, &ctx.curve, &ctx.scalar)?;
+    Ok(proof_acc)
+}
+
+pub fn fold_step_accumulate(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    parts: [AssignedAccumulator<S>; 4],
+) -> Result<AssignedAccumulator<S>, Error> {
+    let mut next = AssignedAccumulator::<S>::accumulate(
+        layouter,
+        &ctx.verifier,
+        &ctx.scalar,
+        &ctx.poseidon,
+        &parts,
+    )?;
+    next.collapse(layouter, &ctx.curve, &ctx.scalar)?;
+    Ok(next)
+}
+
+// --------------------------- Public input exposure ---------------------------
+
+pub fn expose_native(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    values: impl IntoIterator<Item = AssignedNative<F>>,
+) -> Result<(), Error> {
+    for value in values {
+        ctx.native.constrain_as_public_input(layouter, &value)?;
+    }
+    Ok(())
+}
+
+pub fn expose_scalar(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    values: impl IntoIterator<Item = AssignedNative<F>>,
+) -> Result<(), Error> {
+    for value in values {
+        ctx.scalar.constrain_as_public_input(layouter, &value)?;
+    }
+    Ok(())
+}
+
+// --------------------------- Final wrap: roots-set update ---------------------------
+
+pub fn wrap_step_update_roots_set(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    pre_commitment_roots_map: Value<Map>,
+    c_pre: &AssignedNative<F>,
+    c_post: &AssignedNative<F>,
+    left_roots_set_root: &AssignedNative<F>,
+    right_roots_set_root: &AssignedNative<F>,
+    expected_post_root: Value<F>,
+) -> Result<(AssignedNative<F>, AssignedNative<F>), Error> {
+    let one = ctx.one(layouter)?;
+    let zero = ctx.zero(layouter)?;
+
+    let mut roots_map = init_map(ctx, layouter, pre_commitment_roots_map)?;
+    let pre_root = roots_map.succinct_repr();
+
+    // Verify child aggregation proofs are bound to THIS historic-roots-set root
+    ctx.scalar
+        .assert_equal(layouter, left_roots_set_root, &pre_root)?;
+    ctx.scalar
+        .assert_equal(layouter, right_roots_set_root, &pre_root)?;
+
+    // Verify membership: c_pre must already be in set
+    let pre_exists = roots_map.get(layouter, c_pre)?;
+    ctx.scalar.assert_equal(layouter, &pre_exists, &one)?;
+
+    // Replay protection: c_post must be new
+    let post_exists = roots_map.get(layouter, c_post)?;
+    ctx.scalar.assert_equal(layouter, &post_exists, &zero)?;
+
+    // Insert c_post and bind expected resulting root
+    roots_map.insert(layouter, c_post, &one)?;
+    let post_root_expected = ctx.scalar.assign(layouter, expected_post_root)?;
+    ctx.scalar
+        .assert_equal(layouter, &roots_map.succinct_repr(), &post_root_expected)?;
+
+    Ok((pre_root, post_root_expected))
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Refactored AggCircuit
+////////////////////////////////////////////////////////////////////////////////
+
 impl<const K: u32> Circuit<F> for AggCircuit<K> {
     type Config = (
         NativeConfig,
@@ -500,8 +1035,8 @@ impl<const K: u32> Circuit<F> for AggCircuit<K> {
         Self {
             child_vk: self.child_vk.clone(),
             child_vk_name: self.child_vk_name.clone(),
-            left_child_state: array::from_fn(|_| Value::unknown()),
-            right_child_state: array::from_fn(|_| Value::unknown()),
+            left_child_state: core::array::from_fn(|_| Value::unknown()),
+            right_child_state: core::array::from_fn(|_| Value::unknown()),
             left_items: Value::unknown(),
             right_items: Value::unknown(),
             pre_commitment_map: Value::unknown(),
@@ -525,228 +1060,268 @@ impl<const K: u32> Circuit<F> for AggCircuit<K> {
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
-        let native_chip = <NativeChip<F> as ComposableChip<F>>::new(&config.0, &());
-        let core_decomp_chip = P2RDecompositionChip::new(&config.1, &(K as usize - 1));
-        let scalar_chip: NativeGadget<
-            midnight_curves::Fq,
-            P2RDecompositionChip<midnight_curves::Fq>,
-            NativeChip<midnight_curves::Fq>,
-        > = NativeGadget::new(core_decomp_chip.clone(), native_chip.clone());
-        let curve_chip = ForeignEccChip::new(&config.2, &scalar_chip, &scalar_chip);
-        let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
-        let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
+        // Initialize shared chips context
+        let ctx = AggCtx::new(&config, (K as usize).saturating_sub(1));
 
-        let child_vk_val: AssignedNative<F> =
-            native_chip.assign_fixed(&mut layouter, self.child_vk.transcript_repr)?;
-        let assigned_vk = verifier_chip.assign_vk(
-            self.child_vk_name.as_str(),
+        // Assign and bind child verification key
+        let child_vk_val: AssignedNative<F> = ctx
+            .native
+            .assign_fixed(&mut layouter, self.child_vk.transcript_repr)?;
+        let assigned_vk = ctx.verifier.assign_vk(
+            &self.child_vk_name,
             &self.child_vk.domain,
             &self.child_vk.cs,
             child_vk_val,
         )?;
 
-        let zero = scalar_chip.assign_fixed(&mut layouter, F::ZERO)?;
-        let one = scalar_chip.assign_fixed(&mut layouter, F::ONE)?;
-
-        let (out_state_fields, assigned_left_pi_base, assigned_right_pi_base) = if self.is_leaf {
-            // Commitment map (rollup “current” set)
-            let mut commit_map_gadget = midnight_circuits::map::map_gadget::MapGadget::<
-                F,
-                NG,
-                PoseidonChip<F>,
-            >::new(&scalar_chip, &poseidon_chip);
-            commit_map_gadget.init(&mut layouter, self.pre_commitment_map.clone())?;
-            let c_pre = commit_map_gadget.succinct_repr();
-
-            // Nullifier map (rollup “current” spent set)
-            let mut null_map_gadget = midnight_circuits::map::map_gadget::MapGadget::<
-                F,
-                NG,
-                PoseidonChip<F>,
-            >::new(&scalar_chip, &poseidon_chip);
-            null_map_gadget.init(&mut layouter, self.pre_nullifier_map.clone())?;
-            let n_pre = null_map_gadget.succinct_repr();
-
-            // Historic roots set (what allows “lagging” tx roots)
-            let mut roots_map_gadget = midnight_circuits::map::map_gadget::MapGadget::<
-                F,
-                NG,
-                PoseidonChip<F>,
-            >::new(&scalar_chip, &poseidon_chip);
-            roots_map_gadget.init(&mut layouter, self.pre_commitment_roots_map.clone())?;
-
-            // ---- FIX (Issue 1): bind roots-set root into leaf agg public state
-            let roots_set_root = roots_map_gadget.succinct_repr();
-
-            let mut l: Vec<AssignedNative<F>> = Vec::with_capacity(7);
-            for j in 0..7 {
-                l.push(
-                    scalar_chip.assign(&mut layouter, self.left_items.clone().map(|arr| arr[j]))?,
-                );
-            }
-            let mut r: Vec<AssignedNative<F>> = Vec::with_capacity(7);
-            for j in 0..7 {
-                r.push(
-                    scalar_chip
-                        .assign(&mut layouter, self.right_items.clone().map(|arr| arr[j]))?,
-                );
-            }
-
-            // NEW: allow tx roots to be any HISTORIC root (not necessarily the rolling c_pre/c_mid)
-            // Enforce: tx_root ∈ roots_set
-            let ok_l = roots_map_gadget.get(&mut layouter, &l[0])?;
-            scalar_chip.assert_equal(&mut layouter, &ok_l, &one)?;
-            let ok_r = roots_map_gadget.get(&mut layouter, &r[0])?;
-            scalar_chip.assert_equal(&mut layouter, &ok_r, &one)?;
-
-            // ✅ Single Poseidon hash of all 7 would-be public inputs
-            let inst_l = poseidon_chip.hash(&mut layouter, &l[..])?;
-            let inst_r = poseidon_chip.hash(&mut layouter, &r[..])?;
-
-            // Apply BOTH tx’s effects to the *current* rollup sets (commitments + nullifiers)
-            commit_map_gadget.insert(&mut layouter, &l[3], &one)?;
-            commit_map_gadget.insert(&mut layouter, &l[4], &one)?;
-
-            for nf in [l[5].clone(), l[6].clone()] {
-                let old = null_map_gadget.get(&mut layouter, &nf)?;
-                scalar_chip.assert_equal(&mut layouter, &old, &zero)?;
-                null_map_gadget.insert(&mut layouter, &nf, &one)?;
-            }
-
-            commit_map_gadget.insert(&mut layouter, &r[3], &one)?;
-            commit_map_gadget.insert(&mut layouter, &r[4], &one)?;
-
-            for nf in [r[5].clone(), r[6].clone()] {
-                let old = null_map_gadget.get(&mut layouter, &nf)?;
-                scalar_chip.assert_equal(&mut layouter, &old, &zero)?;
-                null_map_gadget.insert(&mut layouter, &nf, &one)?;
-            }
-
-            let c_post = commit_map_gadget.succinct_repr();
-            let n_post = null_map_gadget.succinct_repr();
-            let subroot = poseidon_chip.hash(&mut layouter, &[inst_l.clone(), inst_r.clone()])?;
-            let out_fields = [c_pre, c_post, n_pre, n_post, subroot, roots_set_root];
-
-            (out_fields, vec![inst_l], vec![inst_r])
+        // --------------------- IVC base step (state update / stitching) ---------------------
+        let (out_state, left_pi_base, right_pi_base) = if self.is_leaf {
+            ivc_base_step_leaf(
+                &ctx,
+                &mut layouter,
+                self.pre_commitment_map.clone(),
+                self.pre_nullifier_map.clone(),
+                self.pre_commitment_roots_map.clone(),
+                self.left_items.clone(),
+                self.right_items.clone(),
+            )?
         } else {
-            let mut l_vec: Vec<AssignedNative<F>> = Vec::with_capacity(AGG_STATE_WIDTH);
-            let mut r_vec: Vec<AssignedNative<F>> = Vec::with_capacity(AGG_STATE_WIDTH);
-            for j in 0..AGG_STATE_WIDTH {
-                l_vec.push(scalar_chip.assign(&mut layouter, self.left_child_state[j])?);
-                r_vec.push(scalar_chip.assign(&mut layouter, self.right_child_state[j])?);
-            }
-            let l: [AssignedNative<F>; AGG_STATE_WIDTH] = l_vec.try_into().unwrap();
-            let r: [AssignedNative<F>; AGG_STATE_WIDTH] = r_vec.try_into().unwrap();
-
-            scalar_chip.assert_equal(&mut layouter, &l[1], &r[0])?;
-            scalar_chip.assert_equal(&mut layouter, &l[3], &r[2])?;
-            // ---- FIX (Issue 1): roots-set root must be identical across whole agg tree
-            scalar_chip.assert_equal(&mut layouter, &l[5], &r[5])?;
-
-            let subroot = poseidon_chip.hash(&mut layouter, &[l[4].clone(), r[4].clone()])?;
-
-            let out_fields = [
-                l[0].clone(),
-                r[1].clone(),
-                l[2].clone(),
-                r[3].clone(),
-                subroot,
-                l[5].clone(), // propagate roots_set_root
-            ];
-
-            (out_fields, l.to_vec(), r.to_vec())
+            ivc_base_step_internal(
+                &ctx,
+                &mut layouter,
+                self.left_child_state,
+                self.right_child_state,
+            )?
         };
 
-        let mut left_acc = AssignedAccumulator::assign(
+        // --------------------- IVC fold step (partial verify + accumulator fold) ---------------------
+        let mut left_pi_acc = assign_pi_acc(
+            &ctx,
             &mut layouter,
-            &curve_chip,
-            &scalar_chip,
-            1,
-            1,
-            &[],
             &self.fixed_base_names,
             self.left_acc.clone(),
         )?;
-        let mut right_acc = AssignedAccumulator::assign(
+        let mut right_pi_acc = assign_pi_acc(
+            &ctx,
             &mut layouter,
-            &curve_chip,
-            &scalar_chip,
-            1,
-            1,
-            &[],
             &self.fixed_base_names,
             self.right_acc.clone(),
         )?;
 
-        let (assigned_left_pi, assigned_right_pi) = if self.is_leaf {
-            let neutral = scalar_chip.assign_fixed(&mut layouter, false)?;
-            AssignedAccumulator::scale_by_bit(
-                &mut layouter,
-                &scalar_chip,
-                &neutral,
-                &mut left_acc,
-            )?;
-            AssignedAccumulator::scale_by_bit(
-                &mut layouter,
-                &scalar_chip,
-                &neutral,
-                &mut right_acc,
-            )?;
-            left_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-            right_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-            (assigned_left_pi_base, assigned_right_pi_base)
-        } else {
-            let mut left_pi = assigned_left_pi_base;
-            left_pi.extend(verifier_chip.as_public_input(&mut layouter, &left_acc)?);
+        // Leaf has no child pi-acc in the client proof; neutralize the provided placeholder acc
+        neutralize_pi_acc_if_leaf(&ctx, &mut layouter, self.is_leaf, &mut left_pi_acc)?;
+        neutralize_pi_acc_if_leaf(&ctx, &mut layouter, self.is_leaf, &mut right_pi_acc)?;
 
-            let mut right_pi = assigned_right_pi_base;
-            right_pi.extend(verifier_chip.as_public_input(&mut layouter, &right_acc)?);
+        let left_child_pi = build_child_public_inputs(
+            &ctx,
+            &mut layouter,
+            self.is_leaf,
+            left_pi_base,
+            Some(&left_pi_acc),
+        )?;
+        let right_child_pi = build_child_public_inputs(
+            &ctx,
+            &mut layouter,
+            self.is_leaf,
+            right_pi_base,
+            Some(&right_pi_acc),
+        )?;
 
-            (left_pi, right_pi)
-        };
+        let id_point = ctx.id_point(&mut layouter)?;
 
-        let id_point: AssignedForeignPoint<
-            midnight_curves::Fq,
-            midnight_curves::G1Projective,
-            midnight_curves::G1Projective,
-        > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
-
-        let mut left_proof_acc = verifier_chip.prepare(
+        let left_proof_acc = prepare_proof_acc(
+            &ctx,
             &mut layouter,
             &assigned_vk,
-            &[("com_instance", id_point.clone())],
-            &[&assigned_left_pi],
+            id_point.clone(),
+            &left_child_pi,
             self.left_proof.clone(),
         )?;
-        left_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-
-        let mut right_proof_acc = verifier_chip.prepare(
+        let right_proof_acc = prepare_proof_acc(
+            &ctx,
             &mut layouter,
             &assigned_vk,
-            &[("com_instance", id_point)],
-            &[&assigned_right_pi],
+            id_point,
+            &right_child_pi,
             self.right_proof.clone(),
         )?;
-        right_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-        let mut next_acc = AssignedAccumulator::<S>::accumulate(
+        let next_acc = fold_step_accumulate(
+            &ctx,
             &mut layouter,
-            &verifier_chip,
-            &scalar_chip,
-            &poseidon_chip,
-            &[left_proof_acc, left_acc, right_proof_acc, right_acc],
+            [left_proof_acc, left_pi_acc, right_proof_acc, right_pi_acc],
         )?;
-        next_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-        let next_acc_pi = verifier_chip.as_public_input(&mut layouter, &next_acc)?;
-        for f in out_state_fields.iter() {
-            native_chip.constrain_as_public_input(&mut layouter, f)?;
-        }
-        for x in next_acc_pi.iter() {
-            native_chip.constrain_as_public_input(&mut layouter, x)?;
-        }
+        // --------------------- Public outputs ---------------------
+        // AggCircuit exposes: state fields || folded accumulator PI
+        expose_native(&ctx, &mut layouter, out_state.into_array())?;
+        let next_acc_pi = ctx.verifier.as_public_input(&mut layouter, &next_acc)?;
+        expose_native(&ctx, &mut layouter, next_acc_pi)?;
 
-        core_decomp_chip.load(&mut layouter)
+        ctx.load(&mut layouter)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Refactored FinalAggCircuit
+////////////////////////////////////////////////////////////////////////////////
+
+impl Circuit<F> for FinalAggCircuit {
+    type Config = (
+        NativeConfig,
+        P2RDecompositionConfig,
+        ForeignEccConfig<C>,
+        PoseidonConfig<F>,
+    );
+    type FloorPlanner = SimpleFloorPlanner;
+    type Params = ();
+
+    fn without_witnesses(&self) -> Self {
+        Self {
+            child_vk: self.child_vk.clone(),
+            child_vk_name: self.child_vk_name.clone(),
+            child_level: self.child_level,
+            left_proof: Value::unknown(),
+            right_proof: Value::unknown(),
+            left_pi_acc: Value::unknown(),
+            right_pi_acc: Value::unknown(),
+            fixed_base_names: self.fixed_base_names.clone(),
+            left_child_state: Value::unknown(),
+            right_child_state: Value::unknown(),
+            agg_state: Value::unknown(),
+            pre_commitment_roots_map: Value::unknown(),
+            post_commitment_roots_root: Value::unknown(),
+        }
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        configure_agg_circuit(meta)
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        let ctx = AggCtx::new(&config, (AGG_K as usize).saturating_sub(1));
+
+        // --------------------- Assign and expose final aggregation state (c/n boundaries) ---------------------
+        let agg = assign_state_value(&ctx, &mut layouter, self.agg_state.clone())?;
+
+        // Public: c_pre, c_post, n_pre, n_post
+        expose_scalar(&ctx, &mut layouter, agg.boundary4())?;
+
+        // --------------------- Assign children states ---------------------
+        let left = assign_state_value(&ctx, &mut layouter, self.left_child_state.clone())?;
+        let right = assign_state_value(&ctx, &mut layouter, self.right_child_state.clone())?;
+
+        // Verify child boundaries stitch together: left.c_post == right.c_pre, left.n_post == right.n_pre
+        ctx.scalar
+            .assert_equal(&mut layouter, &left.c_post, &right.c_pre)?;
+        ctx.scalar
+            .assert_equal(&mut layouter, &left.n_post, &right.n_pre)?;
+
+        // Verify children stitch to declared aggregation boundary
+        ctx.scalar
+            .assert_equal(&mut layouter, &agg.c_pre, &left.c_pre)?;
+        ctx.scalar
+            .assert_equal(&mut layouter, &agg.c_post, &right.c_post)?;
+        ctx.scalar
+            .assert_equal(&mut layouter, &agg.n_pre, &left.n_pre)?;
+        ctx.scalar
+            .assert_equal(&mut layouter, &agg.n_post, &right.n_post)?;
+
+        // Compute and expose final subroot
+        let subroot = ctx.poseidon.hash(
+            &mut layouter,
+            &[left.subroot.clone(), right.subroot.clone()],
+        )?;
+        ctx.scalar
+            .constrain_as_public_input(&mut layouter, &subroot)?;
+
+        // --------------------- Wrap step: bind and update historic-roots-set ---------------------
+        let (pre_roots_root, post_roots_root) = wrap_step_update_roots_set(
+            &ctx,
+            &mut layouter,
+            self.pre_commitment_roots_map.clone(),
+            &agg.c_pre,
+            &agg.c_post,
+            &left.roots_set_root,
+            &right.roots_set_root,
+            self.post_commitment_roots_root.clone(),
+        )?;
+
+        // Public: pre_roots_root, post_roots_root
+        expose_scalar(&ctx, &mut layouter, [pre_roots_root, post_roots_root])?;
+
+        // --------------------- Verify top aggregation proofs and fold accumulators (wrap fold) ---------------------
+        let vk_val: AssignedNative<F> = ctx.native.assign_fixed(&mut layouter, self.child_vk.2)?;
+        let assigned_vk = ctx.verifier.assign_vk(
+            &self.child_vk_name,
+            &self.child_vk.0,
+            &self.child_vk.1,
+            vk_val,
+        )?;
+
+        let left_pi_acc = assign_pi_acc(
+            &ctx,
+            &mut layouter,
+            &self.fixed_base_names,
+            self.left_pi_acc.clone(),
+        )?;
+        let right_pi_acc = assign_pi_acc(
+            &ctx,
+            &mut layouter,
+            &self.fixed_base_names,
+            self.right_pi_acc.clone(),
+        )?;
+
+        // Child public inputs = child state fields || child pi_acc PI
+        let left_pi = build_child_public_inputs(
+            &ctx,
+            &mut layouter,
+            false,
+            base_pi_from_state(&left),
+            Some(&left_pi_acc),
+        )?;
+        let right_pi = build_child_public_inputs(
+            &ctx,
+            &mut layouter,
+            false,
+            base_pi_from_state(&right),
+            Some(&right_pi_acc),
+        )?;
+
+        let id_point = ctx.id_point(&mut layouter)?;
+
+        let left_proof_acc = prepare_proof_acc(
+            &ctx,
+            &mut layouter,
+            &assigned_vk,
+            id_point.clone(),
+            &left_pi,
+            self.left_proof.clone(),
+        )?;
+        let right_proof_acc = prepare_proof_acc(
+            &ctx,
+            &mut layouter,
+            &assigned_vk,
+            id_point,
+            &right_pi,
+            self.right_proof.clone(),
+        )?;
+
+        let final_acc = fold_step_accumulate(
+            &ctx,
+            &mut layouter,
+            [left_proof_acc, left_pi_acc, right_proof_acc, right_pi_acc],
+        )?;
+
+        // Public: final accumulator PI
+        let final_acc_pi = ctx.verifier.as_public_input(&mut layouter, &final_acc)?;
+        expose_scalar(&ctx, &mut layouter, final_acc_pi)?;
+
+        ctx.load(&mut layouter)
     }
 }
 
@@ -1688,252 +2263,6 @@ pub struct FinalAggCircuit {
     pub post_commitment_roots_root: Value<F>,
 }
 
-impl Circuit<F> for FinalAggCircuit {
-    type Config = (
-        NativeConfig,
-        P2RDecompositionConfig,
-        ForeignEccConfig<C>,
-        PoseidonConfig<F>,
-    );
-    type FloorPlanner = SimpleFloorPlanner;
-    type Params = ();
-
-    fn without_witnesses(&self) -> Self {
-        Self {
-            child_vk: self.child_vk.clone(),
-            child_vk_name: self.child_vk_name.clone(),
-            child_level: self.child_level,
-            left_proof: Value::unknown(),
-            right_proof: Value::unknown(),
-            left_pi_acc: Value::unknown(),
-            right_pi_acc: Value::unknown(),
-            fixed_base_names: self.fixed_base_names.clone(),
-            left_child_state: Value::unknown(),
-            right_child_state: Value::unknown(),
-            agg_state: Value::unknown(),
-            pre_commitment_roots_map: Value::unknown(),
-            post_commitment_roots_root: Value::unknown(),
-        }
-    }
-
-    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        configure_agg_circuit(meta)
-    }
-
-    fn synthesize(
-        &self,
-        config: Self::Config,
-        mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
-        let native_chip = <NativeChip<F> as ComposableChip<F>>::new(&config.0, &());
-        let core_decomp_chip = P2RDecompositionChip::new(&config.1, &(AGG_K as usize - 1));
-        let scalar_chip = NativeGadget::new(core_decomp_chip.clone(), native_chip.clone());
-        let curve_chip = ForeignEccChip::new(&config.2, &scalar_chip, &scalar_chip);
-        let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
-        let verifier_chip: VerifierGadget<_> =
-            VerifierGadget::<S>::new(&curve_chip, &scalar_chip, &poseidon_chip);
-
-        let c_pre = scalar_chip.assign(&mut layouter, self.agg_state.clone().map(|s| s.c_pre))?;
-        scalar_chip.constrain_as_public_input(&mut layouter, &c_pre)?;
-        let c_post = scalar_chip.assign(&mut layouter, self.agg_state.clone().map(|s| s.c_post))?;
-        scalar_chip.constrain_as_public_input(&mut layouter, &c_post)?;
-        let n_pre: AssignedNative<F> =
-            scalar_chip.assign(&mut layouter, self.agg_state.clone().map(|s| s.n_pre))?;
-        scalar_chip.constrain_as_public_input(&mut layouter, &n_pre)?;
-        let n_post: AssignedNative<F> =
-            scalar_chip.assign(&mut layouter, self.agg_state.clone().map(|s| s.n_post))?;
-        scalar_chip.constrain_as_public_input(&mut layouter, &n_post)?;
-
-        let l_c_pre = scalar_chip.assign(
-            &mut layouter,
-            self.left_child_state.clone().map(|s| s.c_pre),
-        )?;
-        let l_c_post: AssignedNative<F> = scalar_chip.assign(
-            &mut layouter,
-            self.left_child_state.clone().map(|s| s.c_post),
-        )?;
-        let l_n_pre = scalar_chip.assign(
-            &mut layouter,
-            self.left_child_state.clone().map(|s| s.n_pre),
-        )?;
-        let l_n_post: AssignedNative<F> = scalar_chip.assign(
-            &mut layouter,
-            self.left_child_state.clone().map(|s| s.n_post),
-        )?;
-        let l_subroot: AssignedNative<F> = scalar_chip.assign(
-            &mut layouter,
-            self.left_child_state.clone().map(|s| s.subroot),
-        )?;
-        // ---- FIX (Issue 1): read roots_set_root from child state
-        let l_roots_set_root: AssignedNative<F> = scalar_chip.assign(
-            &mut layouter,
-            self.left_child_state.clone().map(|s| s.roots_set_root),
-        )?;
-
-        let r_c_pre = scalar_chip.assign(
-            &mut layouter,
-            self.right_child_state.clone().map(|s| s.c_pre),
-        )?;
-        let r_c_post = scalar_chip.assign(
-            &mut layouter,
-            self.right_child_state.clone().map(|s| s.c_post),
-        )?;
-        let r_n_pre = scalar_chip.assign(
-            &mut layouter,
-            self.right_child_state.clone().map(|s| s.n_pre),
-        )?;
-        let r_n_post = scalar_chip.assign(
-            &mut layouter,
-            self.right_child_state.clone().map(|s| s.n_post),
-        )?;
-        let r_subroot: AssignedNative<F> = scalar_chip.assign(
-            &mut layouter,
-            self.right_child_state.clone().map(|s| s.subroot),
-        )?;
-        // ---- FIX (Issue 1): read roots_set_root from child state
-        let r_roots_set_root: AssignedNative<F> = scalar_chip.assign(
-            &mut layouter,
-            self.right_child_state.clone().map(|s| s.roots_set_root),
-        )?;
-
-        scalar_chip.assert_equal(&mut layouter, &l_c_post, &r_c_pre)?;
-        scalar_chip.assert_equal(&mut layouter, &l_n_post, &r_n_pre)?;
-
-        scalar_chip.assert_equal(&mut layouter, &c_pre, &l_c_pre)?;
-        scalar_chip.assert_equal(&mut layouter, &c_post, &r_c_post)?;
-        scalar_chip.assert_equal(&mut layouter, &n_pre, &l_n_pre)?;
-        scalar_chip.assert_equal(&mut layouter, &n_post, &r_n_post)?;
-
-        let subroot = poseidon_chip.hash(&mut layouter, &[l_subroot.clone(), r_subroot.clone()])?;
-        scalar_chip.constrain_as_public_input(&mut layouter, &subroot)?;
-
-        let one = scalar_chip.assign_fixed(&mut layouter, F::ONE)?;
-
-        let mut roots_map_gadget = midnight_circuits::map::map_gadget::MapGadget::<
-            F,
-            NG,
-            PoseidonChip<F>,
-        >::new(&scalar_chip, &poseidon_chip);
-        roots_map_gadget.init(&mut layouter, self.pre_commitment_roots_map.clone())?;
-
-        let pre_roots_set_root = roots_map_gadget.succinct_repr();
-        scalar_chip.constrain_as_public_input(&mut layouter, &pre_roots_set_root)?;
-
-        // ---- FIX (Issue 1): child agg proofs must be bound to THIS roots set
-        scalar_chip.assert_equal(&mut layouter, &l_roots_set_root, &pre_roots_set_root)?;
-        scalar_chip.assert_equal(&mut layouter, &r_roots_set_root, &pre_roots_set_root)?;
-
-        let expected_post_roots_set_root =
-            scalar_chip.assign(&mut layouter, self.post_commitment_roots_root.clone())?;
-        scalar_chip.constrain_as_public_input(&mut layouter, &expected_post_roots_set_root)?;
-
-        let pre_ok = roots_map_gadget.get(&mut layouter, &c_pre)?;
-        scalar_chip.assert_equal(&mut layouter, &pre_ok, &one)?;
-
-        // Prevent replay: post root must be new to the set
-        let zero = scalar_chip.assign_fixed(&mut layouter, F::ZERO)?;
-        let already = roots_map_gadget.get(&mut layouter, &c_post)?;
-        scalar_chip.assert_equal(&mut layouter, &already, &zero)?;
-
-        roots_map_gadget.insert(&mut layouter, &c_post, &one)?;
-        scalar_chip.assert_equal(
-            &mut layouter,
-            &roots_map_gadget.succinct_repr(),
-            &expected_post_roots_set_root,
-        )?;
-
-        let vk_val: AssignedNative<F> = native_chip.assign_fixed(&mut layouter, self.child_vk.2)?;
-        let assigned_vk = verifier_chip.assign_vk(
-            self.child_vk_name.as_str(),
-            &self.child_vk.0,
-            &self.child_vk.1,
-            vk_val,
-        )?;
-
-        let mut left_pi_acc = AssignedAccumulator::assign(
-            &mut layouter,
-            &curve_chip,
-            &scalar_chip,
-            1,
-            1,
-            &[],
-            &self.fixed_base_names,
-            self.left_pi_acc.clone(),
-        )?;
-        left_pi_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-
-        let mut right_pi_acc = AssignedAccumulator::assign(
-            &mut layouter,
-            &curve_chip,
-            &scalar_chip,
-            1,
-            1,
-            &[],
-            &self.fixed_base_names,
-            self.right_pi_acc.clone(),
-        )?;
-        right_pi_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-
-        let mut left_pi: Vec<AssignedNative<F>> = Vec::new();
-        left_pi.push(l_c_pre.clone());
-        left_pi.push(l_c_post.clone());
-        left_pi.push(l_n_pre.clone());
-        left_pi.push(l_n_post.clone());
-        left_pi.push(l_subroot.clone());
-        left_pi.push(l_roots_set_root.clone()); // ---- FIX (Issue 1): include in PI
-        left_pi.extend(verifier_chip.as_public_input(&mut layouter, &left_pi_acc)?);
-
-        let mut right_pi: Vec<AssignedNative<F>> = Vec::new();
-        right_pi.push(r_c_pre.clone());
-        right_pi.push(r_c_post.clone());
-        right_pi.push(r_n_pre.clone());
-        right_pi.push(r_n_post.clone());
-        right_pi.push(r_subroot.clone());
-        right_pi.push(r_roots_set_root.clone()); // ---- FIX (Issue 1): include in PI
-        right_pi.extend(verifier_chip.as_public_input(&mut layouter, &right_pi_acc)?);
-
-        let id_point: AssignedForeignPoint<
-            midnight_curves::Fq,
-            midnight_curves::G1Projective,
-            midnight_curves::G1Projective,
-        > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
-
-        let mut left_proof_acc = verifier_chip.prepare(
-            &mut layouter,
-            &assigned_vk,
-            &[("com_instance", id_point.clone())],
-            &[&left_pi],
-            self.left_proof.clone(),
-        )?;
-        left_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-
-        let mut right_proof_acc = verifier_chip.prepare(
-            &mut layouter,
-            &assigned_vk,
-            &[("com_instance", id_point)],
-            &[&right_pi],
-            self.right_proof.clone(),
-        )?;
-        right_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-
-        let mut final_acc = AssignedAccumulator::<S>::accumulate(
-            &mut layouter,
-            &verifier_chip,
-            &scalar_chip,
-            &poseidon_chip,
-            &[left_proof_acc, left_pi_acc, right_proof_acc, right_pi_acc],
-        )?;
-        final_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-
-        let final_acc_pi = verifier_chip.as_public_input(&mut layouter, &final_acc)?;
-        for x in final_acc_pi.iter() {
-            scalar_chip.constrain_as_public_input(&mut layouter, x)?;
-        }
-
-        core_decomp_chip.load(&mut layouter)
-    }
-}
-
 const UTXO_COMMIT_TAG: u64 = 0x0001;
 const UTXO_NULLIFY_TAG: u64 = 0x0002;
 const AMOUNT_BITS: u32 = 128;
@@ -2635,11 +2964,11 @@ fn main() {
 
             // ✅ Use cached final_pk/final_vk/final_agg_srs (no per-batch keygen).
             let final_proof_bytes = {
-                let mut transcript = CircuitTranscript::<KeccakTranscript>::init();
+                let mut transcript = CircuitTranscript::<keccak::KeccakTranscript>::init();
                 create_proof::<
                     F,
                     KZGCommitmentScheme<midnight_curves::Bls12>,
-                    CircuitTranscript<KeccakTranscript>,
+                    CircuitTranscript<keccak::KeccakTranscript>,
                     FinalAggCircuit,
                 >(
                     &final_agg_srs,
@@ -2657,7 +2986,7 @@ fn main() {
             println!("final proof size (bytes): {}", final_proof_bytes.len());
 
             let mut transcript =
-                CircuitTranscript::<KeccakTranscript>::init_from_bytes(&final_proof_bytes);
+                CircuitTranscript::<keccak::KeccakTranscript>::init_from_bytes(&final_proof_bytes);
             let committed_bases: &[&[midnight_curves::G1Projective]] =
                 &[&[midnight_curves::G1Projective::identity()]];
             let instances: &[&[&[F]]] = &[&[&final_public_inputs]];
@@ -2665,7 +2994,7 @@ fn main() {
             let dual_msm = prepare::<
                 F,
                 KZGCommitmentScheme<midnight_curves::Bls12>,
-                CircuitTranscript<KeccakTranscript>,
+                CircuitTranscript<keccak::KeccakTranscript>,
             >(&final_vk, committed_bases, instances, &mut transcript)
             .expect("Final aggregation verification preparation failed");
 

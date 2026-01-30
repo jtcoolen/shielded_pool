@@ -135,20 +135,6 @@ pub(crate) fn configure_agg_circuit(
 }
 
 #[derive(Clone, Debug)]
-pub struct AggPublicInputs {
-    pub state: AggState,
-    pub pi_acc: AggAccumulator,
-}
-impl AggPublicInputs {
-    pub fn to_fields(&self) -> Vec<F> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&self.state.to_fields());
-        out.extend(AssignedAccumulator::as_public_input(&self.pi_acc));
-        out
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct AggCircuit<const K: u32> {
     pub(crate) child_vk: VkData,
     pub(crate) child_vk_name: String,

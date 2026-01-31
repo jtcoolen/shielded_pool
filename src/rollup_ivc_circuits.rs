@@ -16,8 +16,8 @@ use midnight_circuits::{
         NB_POSEIDON_ADVICE_COLS, NB_POSEIDON_FIXED_COLS, PoseidonChip, PoseidonConfig,
     },
     instructions::{
-        AssertionInstructions, AssignmentInstructions, HashInstructions, PublicInputInstructions,
-        map::MapInstructions,
+        ArithInstructions, AssertionInstructions, AssignmentInstructions, HashInstructions,
+        PublicInputInstructions, map::MapInstructions,
     },
     map::cpu::MapMt,
     types::{AssignedForeignPoint, AssignedNative, ComposableChip, Instantiable},
@@ -103,7 +103,7 @@ pub const AGG_K: u32 = K_INTERNAL;
 
 /// Width of the aggregation state exposed by aggregation circuits.
 /// This includes the historic commitment-roots-set Merkle map root, used to bind membership checks.
-pub const AGG_STATE_WIDTH: usize = 6;
+pub const AGG_STATE_WIDTH: usize = 7;
 
 /// Width of client proof public items (canonical order).
 pub const CLIENT_ITEMS_WIDTH: usize = 7;
@@ -125,6 +125,7 @@ pub struct AggState {
     pub n_post: F,
     pub subroot: F,
     pub commitment_roots_set_root: F,
+    pub block_level: F,
 }
 
 impl AggState {
@@ -138,6 +139,7 @@ impl AggState {
             self.n_post,
             self.subroot,
             self.commitment_roots_set_root,
+            self.block_level,
         ]
     }
 }
@@ -289,6 +291,7 @@ pub struct AggStateFields<T> {
     pub n_post: T,
     pub subroot: T,
     pub commitment_roots_set_root: T,
+    pub block_level: T,
 }
 
 impl<T> AggStateFields<T> {
@@ -301,6 +304,7 @@ impl<T> AggStateFields<T> {
             self.n_post,
             self.subroot,
             self.commitment_roots_set_root,
+            self.block_level,
         ]
     }
 }
@@ -325,6 +329,7 @@ impl<T: Clone> AggStateFields<T> {
             self.n_post.clone(),
             self.subroot.clone(),
             self.commitment_roots_set_root.clone(),
+            self.block_level.clone(),
         ]
     }
 }
@@ -471,6 +476,7 @@ pub fn assign_state_array(
         n_post,
         subroot,
         commitment_roots_set_root,
+        block_level,
     ] = assign_values(ctx, layouter, fields)?;
 
     Ok(AggStateFields {
@@ -480,6 +486,7 @@ pub fn assign_state_array(
         n_post,
         subroot,
         commitment_roots_set_root,
+        block_level,
     })
 }
 
@@ -562,6 +569,7 @@ pub fn base_step(
     pre_commitment_roots_set_map: Value<Map>,
     left_items: Value<[F; CLIENT_ITEMS_WIDTH]>,
     right_items: Value<[F; CLIENT_ITEMS_WIDTH]>,
+    block_level: Value<F>,
 ) -> Result<
     (
         AggStateFields<AssignedNative<F>>,
@@ -572,6 +580,9 @@ pub fn base_step(
 > {
     let one = ctx.one(layouter)?;
     let zero = ctx.zero(layouter)?;
+
+    // Batch block number (bound into state; used for swap expiry checks).
+    let blk_assigned = ctx.scalar.assign(layouter, block_level)?;
 
     // Rollup sets.
     let (mut commit_map, c_pre) = init_map_with_root(ctx, layouter, pre_commitment_map)?;
@@ -620,6 +631,7 @@ pub fn base_step(
             n_post: null_map.succinct_repr(),
             subroot,
             commitment_roots_set_root,
+            block_level: blk_assigned,
         },
         left.as_vec(),  // <-- verify client proof with its 7 unhashed public inputs
         right.as_vec(), // <-- verify client proof with its 7 unhashed public inputs
@@ -663,6 +675,7 @@ pub fn fold_step(
         &left.commitment_roots_set_root,
         &right.commitment_roots_set_root,
     )?;
+    ctx.assert_eq(layouter, &left.block_level, &right.block_level)?;
 
     // Parent subroot.
     let subroot = ctx.hash2(layouter, &left.subroot, &right.subroot)?;
@@ -674,6 +687,7 @@ pub fn fold_step(
         n_post: right.n_post.clone(),
         subroot,
         commitment_roots_set_root: left.commitment_roots_set_root.clone(),
+        block_level: left.block_level.clone(),
     };
 
     Ok((
@@ -1057,6 +1071,9 @@ pub struct BaseStepCircuit<const K: u32> {
     pub pre_nullifier_map: Value<Map>,
 
     pub pre_commitment_roots_set_map: Value<Map>,
+    /// Batch L2 rollup block number for this aggregated subtree.
+    /// This is carried into `AggState.blk` and is later checked/advanced in the final wrap proof.
+    pub block_level: Value<F>,
 
     pub left_proof: Value<Vec<u8>>,
     pub right_proof: Value<Vec<u8>>,
@@ -1079,6 +1096,7 @@ impl<const K: u32> Circuit<F> for BaseStepCircuit<K> {
             pre_commitment_map: Value::unknown(),
             pre_nullifier_map: Value::unknown(),
             pre_commitment_roots_set_map: Value::unknown(),
+            block_level: Value::unknown(),
             left_proof: Value::unknown(),
             right_proof: Value::unknown(),
             left_pi_acc: Value::unknown(),
@@ -1116,6 +1134,7 @@ impl<const K: u32> Circuit<F> for BaseStepCircuit<K> {
                     self.pre_commitment_roots_set_map.clone(),
                     self.left_items.clone(),
                     self.right_items.clone(),
+                    self.block_level,
                 )
             },
         )
@@ -1232,6 +1251,11 @@ pub struct WrapStepCircuit {
 
     pub pre_commitment_roots_set_map: Value<Map>,
     pub post_commitment_roots_set_root: Value<F>,
+
+    /// Global block counter transition, enforced in-circuit:
+    /// `blk_post = blk_pre + 1` and `agg.blk = blk_post`.
+    pub blk_pre: Value<F>,
+    pub blk_post: Value<F>,
 }
 
 impl Circuit<F> for WrapStepCircuit {
@@ -1253,6 +1277,8 @@ impl Circuit<F> for WrapStepCircuit {
             agg_state: Value::unknown(),
             pre_commitment_roots_set_map: Value::unknown(),
             post_commitment_roots_set_root: Value::unknown(),
+            blk_pre: Value::unknown(),
+            blk_post: Value::unknown(),
         }
     }
 
@@ -1270,12 +1296,31 @@ impl Circuit<F> for WrapStepCircuit {
         // --------------------- Assign and expose final aggregation boundary (c/n) ---------------------
         let agg = assign_state_value(&ctx, &mut layouter, self.agg_state.clone())?;
 
+        let one = ctx.one(&mut layouter)?;
+
         // Public: c_pre, c_post, n_pre, n_post
         expose_native(&ctx, &mut layouter, agg.boundary4())?;
+
+        // --------------------- Block counter transition (public) ---------------------
+        let blk_pre = ctx.scalar.assign(&mut layouter, self.blk_pre.clone())?;
+        let blk_post = ctx.scalar.assign(&mut layouter, self.blk_post.clone())?;
+
+        // Enforce: blk_post = blk_pre + 1
+        let blk_pre_plus_one = ctx.scalar.add(&mut layouter, &blk_pre, &one)?;
+        ctx.assert_eq(&mut layouter, &blk_post, &blk_pre_plus_one)?;
+
+        // Enforce: agg.blk = blk_post
+        ctx.assert_eq(&mut layouter, &agg.block_level, &blk_post)?;
+
+        // Public: blk_pre, blk_post (so L1 can pin blk_pre to head and accept blk_post as new head)
+        expose_native(&ctx, &mut layouter, [blk_pre.clone(), blk_post.clone()])?;
 
         // --------------------- Assign children states and stitch checks ---------------------
         let left = assign_state_value(&ctx, &mut layouter, self.left_child_state.clone())?;
         let right = assign_state_value(&ctx, &mut layouter, self.right_child_state.clone())?;
+
+        ctx.assert_eq(&mut layouter, &left.block_level, &blk_post)?;
+        ctx.assert_eq(&mut layouter, &right.block_level, &blk_post)?;
 
         // left.c_post == right.c_pre, left.n_post == right.n_pre
         ctx.assert_eq(&mut layouter, &left.c_post, &right.c_pre)?;

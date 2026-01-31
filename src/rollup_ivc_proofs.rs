@@ -21,7 +21,7 @@ use midnight_proofs::{
 };
 
 use crate::{
-    rollup_ivc_circuits::{self, VkData},
+    rollup_ivc_circuits::{self, AGG_STATE_WIDTH, VkData},
     setup_ivc,
 };
 
@@ -201,19 +201,20 @@ fn collapse_acc(mut acc: Accumulator<S>) -> Accumulator<S> {
 
 fn agg_state_as_values(
     state: &rollup_ivc_circuits::AggState,
-) -> Result<[Value<F>; 6], AggregationError> {
+) -> Result<[Value<F>; AGG_STATE_WIDTH], AggregationError> {
     let fields = state.to_fields();
     match fields.as_slice() {
-        [a, b, c, d, e, f] => Ok([
+        [a, b, c, d, e, f, g] => Ok([
             Value::known(a.clone()),
             Value::known(b.clone()),
             Value::known(c.clone()),
             Value::known(d.clone()),
             Value::known(e.clone()),
             Value::known(f.clone()),
+            Value::known(g.clone()),
         ]),
         _ => Err(AggregationError::AggStateFieldCount {
-            expected: 6,
+            expected: rollup_ivc_circuits::AGG_STATE_WIDTH,
             got: fields.len(),
         }),
     }
@@ -344,6 +345,7 @@ fn plan_leaves<'a>(
     pre_nullifier_map: Map,
     roots_map: Map,
     roots_set_root: F,
+    block_level: F,
 ) -> Result<Vec<LeafPlan<'a>>, AggregationError> {
     let init = (
         Vec::with_capacity(client_proofs.len() / 2),
@@ -378,6 +380,7 @@ fn plan_leaves<'a>(
                 n_post: n2.succinct_repr(),
                 subroot: hash_pair(left.state, right.state),
                 commitment_roots_set_root: roots_set_root,
+                block_level,
             };
 
             plans.push(LeafPlan {
@@ -433,6 +436,7 @@ fn prove_leaf(
         pre_commitment_map: Value::known(plan.pre_commitment_map.clone_inner()),
         pre_nullifier_map: Value::known(plan.pre_nullifier_map.clone_inner()),
         pre_commitment_roots_set_map: Value::known(plan.pre_roots_map.clone_inner()),
+        block_level: Value::known(plan.expected_state.block_level),
 
         left_proof: Value::known(left.proof.clone()),
         right_proof: Value::known(right.proof.clone()),
@@ -535,6 +539,10 @@ fn prove_parent(
         left.state.commitment_roots_set_root == right.state.commitment_roots_set_root,
         AggregationError::RootsSetRootMismatch,
     )?;
+    ensure(
+        left.state.block_level == right.state.block_level,
+        AggregationError::RootsSetRootMismatch, // reuse (or add a dedicated error if you prefer)
+    )?;
 
     let child_keys = setup.agg_store.get(child_level);
     let parent_keys = setup.agg_store.get(parent_level);
@@ -550,6 +558,7 @@ fn prove_parent(
         n_post: right.state.n_post,
         subroot: hash_pair(left.state.subroot, right.state.subroot),
         commitment_roots_set_root: left.state.commitment_roots_set_root,
+        block_level: left.state.block_level,
     };
 
     let circuit = rollup_ivc_circuits::InternalAggCircuit {
@@ -677,6 +686,7 @@ fn finalize(
         n_post: right_top.state.n_post,
         subroot: hash_pair(left_top.state.subroot, right_top.state.subroot),
         commitment_roots_set_root: left_top.state.commitment_roots_set_root,
+        block_level: left_top.state.block_level,
     };
 
     let expected_root =
@@ -717,6 +727,7 @@ pub fn try_aggregate_client_proofs_cached(
     pre_commitment_map: Map,
     pre_nullifier_map: Map,
     pre_commitment_roots_map: Map,
+    batch_block_level: F,
 ) -> Result<AggregationResult, AggregationError> {
     validate_inputs(setup, client_proofs)?;
 
@@ -730,6 +741,7 @@ pub fn try_aggregate_client_proofs_cached(
         pre_nullifier_map,
         pre_commitment_roots_map,
         roots_set_root,
+        batch_block_level,
     )?;
 
     // 2) prove leaves (parallel)
@@ -754,6 +766,7 @@ pub fn aggregate_client_proofs_cached(
     pre_commitment_map: Map,
     pre_nullifier_map: Map,
     pre_commitment_roots_map: Map,
+    batch_block_level: F,
 ) -> AggregationResult {
     try_aggregate_client_proofs_cached(
         setup,
@@ -763,6 +776,7 @@ pub fn aggregate_client_proofs_cached(
         pre_commitment_map,
         pre_nullifier_map,
         pre_commitment_roots_map,
+        batch_block_level,
     )
     .expect("aggregation failed") // TODO remove expect
 }

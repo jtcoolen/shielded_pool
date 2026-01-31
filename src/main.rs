@@ -241,6 +241,8 @@ struct ChainState {
     commitment_roots_set: CommitmentMap,
     commitment_root_history: Vec<F>,
     commitment_map_history: Vec<CommitmentMap>,
+
+    blk_head: u64,
 }
 
 struct BatchPreState {
@@ -337,6 +339,7 @@ fn init_chain_state(
         commitment_roots_set,
         commitment_map,
         nullifier_map,
+        blk_head: 0,
     }
 }
 
@@ -624,6 +627,7 @@ fn demonstrate_replay_protection(
     println!("  c_post = {:?}", agg_state.c_post);
     println!("  n_pre  = {:?}", agg_state.n_pre);
     println!("  n_post = {:?}", agg_state.n_post);
+    println!("  blk    = {:?}", agg_state.block_level);
 
     println!(
         "  roots_set has c_pre?  {:?}",
@@ -648,6 +652,7 @@ fn demonstrate_replay_protection(
             commitment_map,
             nullifier_map,
             roots_set_map,
+            F::ZERO,
         );
     }));
 
@@ -705,6 +710,8 @@ fn run() -> Result<(), AppError> {
         agg_state: Value::unknown(),
         pre_commitment_roots_set_map: Value::unknown(),
         post_commitment_roots_set_root: Value::unknown(),
+        blk_post: Value::unknown(),
+        blk_pre: Value::unknown(),
     };
 
     let final_vk = keygen_vk_with_k(&final_agg_srs, &default_final_circuit, AGG_K)
@@ -715,6 +722,13 @@ fn run() -> Result<(), AppError> {
     // --- Initialize randomness and chain state ---
     let mut rng = ChaCha8Rng::from_entropy();
     let mut chain = init_chain_state(&mut rng, NUM_ACCOUNTS, NUM_SEED_DEPOSITS_PER_ACCOUNT);
+
+    // Global L2 block counter (demo "on-chain head").
+    //
+    // We will prove in the final wrap proof that:
+    //   blk_post = blk_pre + 1
+    // and bind the batch to blk_post.
+    let mut blk_head: u64 = chain.blk_head;
 
     println!(
         "Initial commitment root: {:?}",
@@ -731,6 +745,13 @@ fn run() -> Result<(), AppError> {
 
     while total_transfers_done < NUM_TRANSFERS {
         let pre = snapshot_batch_pre_state(&chain);
+
+        // Compute this batch's block transition.
+        let blk_pre_u64 = blk_head;
+        let blk_post_u64 = blk_head + 1;
+        let blk_pre_f = F::from(blk_pre_u64);
+        let blk_post_f = F::from(blk_post_u64);
+        let batch_blk = blk_post_f; // subtree is bound to blk_post per spec
 
         // Shadow state for the batch.
         let mut shadow_accounts = chain.accounts.clone();
@@ -830,6 +851,7 @@ fn run() -> Result<(), AppError> {
             pre.pre_commitment_map.clone(),
             pre.pre_nullifier_map.clone(),
             pre.pre_roots_set_map.clone(),
+            batch_blk,
         );
         println!(
             "Batch {} aggregated (up to top pair) in {:?}",
@@ -880,6 +902,8 @@ fn run() -> Result<(), AppError> {
                 agg_state: Value::known(agg_result.root_state),
                 pre_commitment_roots_set_map: Value::known(pre.pre_roots_set_map.clone()),
                 post_commitment_roots_set_root: Value::known(post_roots_set_root),
+                blk_pre: Value::known(blk_pre_f),
+                blk_post: Value::known(blk_post_f),
             };
 
             let mut final_public_inputs: Vec<F> = vec![
@@ -887,7 +911,12 @@ fn run() -> Result<(), AppError> {
                 agg_result.root_state.c_post,
                 agg_result.root_state.n_pre,
                 agg_result.root_state.n_post,
+                // block counter transition (public) TODO we can expose only one block level
+                blk_pre_f,
+                blk_post_f,
+                // batch subroot (public)
                 agg_result.root_state.subroot,
+                // historic roots set transition (public)
                 pre_roots_set_root,
                 post_roots_set_root,
             ];
@@ -947,6 +976,7 @@ fn run() -> Result<(), AppError> {
                     Commitment-set transition: {:?} -> {:?}\n\
                     Nullifier-set transition: {:?} -> {:?}\n\
                     Historic-roots-set transition: {:?} -> {:?}\n\
+                    Block counter transition: {} -> {}\n\
                     Final accumulator PI length: {} field elements",
                 batch_idx,
                 agg_result.root_state.subroot,
@@ -956,6 +986,8 @@ fn run() -> Result<(), AppError> {
                 agg_result.root_state.n_post,
                 pre_roots_set_root,
                 post_roots_set_root,
+                blk_pre_u64,
+                blk_post_u64,
                 final_acc_pi.len()
             );
         }
@@ -972,6 +1004,10 @@ fn run() -> Result<(), AppError> {
         chain
             .commitment_map_history
             .push(chain.commitment_map.clone());
+
+        // Advance the global head block number after accepting the final wrap proof.
+        blk_head = blk_post_u64;
+        chain.blk_head = blk_head;
 
         println!(
             "After batch {} committed commitment root: {:?}",
@@ -1241,6 +1277,7 @@ mod tests {
             pre.pre_commitment_map.clone(),
             pre.pre_nullifier_map.clone(),
             pre.pre_roots_set_map.clone(),
+            F::ZERO,
         );
 
         Ok((
@@ -1302,6 +1339,7 @@ mod tests {
                 post_cmap.clone(),
                 post_nmap.clone(),
                 pre.pre_roots_set_map.clone(),
+                F::ZERO,
             );
         }));
 
@@ -1333,6 +1371,7 @@ mod tests {
             wrong_pre_cmap.clone(),
             pre.pre_nullifier_map.clone(),
             pre.pre_roots_set_map.clone(),
+            F::ZERO,
         );
 
         // The aggregated batch starts from the wrong head (this is what the node must reject).
@@ -1399,6 +1438,7 @@ mod tests {
                 pre.pre_commitment_map.clone(),
                 pre.pre_nullifier_map.clone(),
                 pre.pre_roots_set_map.clone(),
+                F::ZERO,
             );
         }));
 

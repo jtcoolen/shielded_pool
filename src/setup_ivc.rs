@@ -526,6 +526,7 @@ fn generate_leaf_keys(
         pre_commitment_map: Value::unknown(),
         pre_nullifier_map: Value::unknown(),
         pre_commitment_roots_set_map: Value::unknown(),
+        block_level: Value::unknown(),
         left_proof: Value::unknown(),
         right_proof: Value::unknown(),
         left_pi_acc: Value::unknown(),

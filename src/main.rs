@@ -104,11 +104,12 @@ fn host_hash2(a: F, b: F) -> F {
 }
 
 /// Poseidon commitment to swap terms:
-///   (tag, asset_id, pk_a.x, pk_a.y, pk_b.x, pk_b.y, amt_a_to_b, amt_b_to_a)
+///   (tag, asset_id_a, asset_id_b, pk_a.x, pk_a.y, pk_b.x, pk_b.y, amt_a_to_b, amt_b_to_a)
 ///
 /// Must match the in-circuit hashing for `sterms_expected`.
 fn host_swap_terms_hash(
-    asset_id: F,
+    asset_id_a: F,
+    asset_id_b: F,
     pk_a: &JubjubSubgroup,
     pk_b: &JubjubSubgroup,
     amt_a_to_b: u128,
@@ -121,7 +122,8 @@ fn host_swap_terms_hash(
 
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[
         F::from(transfer_circuit::SWAP_TERMS_TAG),
-        asset_id,
+        asset_id_a,
+        asset_id_b,
         a_xy[0],
         a_xy[1],
         b_xy[0],
@@ -159,7 +161,7 @@ fn choose_sender_idx(
     let viable: Vec<usize> = accounts
         .iter()
         .enumerate()
-        .filter(|(_, a)| spendable_note_indices(a, latest_confirmed_root_idx).len() >= 2)
+        .filter(|(_, a)| has_two_spendable_same_asset(a, latest_confirmed_root_idx))
         .map(|(i, _)| i)
         .collect();
 
@@ -299,8 +301,9 @@ fn scalar_to_field(alpha: JubjubScalar) -> Result<F, AppError> {
 
 #[derive(Clone)]
 struct ChainState {
-    /// Single global asset id used for all notes in this demo.
-    asset_id: F,
+    /// Demo: multiple assets exist simultaneously; each note carries its own asset id.
+    /// (The spend circuit still requires a single asset *per transaction leg*.)
+    asset_ids: Vec<F>,
 
     accounts: Vec<transfer_circuit::Account>,
     commitment_map: CommitmentMap,
@@ -350,11 +353,12 @@ fn seed_deposits(
     rng: &mut ChaCha8Rng,
     accounts: &mut [transfer_circuit::Account],
     commitment_map: &mut CommitmentMap,
-    asset_id: F,
+    asset_ids: &[F],
     deposits_per_account: usize,
 ) {
     for acc in accounts.iter_mut() {
         for _ in 0..deposits_per_account {
+            let asset_id = asset_ids[rng.gen_range(0..asset_ids.len())];
             let utxo = transfer_circuit::Utxo {
                 asset_id,
                 amount: random_amount(&mut *rng),
@@ -379,7 +383,13 @@ fn init_chain_state(
     num_accounts: usize,
     deposits_per_account: usize,
 ) -> ChainState {
-    let asset_id = F::random(&mut *rng);
+    // Demo: create two distinct assets.
+    let asset_a = F::random(&mut *rng);
+    let mut asset_b = F::random(&mut *rng);
+    while asset_b == asset_a {
+        asset_b = F::random(&mut *rng);
+    }
+    let asset_ids = vec![asset_a, asset_b];
 
     let mut accounts = init_accounts(num_accounts);
     let mut commitment_map = CommitmentMap::new(&F::ZERO);
@@ -389,7 +399,7 @@ fn init_chain_state(
         &mut *rng,
         &mut accounts,
         &mut commitment_map,
-        asset_id,
+        &asset_ids,
         deposits_per_account,
     );
 
@@ -399,7 +409,7 @@ fn init_chain_state(
     commitment_roots_set.insert(&genesis_root, &F::ONE);
 
     ChainState {
-        asset_id,
+        asset_ids,
         accounts,
         commitment_map_history: vec![commitment_map.clone()],
         commitment_root_history: vec![genesis_root],
@@ -491,14 +501,18 @@ fn plan_transaction_for_sender(
     recipient1_idx: usize,
     recipient2_idx: usize,
 ) -> Option<PlannedTx> {
-    let spendable = spendable_note_indices(&shadow_accounts[sender_idx], latest_confirmed_root_idx);
-    if spendable.len() < 2 {
-        return None;
-    }
-    let (old1_idx, old2_idx) = choose_two_distinct(rng, &spendable);
+    let (old1_idx, old2_idx) = choose_two_spendable_same_asset(
+        rng,
+        &shadow_accounts[sender_idx],
+        latest_confirmed_root_idx,
+    )?;
 
     let old1 = &shadow_accounts[sender_idx].wallet[old1_idx];
     let old2 = &shadow_accounts[sender_idx].wallet[old2_idx];
+    // Circuit requires old1.asset_id == old2.asset_id; selection above guarantees it, but keep invariant explicit.
+    if old1.utxo.asset_id != old2.utxo.asset_id {
+        return None;
+    }
     let min_root_idx_for_inputs = old1.confirmed_at_root_idx.max(old2.confirmed_at_root_idx);
 
     let root_idx_for_proof =
@@ -555,6 +569,67 @@ fn plan_transfer_pair(
     Ok((left, right))
 }
 
+/// Returns true iff an account has at least two spendable notes with the SAME asset id.
+fn has_two_spendable_same_asset(
+    account: &transfer_circuit::Account,
+    latest_confirmed_root_idx: usize,
+) -> bool {
+    let spendable = spendable_note_indices(account, latest_confirmed_root_idx);
+    if spendable.len() < 2 {
+        return false;
+    }
+    for (i, &idx_i) in spendable.iter().enumerate() {
+        let asset = account.wallet[idx_i].utxo.asset_id;
+        for &idx_j in spendable.iter().skip(i + 1) {
+            if account.wallet[idx_j].utxo.asset_id == asset {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Choose two distinct spendable notes with the same asset id. Returns (old1_idx, old2_idx).
+fn choose_two_spendable_same_asset(
+    rng: &mut ChaCha8Rng,
+    account: &transfer_circuit::Account,
+    latest_confirmed_root_idx: usize,
+) -> Option<(usize, usize)> {
+    let spendable = spendable_note_indices(account, latest_confirmed_root_idx);
+    if spendable.len() < 2 {
+        return None;
+    }
+
+    // Randomized attempts first.
+    for _ in 0..16 {
+        let a = spendable[rng.gen_range(0..spendable.len())];
+        let asset = account.wallet[a].utxo.asset_id;
+        let same: Vec<usize> = spendable
+            .iter()
+            .copied()
+            .filter(|i| account.wallet[*i].utxo.asset_id == asset)
+            .collect();
+        if same.len() >= 2 {
+            return Some(choose_two_distinct(rng, &same));
+        }
+    }
+
+    // Deterministic fallback.
+    for &a in &spendable {
+        let asset = account.wallet[a].utxo.asset_id;
+        let same: Vec<usize> = spendable
+            .iter()
+            .copied()
+            .filter(|i| account.wallet[*i].utxo.asset_id == asset)
+            .collect();
+        if same.len() >= 2 {
+            return Some(choose_two_distinct(rng, &same));
+        }
+    }
+
+    None
+}
+
 fn choose_sender_idx_excluding(
     rng: &mut ChaCha8Rng,
     accounts: &[transfer_circuit::Account],
@@ -565,7 +640,7 @@ fn choose_sender_idx_excluding(
         .iter()
         .enumerate()
         .filter(|(i, a)| {
-            *i != exclude && spendable_note_indices(a, latest_confirmed_root_idx).len() >= 2
+            *i != exclude && has_two_spendable_same_asset(a, latest_confirmed_root_idx)
         })
         .map(|(i, _)| i)
         .collect();
@@ -591,6 +666,8 @@ fn choose_swap_vto(rng: &mut ChaCha8Rng, blk_post_u64: u64) -> (u64, F) {
 struct SwapAgreement {
     a_idx: usize,
     b_idx: usize,
+    asset_id_a: F,
+    asset_id_b: F,
     pk_a: JubjubSubgroup,
     pk_b: JubjubSubgroup,
     amt_a_to_b: u128,
@@ -604,7 +681,8 @@ fn sample_bounded_amount(rng: &mut ChaCha8Rng, max: u128) -> u128 {
 
 fn build_swap_agreement(
     rng: &mut ChaCha8Rng,
-    asset_id: F,
+    asset_id_a: F,
+    asset_id_b: F,
     accounts: &[transfer_circuit::Account],
     a_idx: usize,
     b_idx: usize,
@@ -625,12 +703,15 @@ fn build_swap_agreement(
     for _ in 0..MAX_STERMS_RESAMPLE {
         let amt_a_to_b = sample_bounded_amount(rng, total_a);
         let amt_b_to_a = sample_bounded_amount(rng, total_b);
-        let sterms = host_swap_terms_hash(asset_id, &pk_a, &pk_b, amt_a_to_b, amt_b_to_a);
+        let sterms =
+            host_swap_terms_hash(asset_id_a, asset_id_b, &pk_a, &pk_b, amt_a_to_b, amt_b_to_a);
 
         if sterms != F::ZERO || (total_a == 0 && total_b == 0) {
             return Ok(SwapAgreement {
                 a_idx,
                 b_idx,
+                asset_id_a,
+                asset_id_b,
                 pk_a,
                 pk_b,
                 amt_a_to_b,
@@ -647,6 +728,8 @@ fn build_swap_agreement(
 
 fn swap_terms_witness(ag: &SwapAgreement) -> SwapTermsWitness {
     SwapTermsWitness {
+        asset_id_a: ag.asset_id_a,
+        asset_id_b: ag.asset_id_b,
         pk_a: ag.pk_a.clone(),
         pk_b: ag.pk_b.clone(),
         amt_a_to_b: ag.amt_a_to_b,
@@ -697,7 +780,6 @@ fn plan_swap_pair(
     rng: &mut ChaCha8Rng,
     accounts: &[transfer_circuit::Account],
     latest_confirmed_root_idx: usize,
-    asset_id: F,
     blk_post_u64: u64,
 ) -> Option<(PlannedTx, PlannedTx, TxIntent, TxIntent)> {
     // Pick distinct senders for a clean 2-party swap.
@@ -721,9 +803,19 @@ fn plan_swap_pair(
         /*recipient1=*/ a,
         /*recipient2=*/ b,
     )?;
+    // Determine the (per-leg) asset ids from the selected inputs (same-asset per leg is guaranteed by planning).
+    let asset_id_a = accounts[a].wallet[plan_a.old1_idx].utxo.asset_id;
+    let asset_id_b = accounts[b].wallet[plan_b.old1_idx].utxo.asset_id;
 
-    let ag = build_swap_agreement(rng, asset_id, accounts, a, b, &plan_a, &plan_b).ok()?;
+    // Prefer true multi-asset swaps; if both legs would spend the same asset, let the caller fallback.
+    if asset_id_a == asset_id_b {
+        return None;
+    }
 
+    let ag = build_swap_agreement(
+        rng, asset_id_a, asset_id_b, accounts, a, b, &plan_a, &plan_b,
+    )
+    .ok()?;
     let intent_a = swap_leg_intent_for_a_to_b(rng, blk_post_u64, &ag);
     let intent_b = swap_leg_intent_for_b_to_a(rng, blk_post_u64, &ag);
 
@@ -744,17 +836,12 @@ fn decide_pair_plan(
     do_swap: bool,
     accounts: &[transfer_circuit::Account],
     latest_confirmed_root_idx: usize,
-    asset_id: F,
     blk_post_u64: u64,
 ) -> Result<PairPlan, AppError> {
     if do_swap {
-        if let Some((pl, pr, il, ir)) = plan_swap_pair(
-            rng,
-            accounts,
-            latest_confirmed_root_idx,
-            asset_id,
-            blk_post_u64,
-        ) {
+        if let Some((pl, pr, il, ir)) =
+            plan_swap_pair(rng, accounts, latest_confirmed_root_idx, blk_post_u64)
+        {
             return Ok(PairPlan {
                 left: pl,
                 right: pr,
@@ -900,7 +987,6 @@ impl TxEffects {
 
 fn build_transaction(
     rng: &mut ChaCha8Rng,
-    asset_id: F,
     shadow_accounts: &[transfer_circuit::Account],
     commitment_map_history: &[CommitmentMap],
     commitment_root_history: &[F],
@@ -925,6 +1011,13 @@ fn build_transaction(
     let sender = shadow_accounts[plan.sender_idx].clone();
     let old1 = shadow_accounts[plan.sender_idx].wallet[plan.old1_idx].clone();
     let old2 = shadow_accounts[plan.sender_idx].wallet[plan.old2_idx].clone();
+    // Per-leg constraint: both inputs (and therefore both outputs) share the same asset id.
+    let asset_id = old1.utxo.asset_id;
+    if old2.utxo.asset_id != asset_id {
+        return Err(AppError::ReplayGuard(
+            "selected inputs have different asset ids".to_string(),
+        ));
+    }
 
     // Validate chosen proof root is within admissible range for the shadow state.
     if plan.root_idx_for_proof > latest_confirmed_root_idx {
@@ -1105,7 +1198,6 @@ fn build_prove_apply_one(
     srs: &ParamsKZG<E>,
     pk: &MidnightPK<transfer_circuit::Spend2Output2>,
     relation: &transfer_circuit::Spend2Output2,
-    asset_id: F,
     plan: &PlannedTx,
     intent: TxIntent,
     // Shadow state (in-batch)
@@ -1122,7 +1214,6 @@ fn build_prove_apply_one(
 ) -> Result<rollup_ivc_proofs::ClientProof, AppError> {
     let (built, _root_before) = build_transaction(
         rng,
-        asset_id,
         shadow_accounts,
         commitment_map_history,
         commitment_root_history,
@@ -1317,7 +1408,6 @@ fn run() -> Result<(), AppError> {
                 do_swap,
                 &shadow_accounts,
                 pre.latest_confirmed_root_idx,
-                chain.asset_id,
                 blk_post_u64,
             )?;
 
@@ -1334,7 +1424,6 @@ fn run() -> Result<(), AppError> {
                     &srs,
                     &pk,
                     &relation,
-                    chain.asset_id,
                     &pair.left,
                     pair.left_intent,
                     &mut shadow_accounts,
@@ -1359,7 +1448,6 @@ fn run() -> Result<(), AppError> {
                     &srs,
                     &pk,
                     &relation,
-                    chain.asset_id,
                     &pair.right,
                     pair.right_intent,
                     &mut shadow_accounts,
@@ -1783,7 +1871,6 @@ mod tests {
             // Build tx ONCE; proof must match effects
             let (built, _root_before) = build_transaction(
                 &mut rng,
-                chain.asset_id,
                 &shadow_accounts,
                 &chain.commitment_map_history,
                 &chain.commitment_root_history,
@@ -1970,7 +2057,6 @@ mod tests {
         for tx_idx in 0..batch_size {
             let (built, _) = build_transaction(
                 &mut rng,
-                chain.asset_id,
                 &shadow_accounts,
                 &chain.commitment_map_history,
                 &chain.commitment_root_history,

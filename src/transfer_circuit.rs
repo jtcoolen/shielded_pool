@@ -31,6 +31,8 @@ pub(crate) const AMOUNT_GEN_BITS: u32 = 120;
 
 pub(crate) const SWAP_TERMS_TAG: u64 = 0x0003;
 
+const VTO_BITS: u32 = 64;
+
 /// Public inputs (unhashed): these are constrained individually as public inputs, in this exact order.
 #[derive(Clone, Copy, Debug)]
 pub struct Spend2Output2PublicInputs {
@@ -73,6 +75,10 @@ pub struct Utxo {
 
 #[derive(Clone, Debug)]
 pub struct SwapTermsWitness {
+    /// Asset id spent by pk_a (A -> B leg).
+    pub asset_id_a: F,
+    /// Asset id spent by pk_b (B -> A leg).
+    pub asset_id_b: F,
     pub pk_a: JubjubSubgroup,
     pub pk_b: JubjubSubgroup,
     pub amt_a_to_b: u128,
@@ -82,6 +88,8 @@ pub struct SwapTermsWitness {
 impl Default for SwapTermsWitness {
     fn default() -> Self {
         Self {
+            asset_id_a: F::ZERO,
+            asset_id_b: F::ZERO,
             pk_a: JubjubSubgroup::identity(),
             pk_b: JubjubSubgroup::identity(),
             amt_a_to_b: 0,
@@ -199,6 +207,10 @@ impl Relation for Spend2Output2 {
         let gates = swap_gates(std_lib, layouter, &swap_pi.sterms)?;
         // Make "transfer" mode (no swap) robust: opaque swap PIs must be zero.
         enforce_transfer_mode_defaults(std_lib, layouter, &gates, &swap_pi)?;
+        // in swap mode, make swap legs "self-validating" before rollup:
+        // - vto must be a u64
+        // - swapcm must bind (sterms, vto) as H2(sterms, vto)
+        enforce_swap_mode_public_inputs(std_lib, layouter, &gates, &swap_pi)?;
 
         // Swap terms witness is still provided even for transfers; swap constraints are gated.
         let terms = assign_swap_terms(std_lib, layouter, w.terms)?;
@@ -318,6 +330,8 @@ struct SwapGates {
 
 #[derive(Clone)]
 struct AssignedSwapTerms {
+    asset_id_a: AssignedNative<F>,
+    asset_id_b: AssignedNative<F>,
     pk_a: AssignedPointXY,
     pk_b: AssignedPointXY,
     amt_a_to_b: AssignedNative<F>,
@@ -534,11 +548,38 @@ fn enforce_transfer_mode_defaults<L: Layouter<F>>(
     Ok(())
 }
 
+/// Swap-mode self-validation:
+/// If `sterms != 0` then require:
+///   - vto is a u64 (fits in 64 bits)
+///   - swapcm == H2(sterms, vto)  (Poseidon over [sterms, vto])
+fn enforce_swap_mode_public_inputs<L: Layouter<F>>(
+    std_lib: &ZkStdLib,
+    layouter: &mut L,
+    gates: &SwapGates,
+    swap: &SwapPublicInputsAssigned,
+) -> Result<(), Error> {
+    // Range-check vto into 64 bits (u64). This is cheap and makes vto well-typed.
+    // We don't need the bits; we only need the constraints.
+    let _vto_bits =
+        std_lib.assigned_to_le_bits(layouter, &swap.vto, Some(VTO_BITS as usize), true)?;
+
+    // swapcm_expected := H2(sterms, vto)
+    // (Assumes the rollup leaf uses the same H2 definition.)
+    let swapcm_expected = std_lib.poseidon(layouter, &[swap.sterms.clone(), swap.vto.clone()])?;
+
+    // Enforce only in swap mode (sterms != 0).
+    assert_eq_when_swap(std_lib, layouter, gates, &swap.swapcm, &swapcm_expected)?;
+    Ok(())
+}
+
 fn assign_swap_terms<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
     terms_val: Value<SwapTermsWitness>,
 ) -> Result<AssignedSwapTerms, Error> {
+    let asset_id_a = std_lib.assign(layouter, terms_val.clone().map(|t| t.asset_id_a))?;
+    let asset_id_b = std_lib.assign(layouter, terms_val.clone().map(|t| t.asset_id_b))?;
+
     let pk_a = assign_point_xy_from_value(std_lib, layouter, terms_val.clone().map(|t| t.pk_a))?;
     let pk_b = assign_point_xy_from_value(std_lib, layouter, terms_val.clone().map(|t| t.pk_b))?;
 
@@ -549,6 +590,8 @@ fn assign_swap_terms<L: Layouter<F>>(
     let amt_b_to_a = std_lib.assign(layouter, terms_val.map(|t| F::from_u128(t.amt_b_to_a)))?;
 
     Ok(AssignedSwapTerms {
+        asset_id_a,
+        asset_id_b,
         pk_a,
         pk_b,
         amt_a_to_b,
@@ -574,8 +617,8 @@ fn enforce_swap_mode<L: Layouter<F>>(
     let pk_a_ne_pk_b = std_lib.not(layouter, &pk_a_eq_pk_b)?;
     assert_when_swap(std_lib, layouter, gates, pk_a_ne_pk_b)?;
 
-    // If swap: sterms must bind to terms + asset id.
-    let sterms_expected = compute_sterms_expected(std_lib, layouter, asset_id, terms)?;
+    // If swap: sterms must bind to full terms (BOTH assets + both pk + both amounts).
+    let sterms_expected = compute_sterms_expected(std_lib, layouter, terms)?;
     assert_eq_when_swap(std_lib, layouter, gates, sterms, &sterms_expected)?;
 
     // If swap: sender must be pk_a or pk_b.
@@ -603,6 +646,10 @@ fn enforce_swap_mode<L: Layouter<F>>(
     let exp_pk1x = std_lib.select(layouter, &sender_is_a, &terms.pk_b.x, &terms.pk_a.x)?;
     let exp_pk1y = std_lib.select(layouter, &sender_is_a, &terms.pk_b.y, &terms.pk_a.y)?;
     let exp_amt1 = std_lib.select(layouter, &sender_is_a, &terms.amt_a_to_b, &terms.amt_b_to_a)?;
+    // Multi-asset swap: this leg's spent asset id must match the sender's side in the terms.
+    let exp_asset_id =
+        std_lib.select(layouter, &sender_is_a, &terms.asset_id_a, &terms.asset_id_b)?;
+    assert_eq_when_swap(std_lib, layouter, gates, asset_id, &exp_asset_id)?;
 
     // If swap => out1 recipient + amount match expectation
     assert_eq_when_swap(std_lib, layouter, gates, &out1_pk.x, &exp_pk1x)?;
@@ -619,7 +666,6 @@ fn enforce_swap_mode<L: Layouter<F>>(
 fn compute_sterms_expected<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
-    asset_id: &AssignedNative<F>,
     terms: &AssignedSwapTerms,
 ) -> Result<AssignedNative<F>, Error> {
     let tag = std_lib.assign_fixed(layouter, F::from(SWAP_TERMS_TAG))?;
@@ -627,7 +673,8 @@ fn compute_sterms_expected<L: Layouter<F>>(
         layouter,
         &[
             tag,
-            asset_id.clone(),
+            terms.asset_id_a.clone(),
+            terms.asset_id_b.clone(),
             terms.pk_a.x.clone(),
             terms.pk_a.y.clone(),
             terms.pk_b.x.clone(),
@@ -811,7 +858,8 @@ pub(crate) fn host_nullify(commit: F, pk_x: F, pk_y: F) -> F {
 }
 
 pub(crate) fn host_swap_terms(
-    asset_id: F,
+    asset_id_a: F,
+    asset_id_b: F,
     pk_ax: F,
     pk_ay: F,
     pk_bx: F,
@@ -822,7 +870,14 @@ pub(crate) fn host_swap_terms(
     let tag = F::from(SWAP_TERMS_TAG);
     let a2b = F::from_u128(amt_a_to_b);
     let b2a = F::from_u128(amt_b_to_a);
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[tag, asset_id, pk_ax, pk_ay, pk_bx, pk_by, a2b, b2a])
+    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[
+        tag, asset_id_a, asset_id_b, pk_ax, pk_ay, pk_bx, pk_by, a2b, b2a,
+    ])
+}
+
+pub(crate) fn host_swapcm(sterms: F, vto: F) -> F {
+    // H2(sterms, vto)
+    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[sterms, vto])
 }
 
 // -----------------------------
@@ -857,6 +912,7 @@ mod tests {
     use proptest::prelude::*;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
+    use std::ops::Add;
     use std::ops::Not;
     use std::sync::OnceLock;
 
@@ -1221,11 +1277,25 @@ mod tests {
         let nf2 = host_nullify(old_c2, pk_sx, pk_sy);
 
         // Compute sterms (must be non-zero to trigger swap mode).
-        let mut sterms = host_swap_terms(asset_id, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 0);
+        // Multi-asset swap terms bind BOTH assets; for this single-proof unit test we can pick an arbitrary counter-asset.
+        let mut asset_id_b = F::random(&mut rng);
+        while asset_id_b == asset_id {
+            asset_id_b = F::random(&mut rng);
+        }
+        let mut sterms = host_swap_terms(
+            asset_id, asset_id_b, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 0,
+        );
         if sterms == F::ZERO {
             // extremely unlikely; perturb by changing the "other direction" amount
-            sterms = host_swap_terms(asset_id, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 1);
+            sterms = host_swap_terms(
+                asset_id, asset_id_b, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 1,
+            );
         }
+
+        // vto must be a u64; swapcm must be H2(sterms, vto)
+        let vto_u64: u64 = rng.r#gen::<u64>();
+        let vto = F::from(vto_u64);
+        let swapcm = host_swapcm(sterms, vto);
 
         let instance = Spend2Output2PublicInputs {
             root,
@@ -1236,12 +1306,13 @@ mod tests {
             nf1,
             nf2,
             sterms,
-            // opaque fields, not constrained beyond transfer-mode zeroing
-            swapcm: F::random(&mut rng),
-            vto: F::random(&mut rng),
+            swapcm,
+            vto,
         };
 
         let terms = SwapTermsWitness {
+            asset_id_a: asset_id,
+            asset_id_b,
             pk_a: pk_sender,
             pk_b,
             amt_a_to_b,
@@ -1434,6 +1505,15 @@ mod tests {
         let seed = 1012;
         let (mut instance, witness) = make_valid_swap_case(seed);
         instance.sterms = F::from(123456u64); // mismatched commitment to terms
+        assert!(rejects(&instance, witness, seed));
+    }
+
+    #[test]
+    fn negative_swap_mode_bad_swapcm_is_rejected() {
+        // if sterms != 0 then swapcm must equal H2(sterms, vto)
+        let seed = 1013;
+        let (mut instance, witness) = make_valid_swap_case(seed);
+        instance.swapcm = instance.swapcm.add(&F::ONE);
         assert!(rejects(&instance, witness, seed));
     }
 }

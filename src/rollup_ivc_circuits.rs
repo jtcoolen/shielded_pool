@@ -109,6 +109,7 @@ pub const AGG_STATE_WIDTH: usize = 7;
 /// Width of client proof public items (canonical order).
 /// Canonical order:
 /// `[root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2, sterms, swapcm, vto]`.
+/// NOTE (multi-asset swaps): `sterms` now binds BOTH legs' asset ids (asset_a, asset_b) in addition to (pk_a, pk_b, amounts).
 pub const CLIENT_ITEMS_WIDTH: usize = 10;
 
 ////////////////////////////////////////////////////////////////////////////////

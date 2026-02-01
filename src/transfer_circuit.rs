@@ -7,12 +7,13 @@ use midnight_circuits::{
     ecc::native::AssignedScalarOfNativeCurve,
     hash::poseidon::PoseidonChip,
     instructions::{
-        AssertionInstructions, AssignmentInstructions, ConversionInstructions,
-        DecompositionInstructions, EccInstructions, PublicInputInstructions, ZeroInstructions,
-        hash::HashCPU, map::MapInstructions,
+        ArithInstructions, AssertionInstructions, AssignmentInstructions, BinaryInstructions,
+        ControlFlowInstructions, ConversionInstructions, DecompositionInstructions,
+        EccInstructions, PublicInputInstructions, ZeroInstructions, hash::HashCPU,
+        map::MapInstructions,
     },
     map::cpu::MapMt,
-    types::{AssignedNative, AssignedNativePoint},
+    types::{AssignedBit, AssignedNative, AssignedNativePoint},
 };
 use midnight_curves::{Fr as JubjubScalar, JubjubExtended as Jubjub, JubjubSubgroup};
 use midnight_proofs::circuit::{Layouter, Value};
@@ -38,6 +39,10 @@ pub struct Spend2Output2PublicInputs {
     pub new_c2: F,
     pub nf1: F,
     pub nf2: F,
+    // --- swap extension
+    pub sterms: F,
+    pub swapcm: F,
+    pub vto: F,
 }
 
 impl Default for Spend2Output2PublicInputs {
@@ -50,6 +55,9 @@ impl Default for Spend2Output2PublicInputs {
             new_c2: F::ZERO,
             nf1: F::ZERO,
             nf2: F::ZERO,
+            sterms: F::ZERO,
+            swapcm: F::ZERO,
+            vto: F::ZERO,
         }
     }
 }
@@ -59,6 +67,27 @@ pub struct Utxo {
     pub asset_id: F,
     pub amount: u128,
     pub randomness: F,
+}
+
+pub(crate) const SWAP_TERMS_TAG: u64 = 0x0003;
+
+#[derive(Clone, Debug)]
+pub struct SwapTermsWitness {
+    pub pk_a: JubjubSubgroup,
+    pub pk_b: JubjubSubgroup,
+    pub amt_a_to_b: u128,
+    pub amt_b_to_a: u128,
+}
+
+impl Default for SwapTermsWitness {
+    fn default() -> Self {
+        Self {
+            pk_a: JubjubSubgroup::identity(),
+            pk_b: JubjubSubgroup::identity(),
+            amt_a_to_b: 0,
+            amt_b_to_a: 0,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -77,6 +106,7 @@ impl Relation for Spend2Output2 {
         Utxo,
         JubjubSubgroup,
         JubjubSubgroup,
+        SwapTermsWitness,
     );
 
     fn format_instance(instance: &Self::Instance) -> Result<Vec<F>, Error> {
@@ -88,6 +118,9 @@ impl Relation for Spend2Output2 {
             instance.new_c2,
             instance.nf1,
             instance.nf2,
+            instance.sterms,
+            instance.swapcm,
+            instance.vto,
         ])
     }
 
@@ -98,18 +131,21 @@ impl Relation for Spend2Output2 {
         _instance: Value<Self::Instance>,
         witness: Value<Self::Witness>,
     ) -> Result<(), Error> {
-        let commit_map_val = witness.clone().map(|(m, _, _, _, _, _, _, _, _)| m);
+        let commit_map_val = witness.clone().map(|(m, _, _, _, _, _, _, _, _, _)| m);
 
-        let sk_val = witness.clone().map(|(_, sk, _, _, _, _, _, _, _)| sk);
-        let alpha_val = witness.clone().map(|(_, _, alpha, _, _, _, _, _, _)| alpha);
+        let sk_val = witness.clone().map(|(_, sk, _, _, _, _, _, _, _, _)| sk);
+        let alpha_val = witness
+            .clone()
+            .map(|(_, _, alpha, _, _, _, _, _, _, _)| alpha);
 
-        let old1_val = witness.clone().map(|(_, _, _, o1, _, _, _, _, _)| o1);
-        let old2_val = witness.clone().map(|(_, _, _, _, o2, _, _, _, _)| o2);
-        let new1_val = witness.clone().map(|(_, _, _, _, _, n1, _, _, _)| n1);
-        let new2_val = witness.clone().map(|(_, _, _, _, _, _, n2, _, _)| n2);
+        let old1_val = witness.clone().map(|(_, _, _, o1, _, _, _, _, _, _)| o1);
+        let old2_val = witness.clone().map(|(_, _, _, _, o2, _, _, _, _, _)| o2);
+        let new1_val = witness.clone().map(|(_, _, _, _, _, n1, _, _, _, _)| n1);
+        let new2_val = witness.clone().map(|(_, _, _, _, _, _, n2, _, _, _)| n2);
 
-        let pk1_out_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _)| k1);
-        let pk2_out_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2)| k2);
+        let pk1_out_val = witness.clone().map(|(_, _, _, _, _, _, _, k1, _, _)| k1);
+        let pk2_out_val = witness.clone().map(|(_, _, _, _, _, _, _, _, k2, _)| k2);
+        let terms_val = witness.clone().map(|(_, _, _, _, _, _, _, _, _, t)| t);
 
         let sk: AssignedScalarOfNativeCurve<Jubjub> = std_lib.jubjub().assign(layouter, sk_val)?;
         let generator = std_lib
@@ -178,6 +214,102 @@ impl Relation for Spend2Output2 {
         std_lib.constrain_as_public_input(layouter, &new_c2)?;
         std_lib.constrain_as_public_input(layouter, &nf1)?;
         std_lib.constrain_as_public_input(layouter, &nf2)?;
+
+        // Swap extension public inputs (opaque here).
+        let sterms: AssignedNative<F> = std_lib.assign(layouter, _instance.map(|i| i.sterms))?;
+        let swapcm: AssignedNative<F> = std_lib.assign(layouter, _instance.map(|i| i.swapcm))?;
+        let vto: AssignedNative<F> = std_lib.assign(layouter, _instance.map(|i| i.vto))?;
+        std_lib.constrain_as_public_input(layouter, &sterms)?;
+        std_lib.constrain_as_public_input(layouter, &swapcm)?;
+        std_lib.constrain_as_public_input(layouter, &vto)?;
+
+        // ---- tiny helpers (local closures are fine) ----
+        let sterms_is_zero_b = std_lib.is_zero(layouter, &sterms)?;
+        let is_swap_b = std_lib.not(layouter, &sterms_is_zero_b)?;
+        let not_swap_b = std_lib.not(layouter, &is_swap_b)?;
+
+        // returns Bool: a == b
+        let is_eq = |layouter: &mut _,
+                     a: &AssignedNative<F>,
+                     b: &AssignedNative<F>|
+         -> Result<AssignedBit<F>, _> {
+            let d = std_lib.sub(layouter, a, b)?;
+            std_lib.is_zero(layouter, &d)
+        };
+
+        let assert_when_swap = |layouter: &mut _, pred: AssignedBit<F>| -> Result<(), _> {
+            let ok = std_lib.or(layouter, &[not_swap_b.clone(), pred])?;
+            std_lib.assert_true(layouter, &ok)
+        };
+
+        let assert_eq_when_swap =
+            |layouter: &mut _, a: &AssignedNative<F>, b: &AssignedNative<F>| -> Result<(), _> {
+                let eq = is_eq(layouter, a, b)?;
+                assert_when_swap(layouter, eq)
+            };
+
+        // ---- Swap terms binding (only if sterms != 0) ----
+        let terms_pk_a: AssignedNativePoint<Jubjub> = std_lib
+            .jubjub()
+            .assign(layouter, terms_val.clone().map(|t| t.pk_a))?;
+        let terms_pk_b: AssignedNativePoint<Jubjub> = std_lib
+            .jubjub()
+            .assign(layouter, terms_val.clone().map(|t| t.pk_b))?;
+        let pk_a_xy = std_lib.jubjub().as_public_input(layouter, &terms_pk_a)?;
+        let pk_b_xy = std_lib.jubjub().as_public_input(layouter, &terms_pk_b)?;
+
+        let amt_a_to_b_f: AssignedNative<F> = std_lib.assign(
+            layouter,
+            terms_val.clone().map(|t| F::from_u128(t.amt_a_to_b)),
+        )?;
+        let amt_b_to_a_f: AssignedNative<F> = std_lib.assign(
+            layouter,
+            terms_val.clone().map(|t| F::from_u128(t.amt_b_to_a)),
+        )?;
+
+        let tag = std_lib.assign_fixed(layouter, F::from(SWAP_TERMS_TAG))?;
+        let sterms_expected = std_lib.poseidon(
+            layouter,
+            &[
+                tag,
+                old1_asg.id.clone(), // asset id
+                pk_a_xy[0].clone(),
+                pk_a_xy[1].clone(),
+                pk_b_xy[0].clone(),
+                pk_b_xy[1].clone(),
+                amt_a_to_b_f.clone(),
+                amt_b_to_a_f.clone(),
+            ],
+        )?;
+
+        // if swap => sterms == sterms_expected
+        assert_eq_when_swap(layouter, &sterms, &sterms_expected)?;
+
+        // sender must be pk_a or pk_b (if swap)
+        let sx_eq_a = is_eq(layouter, &pk_sx, &pk_a_xy[0])?;
+        let sy_eq_a = is_eq(layouter, &pk_sy, &pk_a_xy[1])?;
+        let sender_is_a = std_lib.and(layouter, &[sx_eq_a, sy_eq_a])?;
+
+        let sx_eq_b = is_eq(layouter, &pk_sx, &pk_b_xy[0])?;
+        let sy_eq_b = is_eq(layouter, &pk_sy, &pk_b_xy[1])?;
+        let sender_is_b = std_lib.and(layouter, &[sx_eq_b, sy_eq_b])?;
+
+        let sender_ok = std_lib.or(layouter, &[sender_is_a.clone(), sender_is_b.clone()])?;
+        assert_when_swap(layouter, sender_ok)?;
+
+        // expected out1 receiver + amount (counterparty) depends on which side we are
+        let exp_pk1x = std_lib.select(layouter, &sender_is_a, &pk_b_xy[0], &pk_a_xy[0])?;
+        let exp_pk1y = std_lib.select(layouter, &sender_is_a, &pk_b_xy[1], &pk_a_xy[1])?;
+        let exp_amt1 = std_lib.select(layouter, &sender_is_a, &amt_a_to_b_f, &amt_b_to_a_f)?;
+
+        // if swap => (pk1 == expected) && (amount1 == expected)
+        assert_eq_when_swap(layouter, &pk1x, &exp_pk1x)?;
+        assert_eq_when_swap(layouter, &pk1y, &exp_pk1y)?;
+        assert_eq_when_swap(layouter, &new1_asg.amount_f, &exp_amt1)?;
+
+        // if swap => out2 recipient is sender pk (change)
+        assert_eq_when_swap(layouter, &pk2x, &pk_sx)?;
+        assert_eq_when_swap(layouter, &pk2y, &pk_sy)?;
 
         Ok(())
     }

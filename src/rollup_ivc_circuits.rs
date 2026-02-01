@@ -16,11 +16,12 @@ use midnight_circuits::{
         NB_POSEIDON_ADVICE_COLS, NB_POSEIDON_FIXED_COLS, PoseidonChip, PoseidonConfig,
     },
     instructions::{
-        ArithInstructions, AssertionInstructions, AssignmentInstructions, HashInstructions,
-        PublicInputInstructions, map::MapInstructions,
+        ArithInstructions, AssertionInstructions, AssignmentInstructions, BinaryInstructions,
+        ControlFlowInstructions, DecompositionInstructions, HashInstructions,
+        PublicInputInstructions, ZeroInstructions, map::MapInstructions,
     },
     map::cpu::MapMt,
-    types::{AssignedForeignPoint, AssignedNative, ComposableChip, Instantiable},
+    types::{AssignedBit, AssignedForeignPoint, AssignedNative, ComposableChip, Instantiable},
     verifier::{
         Accumulator, AssignedAccumulator, AssignedVk, BlstrsEmulation, SelfEmulation,
         VerifierGadget,
@@ -106,7 +107,10 @@ pub const AGG_K: u32 = K_INTERNAL;
 pub const AGG_STATE_WIDTH: usize = 7;
 
 /// Width of client proof public items (canonical order).
-pub const CLIENT_ITEMS_WIDTH: usize = 7;
+/// NOTE (swap extension):
+/// Canonical order:
+/// `[root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2, sterms, swapcm, vto]`.
+pub const CLIENT_ITEMS_WIDTH: usize = 10;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Aggregation state
@@ -230,11 +234,25 @@ pub struct ClientPublicItems<T> {
     pub new_c2: T,
     pub nf1: T,
     pub nf2: T,
+    pub sterms: T,
+    pub swapcm: T,
+    pub vto: T,
 }
 
 impl<T> From<[T; CLIENT_ITEMS_WIDTH]> for ClientPublicItems<T> {
     fn from(arr: [T; CLIENT_ITEMS_WIDTH]) -> Self {
-        let [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2] = arr;
+        let [
+            root_before,
+            pk_bx,
+            pk_by,
+            new_c1,
+            new_c2,
+            nf1,
+            nf2,
+            sterms,
+            swapcm,
+            vto,
+        ] = arr;
         Self {
             root_before,
             pk_bx,
@@ -243,6 +261,9 @@ impl<T> From<[T; CLIENT_ITEMS_WIDTH]> for ClientPublicItems<T> {
             new_c2,
             nf1,
             nf2,
+            sterms,
+            swapcm,
+            vto,
         }
     }
 }
@@ -258,6 +279,9 @@ impl<T: Clone> ClientPublicItems<T> {
             self.new_c2.clone(),
             self.nf1.clone(),
             self.nf2.clone(),
+            self.sterms.clone(),
+            self.swapcm.clone(),
+            self.vto.clone(),
         ]
     }
 
@@ -277,6 +301,211 @@ impl<T> ClientPublicItems<T> {
     pub fn nullifiers(&self) -> impl Iterator<Item = &T> {
         core::iter::once(&self.nf1).chain(core::iter::once(&self.nf2))
     }
+
+    #[inline]
+    pub fn swap_fields(&self) -> (&T, &T, &T) {
+        (&self.sterms, &self.swapcm, &self.vto)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Swap / block-number policy knobs
+////////////////////////////////////////////////////////////////////////////////
+
+/// Integer width used for `blk` and `vto` comparisons.
+const BLK_BITS: usize = 64;
+
+/// Optional mitigation: require `vto - blk >= W` for swap legs. Set to 0 to disable.
+const MIN_VALIDITY_WINDOW: u64 = 0;
+
+/// Hard cap: `vto - blk <= SWAP_MAX_DELTA_BLKS` for swap legs.
+pub const SWAP_MAX_DELTA_BLKS: u64 = 16;
+
+fn enforce_bit_false(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    b: &AssignedBit<F>,
+    one: &AssignedNative<F>,
+    zero: &AssignedNative<F>,
+) -> Result<(), Error> {
+    // if b == 1 => select(one) and then force == zero => impossible
+    let b_cell = ctx.native.select(layouter, b, one, zero)?;
+    ctx.assert_eq(layouter, &b_cell, zero)?;
+    Ok(())
+}
+
+fn range_u64(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    x: &AssignedNative<F>,
+) -> Result<(), Error> {
+    ctx.scalar
+        .assigned_to_le_bits(layouter, x, Some(BLK_BITS), true)?;
+    Ok(())
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Swap checks (leaf/base step)
+////////////////////////////////////////////////////////////////////////////////
+/// Either:
+///  - both transfers: (sterms, swapcm, vto) == (0,0,0) for both legs, OR
+///  - a matched swap pair:
+///      sterms_L == sterms_R != 0,
+///      swapcm_i == H2(sterms_i, vto_i) != 0,
+///      blk <= vto_i (and optionally vto_i - blk >= MIN_VALIDITY_WINDOW).
+fn enforce_apply_pair_swap_or_transfer(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    blk: &AssignedNative<F>,
+    left: &ClientPublicItems<AssignedNative<F>>,
+    right: &ClientPublicItems<AssignedNative<F>>,
+    zero: &AssignedNative<F>,
+    one: &AssignedNative<F>,
+) -> Result<(), Error> {
+    // ---------------------------------------------------------------------
+    // Extract swap fields
+    // ---------------------------------------------------------------------
+    let (l_sterms, l_swapcm, l_vto) = left.swap_fields();
+    let (r_sterms, r_swapcm, r_vto) = right.swap_fields();
+
+    // ---------------------------------------------------------------------
+    // Identify transfer vs swap using only boolean ops
+    // transfer leg iff (sterms, swapcm, vto) == (0,0,0)
+    // ---------------------------------------------------------------------
+    let l_sterms_is_zero_b = ctx.scalar.is_zero(layouter, l_sterms)?;
+    let l_swapcm_is_zero_b = ctx.scalar.is_zero(layouter, l_swapcm)?;
+    let l_vto_is_zero_b = ctx.scalar.is_zero(layouter, l_vto)?;
+
+    let r_sterms_is_zero_b = ctx.scalar.is_zero(layouter, r_sterms)?;
+    let r_swapcm_is_zero_b = ctx.scalar.is_zero(layouter, r_swapcm)?;
+    let r_vto_is_zero_b = ctx.scalar.is_zero(layouter, r_vto)?;
+
+    let l_is_transfer_b = ctx.native.and(
+        layouter,
+        &[
+            l_sterms_is_zero_b.clone(),
+            l_swapcm_is_zero_b.clone(),
+            l_vto_is_zero_b.clone(),
+        ],
+    )?;
+    let r_is_transfer_b = ctx.native.and(
+        layouter,
+        &[
+            r_sterms_is_zero_b.clone(),
+            r_swapcm_is_zero_b.clone(),
+            r_vto_is_zero_b.clone(),
+        ],
+    )?;
+
+    let both_transfers_b = ctx.native.and(
+        layouter,
+        &[l_is_transfer_b.clone(), r_is_transfer_b.clone()],
+    )?;
+
+    let l_is_swap_b = ctx.native.not(layouter, &l_is_transfer_b)?;
+    let r_is_swap_b = ctx.native.not(layouter, &r_is_transfer_b)?;
+    let both_swaps_b = ctx.native.and(layouter, &[l_is_swap_b, r_is_swap_b])?;
+
+    // Enforce: either both transfers OR both swaps (reject mixed pair early/cleanly).
+    let ok_b = ctx
+        .native
+        .or(layouter, &[both_transfers_b.clone(), both_swaps_b.clone()])?;
+    let not_ok_b = ctx.native.not(layouter, &ok_b)?;
+    enforce_bit_false(ctx, layouter, &not_ok_b, one, zero)?;
+
+    // Use the clean discriminator for gating swap constraints.
+    let is_swap_pair_b = both_swaps_b;
+
+    // ---------------------------------------------------------------------
+    // Swap-case constraints (all gated by is_swap_pair_b)
+    // ---------------------------------------------------------------------
+
+    // 1) sterms_L == sterms_R if swap
+    let sterms_diff = ctx.scalar.sub(layouter, l_sterms, r_sterms)?;
+    let sterms_diff_gated = ctx
+        .native
+        .select(layouter, &is_swap_pair_b, &sterms_diff, zero)?;
+    ctx.assert_eq(layouter, &sterms_diff_gated, zero)?;
+
+    // 2) sterms != 0 if swap  => reject (is_swap_pair & sterms_is_zero)
+    let sterms_bad_b = ctx.native.and(
+        layouter,
+        &[is_swap_pair_b.clone(), l_sterms_is_zero_b.clone()],
+    )?;
+    enforce_bit_false(ctx, layouter, &sterms_bad_b, one, zero)?;
+
+    // 3) swapcm_i != 0 if swap  => reject (is_swap_pair & swapcm_is_zero)
+    let l_swapcm_bad_b = ctx.native.and(
+        layouter,
+        &[is_swap_pair_b.clone(), l_swapcm_is_zero_b.clone()],
+    )?;
+    enforce_bit_false(ctx, layouter, &l_swapcm_bad_b, one, zero)?;
+
+    let r_swapcm_bad_b = ctx.native.and(
+        layouter,
+        &[is_swap_pair_b.clone(), r_swapcm_is_zero_b.clone()],
+    )?;
+    enforce_bit_false(ctx, layouter, &r_swapcm_bad_b, one, zero)?;
+
+    // 4) swapcm_i == H2(sterms_i, vto_i) if swap
+    let l_swapcm_expected = ctx.hash2(layouter, l_sterms, l_vto)?;
+    let l_swapcm_eq_diff = ctx.scalar.sub(layouter, l_swapcm, &l_swapcm_expected)?;
+    let l_swapcm_eq_gated =
+        ctx.native
+            .select(layouter, &is_swap_pair_b, &l_swapcm_eq_diff, zero)?;
+    ctx.assert_eq(layouter, &l_swapcm_eq_gated, zero)?;
+
+    let r_swapcm_expected = ctx.hash2(layouter, r_sterms, r_vto)?;
+    let r_swapcm_eq_diff = ctx.scalar.sub(layouter, r_swapcm, &r_swapcm_expected)?;
+    let r_swapcm_eq_gated =
+        ctx.native
+            .select(layouter, &is_swap_pair_b, &r_swapcm_eq_diff, zero)?;
+    ctx.assert_eq(layouter, &r_swapcm_eq_gated, zero)?;
+
+    // ---------------------------------------------------------------------
+    // Expiry constraints (only if swap):
+    //   blk <= vto_i and optionally (vto_i - blk) >= MIN_VALIDITY_WINDOW
+    //
+    // Gate arithmetic by selecting values to 0 in transfer case.
+    // ---------------------------------------------------------------------
+
+    // Defensive: always range-check the declared blk.
+    range_u64(ctx, layouter, blk)?;
+
+    let blk_eff = ctx.native.select(layouter, &is_swap_pair_b, blk, zero)?;
+    range_u64(ctx, layouter, &blk_eff)?;
+
+    let w = ctx
+        .scalar
+        .assign_fixed(layouter, F::from(MIN_VALIDITY_WINDOW))?;
+    let w_eff = ctx.native.select(layouter, &is_swap_pair_b, &w, zero)?;
+    range_u64(ctx, layouter, &w_eff)?;
+
+    for vto in [l_vto, r_vto] {
+        let vto_eff = ctx.native.select(layouter, &is_swap_pair_b, vto, zero)?;
+        range_u64(ctx, layouter, &vto_eff)?;
+
+        // diff = vto_eff - blk_eff must be in [0, 2^64) => enforces vto_eff >= blk_eff
+        let diff = ctx.scalar.sub(layouter, &vto_eff, &blk_eff)?;
+        range_u64(ctx, layouter, &diff)?;
+
+        // Optional: diff >= w_eff (if MIN_VALIDITY_WINDOW>0)
+        let diff_minus_w = ctx.scalar.sub(layouter, &diff, &w_eff)?;
+        range_u64(ctx, layouter, &diff_minus_w)?;
+
+        // diff <= SWAP_MAX_DELTA_BLKS
+        let max = ctx
+            .scalar
+            .assign_fixed(layouter, F::from(SWAP_MAX_DELTA_BLKS))?;
+        let max_eff = ctx.native.select(layouter, &is_swap_pair_b, &max, zero)?;
+        range_u64(ctx, layouter, &max_eff)?;
+
+        // max_eff - diff must be in [0, 2^64) => enforces diff <= max_eff
+        let max_minus_diff = ctx.scalar.sub(layouter, &max_eff, &diff)?;
+        range_u64(ctx, layouter, &max_minus_diff)?;
+    }
+
+    Ok(())
 }
 
 /// Typed encoding for the Agg state public inputs (6 fields).
@@ -509,8 +738,18 @@ fn assign_client_items(
     layouter: &mut impl Layouter<F>,
     items: Value<[F; CLIENT_ITEMS_WIDTH]>,
 ) -> Result<ClientPublicItems<AssignedNative<F>>, Error> {
-    let [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2] =
-        assign_values(ctx, layouter, project_value_array(items))?;
+    let [
+        root_before,
+        pk_bx,
+        pk_by,
+        new_c1,
+        new_c2,
+        nf1,
+        nf2,
+        sterms,
+        swapcm,
+        vto,
+    ] = assign_values(ctx, layouter, project_value_array(items))?;
 
     Ok(ClientPublicItems {
         root_before,
@@ -520,6 +759,9 @@ fn assign_client_items(
         new_c2,
         nf1,
         nf2,
+        sterms,
+        swapcm,
+        vto,
     })
 }
 
@@ -582,7 +824,7 @@ pub fn base_step(
     let zero = ctx.zero(layouter)?;
 
     // Batch block number (bound into state; used for swap expiry checks).
-    let blk_assigned = ctx.scalar.assign(layouter, block_level)?;
+    let blk_assigned: AssignedNative<F> = ctx.scalar.assign(layouter, block_level)?;
 
     // Rollup sets.
     let (mut commit_map, c_pre) = init_map_with_root(ctx, layouter, pre_commitment_map)?;
@@ -604,6 +846,9 @@ pub fn base_step(
         &right.root_before,
         &one,
     )?;
+
+    // Enforce transfer-vs-swap pairing semantics (atomic two-party swap).
+    enforce_apply_pair_swap_or_transfer(ctx, layouter, &blk_assigned, &left, &right, &zero, &one)?;
 
     // Hash client public inputs inside the base circuit (used for leaf subroot / rollup binding).
     let inst_left_hash = ctx.hash_client_instance(layouter, &left)?;

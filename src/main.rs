@@ -2445,4 +2445,242 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn negative_cannot_pair_swap_with_transfer_batch4_panics() -> Result<(), AppError> {
+        use rand::SeedableRng;
+        use std::panic;
+
+        // Batch size MUST be 4
+        let batch_size = 4usize;
+        let env = mini_env(/*k=*/ 14, batch_size)?;
+
+        let mut rng = ChaCha8Rng::seed_from_u64(999);
+
+        let asset_a = F::from(11u64);
+        let asset_b = F::from(22u64);
+        assert_ne!(asset_a, asset_b);
+
+        // 4 accounts so we can fill a batch of 4 txs
+        let mut accounts = init_accounts(4);
+
+        let mut commitment_map = CommitmentMap::new(&F::ZERO);
+        let nullifier_map = CommitmentMap::new(&F::ZERO);
+
+        let mint_note = |acc: &mut transfer_circuit::Account,
+                         asset: F,
+                         amount: u128,
+                         rng: &mut ChaCha8Rng,
+                         cmap: &mut CommitmentMap| {
+            let utxo = transfer_circuit::Utxo {
+                asset_id: asset,
+                amount,
+                randomness: F::random(rng),
+            };
+            let commit = commitment_for_utxo(&utxo, acc.pk_x, acc.pk_y);
+            cmap.insert(&commit, &F::ONE);
+            acc.wallet.push(transfer_circuit::Note {
+                utxo,
+                commit,
+                spent: false,
+                confirmed_at_root_idx: 0,
+            });
+        };
+
+        // Swap party A (idx 0) has asset_a
+        mint_note(
+            &mut accounts[0],
+            asset_a,
+            100,
+            &mut rng,
+            &mut commitment_map,
+        );
+        mint_note(&mut accounts[0], asset_a, 50, &mut rng, &mut commitment_map);
+
+        // Swap party B (idx 1) has asset_b (won't do its swap leg in this test)
+        mint_note(&mut accounts[1], asset_b, 80, &mut rng, &mut commitment_map);
+        mint_note(&mut accounts[1], asset_b, 40, &mut rng, &mut commitment_map);
+
+        // Extra senders to fill batch with transfers
+        mint_note(&mut accounts[2], asset_a, 30, &mut rng, &mut commitment_map);
+        mint_note(&mut accounts[2], asset_a, 20, &mut rng, &mut commitment_map);
+
+        mint_note(&mut accounts[3], asset_b, 25, &mut rng, &mut commitment_map);
+        mint_note(&mut accounts[3], asset_b, 15, &mut rng, &mut commitment_map);
+
+        // ChainState (genesis root + roots set)
+        let genesis_root = commitment_map.succinct_repr();
+        let mut commitment_roots_set = CommitmentMap::new(&F::ZERO);
+        commitment_roots_set.insert(&genesis_root, &F::ONE);
+
+        let chain = ChainState {
+            asset_ids: vec![asset_a, asset_b],
+            accounts,
+            commitment_map_history: vec![commitment_map.clone()],
+            commitment_root_history: vec![genesis_root],
+            commitment_roots_set,
+            commitment_map,
+            nullifier_map,
+            blk_head: 0,
+        };
+
+        let pre = snapshot_batch_pre_state(&chain);
+        let latest_confirmed_root_idx = pre.latest_confirmed_root_idx; // 0
+        let confirm_at_idx = chain.commitment_root_history.len(); // 1
+        let blk_post_u64 = chain.blk_head + 1;
+        let batch_blk = F::from(blk_post_u64);
+
+        let mut shadow_accounts = chain.accounts.clone();
+        let mut shadow_commitment_map = chain.commitment_map.clone();
+        let mut shadow_nullifier_map = chain.nullifier_map.clone();
+
+        // -----------------------------
+        // Build swap agreement (deterministic terms) for (A=0, B=1)
+        // -----------------------------
+        let plan_swap_leg = PlannedTx {
+            sender_idx: 0,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 1, // B gets trade output
+            recipient2_idx: 0, // A gets change
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+
+        let total_a = inputs_total_amount(&shadow_accounts, &plan_swap_leg); // 150
+        assert_eq!(total_a, 150);
+
+        let amt_a_to_b: u128 = 70;
+        let amt_b_to_a: u128 = 60; // included in terms hash even though we won't execute B->A leg
+
+        let nonce = F::from(99u64);
+        let sterms = host_swap_terms_hash(
+            nonce,
+            asset_a,
+            asset_b,
+            &shadow_accounts[0].pk_point,
+            &shadow_accounts[1].pk_point,
+            amt_a_to_b,
+            amt_b_to_a,
+        );
+        assert_ne!(sterms, F::ZERO);
+
+        let ag = SwapAgreement {
+            a_idx: 0,
+            b_idx: 1,
+            asset_id_a: asset_a,
+            asset_id_b: asset_b,
+            pk_a: shadow_accounts[0].pk_point,
+            pk_b: shadow_accounts[1].pk_point,
+            amt_a_to_b,
+            amt_b_to_a,
+            nonce,
+            sterms,
+        };
+
+        let intent_swap_leg = swap_leg_intent_for_a_to_b(&mut rng, blk_post_u64, &ag);
+
+        // -----------------------------
+        // Build three transfer txs to fill batch
+        // tx1 is paired with swap leg tx0 => forbidden mixed pair
+        // -----------------------------
+        let plan_xfer_1 = PlannedTx {
+            sender_idx: 2,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 3,
+            recipient2_idx: 2,
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+        let plan_xfer_2 = PlannedTx {
+            sender_idx: 1,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 0,
+            recipient2_idx: 1,
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+        let plan_xfer_3 = PlannedTx {
+            sender_idx: 3,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 2,
+            recipient2_idx: 3,
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+
+        let txs: [(&PlannedTx, TxIntent); 4] = [
+            (&plan_swap_leg, intent_swap_leg),    // tx0: SWAP
+            (&plan_xfer_1, TxIntent::transfer()), // tx1: TRANSFER  <-- mixed with swap in pair 0
+            (&plan_xfer_2, TxIntent::transfer()), // tx2: TRANSFER
+            (&plan_xfer_3, TxIntent::transfer()), // tx3: TRANSFER
+        ];
+
+        // -----------------------------
+        // Prove all 4 txs + apply shadow effects (like run())
+        // -----------------------------
+        let mut proofs: Vec<rollup_ivc_proofs::ClientProof> = Vec::with_capacity(4);
+
+        for (tx_idx, (plan, intent)) in txs.into_iter().enumerate() {
+            let (built, _) = build_transaction(
+                &mut rng,
+                &shadow_accounts,
+                &chain.commitment_map_history,
+                &chain.commitment_root_history,
+                plan,
+                latest_confirmed_root_idx,
+                /*batch_idx=*/ 0,
+                /*tx_idx=*/ tx_idx,
+                intent,
+            )?;
+
+            let effects = TxEffects::from_plan_and_built(plan, &built);
+
+            proofs.push(prove_client(&env.srs, &env.pk, &env.relation, built)?);
+
+            apply_tx_effects(
+                &mut shadow_accounts,
+                &mut shadow_commitment_map,
+                &mut shadow_nullifier_map,
+                confirm_at_idx,
+                &effects,
+            );
+        }
+
+        assert_eq!(proofs.len(), 4);
+
+        // Sanity: first pair is indeed (swap, transfer)
+        assert_ne!(
+            proofs[0].public_items[7],
+            F::ZERO,
+            "tx0 must be swap (sterms!=0)"
+        );
+        assert_eq!(
+            proofs[1].public_items[7],
+            F::ZERO,
+            "tx1 must be transfer (sterms==0)"
+        );
+
+        // -----------------------------
+        // Aggregation must reject mixed pair (swap + transfer) in the same base-step pair
+        // -----------------------------
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _ = rollup_ivc_proofs::aggregate_client_proofs_cached(
+                &env.agg_setup,
+                &env.srs,
+                &env.leaf_vk,
+                &proofs,
+                pre.pre_commitment_map.clone(),
+                pre.pre_nullifier_map.clone(),
+                pre.pre_roots_set_map.clone(),
+                batch_blk,
+            );
+        }));
+
+        assert!(
+            res.is_err(),
+            "expected aggregation to reject pairing swap with transfer (batch_size=4)"
+        );
+
+        Ok(())
+    }
 }

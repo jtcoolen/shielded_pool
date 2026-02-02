@@ -940,12 +940,12 @@ mod tests {
     use crate::transfer_circuit;
 
     use super::*;
+    use crate::host_swap_terms_hash;
     use midnight_circuits::instructions::map::MapCPU;
     use midnight_circuits::types::Instantiable;
     use proptest::prelude::*;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
-    use std::ops::Add;
     use std::ops::Not;
     use std::sync::OnceLock;
 
@@ -1316,18 +1316,18 @@ mod tests {
             asset_id_b = F::random(&mut rng);
         }
 
-        // Nonce is rejection-sampled off-chain to avoid sterms==0 (SPEC).
+        // Nonce is rejection-sampled off-chain to avoid sterms==0.
         let mut nonce = F::random(&mut rng);
-        let mut sterms = host_swap_terms(
-            nonce, asset_id, asset_id_b, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 0,
+        let mut sterms = host_swap_terms_hash(
+            nonce, asset_id, asset_id_b, &pk_sender, &pk_b, amt_a_to_b, 0,
         );
         for _ in 0..8 {
             if sterms != F::ZERO {
                 break;
             }
             nonce = F::random(&mut rng);
-            sterms = host_swap_terms(
-                nonce, asset_id, asset_id_b, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 0,
+            sterms = host_swap_terms_hash(
+                nonce, asset_id, asset_id_b, &pk_sender, &pk_b, amt_a_to_b, 0,
             );
         }
         assert_ne!(sterms, F::ZERO);
@@ -1335,7 +1335,6 @@ mod tests {
         // vto must be a u64; swapcm must be H2(sterms, vto)
         let vto_u64: u64 = rng.r#gen::<u64>();
         let vto = F::from(vto_u64);
-        let swapcm = host_swapcm(sterms, vto);
 
         let instance = Spend2Output2PublicInputs {
             root,

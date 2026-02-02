@@ -1,3 +1,5 @@
+use std::ops::Shl;
+
 use ff::Field;
 use group::Group;
 
@@ -17,8 +19,8 @@ use midnight_circuits::{
     },
     instructions::{
         ArithInstructions, AssertionInstructions, AssignmentInstructions, BinaryInstructions,
-        ControlFlowInstructions, DecompositionInstructions, HashInstructions,
-        PublicInputInstructions, ZeroInstructions, map::MapInstructions,
+        ControlFlowInstructions, HashInstructions, PublicInputInstructions, RangeCheckInstructions,
+        ZeroInstructions, map::MapInstructions,
     },
     map::cpu::MapMt,
     types::{AssignedBit, AssignedForeignPoint, AssignedNative, ComposableChip, Instantiable},
@@ -32,6 +34,7 @@ use midnight_proofs::{
     plonk::{Circuit, ConstraintSystem, Error},
     poly::EvaluationDomain,
 };
+use num_bigint::BigUint;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Small utilities (local helpers)
@@ -108,8 +111,8 @@ pub const AGG_STATE_WIDTH: usize = 7;
 
 /// Width of client proof public items (canonical order).
 /// Canonical order:
-/// `[root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2, sterms, swapcm, vto]`.
-/// NOTE (multi-asset swaps): `sterms` now binds BOTH legs' asset ids (asset_a, asset_b) in addition to (pk_a, pk_b, amounts).
+/// `[root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2, sterms, vto, side]`.
+///  `side` is 0 in transfer mode; in swap mode it is a bit (0=pk_A leg, 1=pk_B leg).
 pub const CLIENT_ITEMS_WIDTH: usize = 10;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -236,8 +239,8 @@ pub struct ClientPublicItems<T> {
     pub nf1: T,
     pub nf2: T,
     pub sterms: T,
-    pub swapcm: T,
     pub vto: T,
+    pub side: T,
 }
 
 impl<T> From<[T; CLIENT_ITEMS_WIDTH]> for ClientPublicItems<T> {
@@ -251,8 +254,8 @@ impl<T> From<[T; CLIENT_ITEMS_WIDTH]> for ClientPublicItems<T> {
             nf1,
             nf2,
             sterms,
-            swapcm,
             vto,
+            side,
         ] = arr;
         Self {
             root_before,
@@ -263,8 +266,8 @@ impl<T> From<[T; CLIENT_ITEMS_WIDTH]> for ClientPublicItems<T> {
             nf1,
             nf2,
             sterms,
-            swapcm,
             vto,
+            side,
         }
     }
 }
@@ -281,8 +284,8 @@ impl<T: Clone> ClientPublicItems<T> {
             self.nf1.clone(),
             self.nf2.clone(),
             self.sterms.clone(),
-            self.swapcm.clone(),
             self.vto.clone(),
+            self.side.clone(),
         ]
     }
 
@@ -305,7 +308,7 @@ impl<T> ClientPublicItems<T> {
 
     #[inline]
     pub fn swap_fields(&self) -> (&T, &T, &T) {
-        (&self.sterms, &self.swapcm, &self.vto)
+        (&self.sterms, &self.vto, &self.side)
     }
 }
 
@@ -375,8 +378,7 @@ fn range_u64(
     x: &AssignedNative<F>,
 ) -> Result<(), Error> {
     ctx.scalar
-        .assigned_to_le_bits(layouter, x, Some(BLK_BITS), true)?;
-    Ok(())
+        .assert_lower_than_fixed(layouter, &x, &BigUint::shl(1u64.into(), BLK_BITS))
 }
 
 #[inline]
@@ -425,27 +427,22 @@ fn enforce_u64_le(
 #[derive(Clone, Copy)]
 struct SwapLeg<'a> {
     sterms: &'a AssignedNative<F>,
-    swapcm: &'a AssignedNative<F>,
     vto: &'a AssignedNative<F>,
+    side: &'a AssignedNative<F>,
 }
 
 impl<'a> SwapLeg<'a> {
     #[inline]
     fn from_items(items: &'a ClientPublicItems<AssignedNative<F>>) -> Self {
-        let (sterms, swapcm, vto) = items.swap_fields();
-        Self {
-            sterms,
-            swapcm,
-            vto,
-        }
+        let (sterms, vto, side) = items.swap_fields();
+        Self { sterms, vto, side }
     }
 }
 
 #[derive(Clone)]
 struct SwapLegKind {
-    swapcm_is_zero: AssignedBit<F>,
-    is_transfer: AssignedBit<F>, // (sterms, swapcm, vto) == (0,0,0)
-    is_swap: AssignedBit<F>,     // !is_transfer
+    is_transfer: AssignedBit<F>, // sterms == 0
+    is_swap: AssignedBit<F>,     // sterms != 0
 }
 
 fn analyze_leg_kind(
@@ -454,21 +451,10 @@ fn analyze_leg_kind(
     leg: SwapLeg<'_>,
 ) -> Result<SwapLegKind, Error> {
     let sterms_is_zero = ctx.scalar.is_zero(layouter, leg.sterms)?;
-    let swapcm_is_zero = ctx.scalar.is_zero(layouter, leg.swapcm)?;
-    let vto_is_zero = ctx.scalar.is_zero(layouter, leg.vto)?;
-
-    let is_transfer = ctx.native.and(
-        layouter,
-        &[
-            sterms_is_zero.clone(),
-            swapcm_is_zero.clone(),
-            vto_is_zero.clone(),
-        ],
-    )?;
-    let is_swap = ctx.native.not(layouter, &is_transfer)?;
+    let is_transfer = sterms_is_zero.clone();
+    let is_swap = ctx.native.not(layouter, &sterms_is_zero)?;
 
     Ok(SwapLegKind {
-        swapcm_is_zero,
         is_transfer,
         is_swap,
     })
@@ -529,41 +515,23 @@ fn enforce_swap_constraints(
     // 2) sterms != 0 if swap.
     assert_nonzero_when(ctx, layouter, is_swap_pair, left_leg.sterms, one, zero)?;
 
-    // 3) swapcm != 0 if swap (both legs).
-    //    Using the precomputed zero flags keeps the logic explicit and consistent.
-    let l_swapcm_bad = ctx.native.and(
-        layouter,
-        &[is_swap_pair.clone(), left_kind.swapcm_is_zero.clone()],
-    )?;
-    forbid_when(ctx, layouter, &l_swapcm_bad, one, zero)?;
+    // 3) side typing (bit) when swap: b * side*(side-1) = 0. TODO use AssignedBit directly
+    let mut side_bool = |side: &AssignedNative<F>| -> Result<(), Error> {
+        let side_minus_one = ctx.scalar.sub(layouter, side, one)?;
+        let prod = ctx.scalar.mul(layouter, side, &side_minus_one, None)?;
+        let gated = ctx.native.select(layouter, is_swap_pair, &prod, zero)?;
+        ctx.assert_eq(layouter, &gated, zero)
+    };
+    side_bool(left_leg.side)?;
+    side_bool(right_leg.side)?;
 
-    let r_swapcm_bad = ctx.native.and(
-        layouter,
-        &[is_swap_pair.clone(), right_kind.swapcm_is_zero.clone()],
-    )?;
-    forbid_when(ctx, layouter, &r_swapcm_bad, one, zero)?;
-
-    // 4) swapcm_i == H2(sterms_i, vto_i) if swap.
-    let l_expected = ctx.hash2(layouter, left_leg.sterms, left_leg.vto)?;
-    assert_equal_when(
-        ctx,
-        layouter,
-        is_swap_pair,
-        left_leg.swapcm,
-        &l_expected,
-        zero,
-    )?;
-
-    let r_expected = ctx.hash2(layouter, right_leg.sterms, right_leg.vto)?;
-    assert_equal_when(
-        ctx,
-        layouter,
-        is_swap_pair,
-        right_leg.swapcm,
-        &r_expected,
-        zero,
-    )?;
-
+    // 4) Opposite-side constraint when swap: side_L + side_R = 1 (SPEC).
+    let sum = ctx.scalar.add(layouter, left_leg.side, right_leg.side)?;
+    let sum_minus_one = ctx.scalar.sub(layouter, &sum, one)?;
+    let gated = ctx
+        .native
+        .select(layouter, is_swap_pair, &sum_minus_one, zero)?;
+    ctx.assert_eq(layouter, &gated, zero)?;
     // 5) Expiry constraints (u64):
     //    - blk <= vto
     //    - (optional) vto - blk >= MIN_VALIDITY_WINDOW
@@ -627,6 +595,40 @@ fn enforce_pair_swap_or_transfer_semantics(
 
     let left_kind = analyze_leg_kind(ctx, layouter, left_leg)?;
     let right_kind = analyze_leg_kind(ctx, layouter, right_leg)?;
+
+    // Transfer-mode canonical zeros (SPEC): if sterms==0 then vto=0 and side=0.
+    assert_equal_when(
+        ctx,
+        layouter,
+        &left_kind.is_transfer,
+        left_leg.vto,
+        zero,
+        zero,
+    )?;
+    assert_equal_when(
+        ctx,
+        layouter,
+        &left_kind.is_transfer,
+        left_leg.side,
+        zero,
+        zero,
+    )?;
+    assert_equal_when(
+        ctx,
+        layouter,
+        &right_kind.is_transfer,
+        right_leg.vto,
+        zero,
+        zero,
+    )?;
+    assert_equal_when(
+        ctx,
+        layouter,
+        &right_kind.is_transfer,
+        right_leg.side,
+        zero,
+        zero,
+    )?;
 
     // Either both transfers or both swaps.
     let is_swap_pair = enforce_pair_kind(ctx, layouter, &left_kind, &right_kind, one, zero)?;
@@ -838,6 +840,9 @@ impl AggCtx {
         one: &AssignedNative<F>,
     ) -> Result<(), Error> {
         for commitment in items.commitments() {
+            // commitment inserts must be fresh (old value == 0) before setting to 1.
+            let existing = commit_map.get(layouter, commitment)?;
+            self.assert_eq(layouter, &existing, zero)?;
             commit_map.insert(layouter, commitment, one)?;
         }
 

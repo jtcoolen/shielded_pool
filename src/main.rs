@@ -104,10 +104,11 @@ fn host_hash2(a: F, b: F) -> F {
 }
 
 /// Poseidon commitment to swap terms:
-///   (tag, asset_id_a, asset_id_b, pk_a.x, pk_a.y, pk_b.x, pk_b.y, amt_a_to_b, amt_b_to_a)
+///   (tag, nonce, asset_id_a, asset_id_b, pk_a.x, pk_a.y, pk_b.x, pk_b.y, amt_a_to_b, amt_b_to_a)
 ///
 /// Must match the in-circuit hashing for `sterms_expected`.
 fn host_swap_terms_hash(
+    nonce: F,
     asset_id_a: F,
     asset_id_b: F,
     pk_a: &JubjubSubgroup,
@@ -122,6 +123,7 @@ fn host_swap_terms_hash(
 
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[
         F::from(transfer_circuit::SWAP_TERMS_TAG),
+        nonce,
         asset_id_a,
         asset_id_b,
         a_xy[0],
@@ -228,16 +230,16 @@ fn blind_pubkey(sender_pk: JubjubSubgroup, alpha: JubjubScalar) -> (JubjubSubgro
 #[derive(Clone, Copy, Debug)]
 struct SwapFields {
     sterms: F,
-    swapcm: F,
     vto: F,
+    side: F,
 }
 
 impl SwapFields {
     fn transfer() -> Self {
         Self {
             sterms: F::ZERO,
-            swapcm: F::ZERO,
             vto: F::ZERO,
+            side: F::ZERO,
         }
     }
 }
@@ -265,8 +267,8 @@ fn build_public_items_with_swap(
         nf1,
         nf2,
         swap.sterms,
-        swap.swapcm,
         swap.vto,
+        swap.side,
     ];
 
     let state = host_instance_hash(public_items);
@@ -280,8 +282,8 @@ fn build_public_items_with_swap(
         nf1,
         nf2,
         sterms: swap.sterms,
-        swapcm: swap.swapcm,
         vto: swap.vto,
+        side: swap.side,
     };
 
     (public_items, state, instance)
@@ -672,6 +674,7 @@ struct SwapAgreement {
     pk_b: JubjubSubgroup,
     amt_a_to_b: u128,
     amt_b_to_a: u128,
+    nonce: F,
     sterms: F,
 }
 
@@ -703,10 +706,12 @@ fn build_swap_agreement(
     for _ in 0..MAX_STERMS_RESAMPLE {
         let amt_a_to_b = sample_bounded_amount(rng, total_a);
         let amt_b_to_a = sample_bounded_amount(rng, total_b);
-        let sterms =
-            host_swap_terms_hash(asset_id_a, asset_id_b, &pk_a, &pk_b, amt_a_to_b, amt_b_to_a);
+        let nonce = F::random(&mut *rng);
+        let sterms = host_swap_terms_hash(
+            nonce, asset_id_a, asset_id_b, &pk_a, &pk_b, amt_a_to_b, amt_b_to_a,
+        );
 
-        if sterms != F::ZERO || (total_a == 0 && total_b == 0) {
+        if sterms != F::ZERO {
             return Ok(SwapAgreement {
                 a_idx,
                 b_idx,
@@ -716,6 +721,7 @@ fn build_swap_agreement(
                 pk_b,
                 amt_a_to_b,
                 amt_b_to_a,
+                nonce,
                 sterms,
             });
         }
@@ -730,6 +736,7 @@ fn swap_terms_witness(ag: &SwapAgreement) -> SwapTermsWitness {
     SwapTermsWitness {
         asset_id_a: ag.asset_id_a,
         asset_id_b: ag.asset_id_b,
+        nonce: ag.nonce,
         pk_a: ag.pk_a.clone(),
         pk_b: ag.pk_b.clone(),
         amt_a_to_b: ag.amt_a_to_b,
@@ -744,13 +751,12 @@ fn swap_leg_intent_for_a_to_b(
     ag: &SwapAgreement,
 ) -> TxIntent {
     let (_vto_u64, vto) = choose_swap_vto(rng, blk_post_u64);
-    let swapcm = host_hash2(ag.sterms, vto);
 
     TxIntent::Swap(SwapLegContext {
         fields: SwapFields {
             sterms: ag.sterms,
-            swapcm,
             vto,
+            side: F::ZERO, // pk_A leg
         },
         terms: swap_terms_witness(ag),
         out1_amount: ag.amt_a_to_b,
@@ -763,13 +769,12 @@ fn swap_leg_intent_for_b_to_a(
     ag: &SwapAgreement,
 ) -> TxIntent {
     let (_vto_u64, vto) = choose_swap_vto(rng, blk_post_u64);
-    let swapcm = host_hash2(ag.sterms, vto);
 
     TxIntent::Swap(SwapLegContext {
         fields: SwapFields {
             sterms: ag.sterms,
-            swapcm,
             vto,
+            side: F::ONE, // pk_B leg
         },
         terms: swap_terms_witness(ag),
         out1_amount: ag.amt_b_to_a,
@@ -782,44 +787,46 @@ fn plan_swap_pair(
     latest_confirmed_root_idx: usize,
     blk_post_u64: u64,
 ) -> Option<(PlannedTx, PlannedTx, TxIntent, TxIntent)> {
-    // Pick distinct senders for a clean 2-party swap.
-    let a = choose_sender_idx(rng, accounts, latest_confirmed_root_idx)?;
-    let b = choose_sender_idx_excluding(rng, accounts, latest_confirmed_root_idx, a)?;
+    const SWAP_RETRIES: usize = 32;
+    for _ in 0..SWAP_RETRIES {
+        let a = choose_sender_idx(rng, accounts, latest_confirmed_root_idx)?;
+        let b = choose_sender_idx_excluding(rng, accounts, latest_confirmed_root_idx, a)?;
 
-    // Swap: out1 to counterparty, out2 back to self.
-    let plan_a = plan_transaction_for_sender(
-        rng,
-        accounts,
-        latest_confirmed_root_idx,
-        a,
-        /*recipient1=*/ b,
-        /*recipient2=*/ a,
-    )?;
-    let plan_b = plan_transaction_for_sender(
-        rng,
-        accounts,
-        latest_confirmed_root_idx,
-        b,
-        /*recipient1=*/ a,
-        /*recipient2=*/ b,
-    )?;
-    // Determine the (per-leg) asset ids from the selected inputs (same-asset per leg is guaranteed by planning).
-    let asset_id_a = accounts[a].wallet[plan_a.old1_idx].utxo.asset_id;
-    let asset_id_b = accounts[b].wallet[plan_b.old1_idx].utxo.asset_id;
+        // Plan A normally (random asset)
+        let plan_a =
+            plan_transaction_for_sender(rng, accounts, latest_confirmed_root_idx, a, b, a)?;
+        let asset_id_a = accounts[a].wallet[plan_a.old1_idx].utxo.asset_id;
 
-    // Prefer true multi-asset swaps; if both legs would spend the same asset, let the caller fallback.
-    if asset_id_a == asset_id_b {
-        return None;
+        // Force B to use a *different* asset if possible by retrying B planning
+        // (works great in your 2-asset demo)
+        let asset_id_b = {
+            // try a few times to get a different asset for B
+            let mut got: Option<(PlannedTx, F)> = None;
+            for _ in 0..16 {
+                let plan_b =
+                    plan_transaction_for_sender(rng, accounts, latest_confirmed_root_idx, b, a, b)?;
+                let asset = accounts[b].wallet[plan_b.old1_idx].utxo.asset_id;
+                if asset != asset_id_a {
+                    got = Some((plan_b, asset));
+                    break;
+                }
+            }
+            let (plan_b, asset_id_b) = match got {
+                Some(x) => x,
+                None => continue, // IMPORTANT: retry outer loop, don't return None
+            };
+            // Continue with swap agreement creation using plan_b
+            let ag = build_swap_agreement(
+                rng, asset_id_a, asset_id_b, accounts, a, b, &plan_a, &plan_b,
+            )
+            .ok()?;
+            let intent_a = swap_leg_intent_for_a_to_b(rng, blk_post_u64, &ag);
+            let intent_b = swap_leg_intent_for_b_to_a(rng, blk_post_u64, &ag);
+            return Some((plan_a, plan_b, intent_a, intent_b));
+        };
+        let _ = asset_id_b; // (kept for clarity)
     }
-
-    let ag = build_swap_agreement(
-        rng, asset_id_a, asset_id_b, accounts, a, b, &plan_a, &plan_b,
-    )
-    .ok()?;
-    let intent_a = swap_leg_intent_for_a_to_b(rng, blk_post_u64, &ag);
-    let intent_b = swap_leg_intent_for_b_to_a(rng, blk_post_u64, &ag);
-
-    Some((plan_a, plan_b, intent_a, intent_b))
+    return None;
 }
 
 #[derive(Clone, Debug)]

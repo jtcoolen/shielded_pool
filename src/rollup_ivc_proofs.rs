@@ -167,7 +167,7 @@ fn apply_tx_effects10(
     null_map: Map,
     items: [F; rollup_ivc_circuits::CLIENT_ITEMS_WIDTH],
 ) -> (Map, Map) {
-    // Order: [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2, sterms, swapcm, vto]
+    //  Order: [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2, sterms, vto, side]
     let c1 = items[3];
     let c2 = items[4];
     let nf1 = items[5];
@@ -184,20 +184,57 @@ fn check_pair_swap_or_transfer(
 ) -> Result<(), AggregationError> {
     // Indices for swap extension
     let l_sterms = left[7];
-    let l_swapcm = left[8];
-    let l_vto = left[9];
+    let l_vto = left[8];
+    let l_side = left[9];
     let r_sterms = right[7];
-    let r_swapcm = right[8];
-    let r_vto = right[9];
+    let r_vto = right[8];
+    let r_side = right[9];
 
-    let l_is_transfer = l_sterms == F::ZERO && l_swapcm == F::ZERO && l_vto == F::ZERO;
-    let r_is_transfer = r_sterms == F::ZERO && r_swapcm == F::ZERO && r_vto == F::ZERO;
+    // SPEC: transfer-mode is indicated by sterms == 0; in that case vto==0 and side==0 must hold.
+    let l_is_transfer = l_sterms == F::ZERO;
+    let r_is_transfer = r_sterms == F::ZERO;
+
+    // Mixed modes are invalid (must be both transfer or both swap).
+    if l_is_transfer != r_is_transfer {
+        return Err(AggregationError::SwapPairRejected {
+            leaf,
+            reason: "mixed transfer/swap pair",
+        });
+    }
 
     if l_is_transfer && r_is_transfer {
+        ensure(
+            l_vto == F::ZERO,
+            AggregationError::SwapPairRejected {
+                leaf,
+                reason: "transfer mode: left vto != 0",
+            },
+        )?;
+        ensure(
+            l_side == F::ZERO,
+            AggregationError::SwapPairRejected {
+                leaf,
+                reason: "transfer mode: left side != 0",
+            },
+        )?;
+        ensure(
+            r_vto == F::ZERO,
+            AggregationError::SwapPairRejected {
+                leaf,
+                reason: "transfer mode: right vto != 0",
+            },
+        )?;
+        ensure(
+            r_side == F::ZERO,
+            AggregationError::SwapPairRejected {
+                leaf,
+                reason: "transfer mode: right side != 0",
+            },
+        )?;
         return Ok(());
     }
 
-    // Swap case: matching intent digest + per-leg tag binds expiry.
+    // Swap case: matching intent digest; side markers must be opposite; vto is per-leg expiry.
     ensure(
         l_sterms == r_sterms,
         AggregationError::SwapPairRejected {
@@ -213,34 +250,25 @@ fn check_pair_swap_or_transfer(
         },
     )?;
 
-    let l_expected = hash_pair(l_sterms, l_vto);
-    let r_expected = hash_pair(r_sterms, r_vto);
     ensure(
-        l_swapcm == l_expected,
+        (l_side == F::ZERO) || (l_side == F::ONE),
         AggregationError::SwapPairRejected {
             leaf,
-            reason: "left swapcm != H(sterms,vto)",
+            reason: "left side not in {0,1}",
         },
     )?;
     ensure(
-        r_swapcm == r_expected,
+        (r_side == F::ZERO) || (r_side == F::ONE),
         AggregationError::SwapPairRejected {
             leaf,
-            reason: "right swapcm != H(sterms,vto)",
+            reason: "right side not in {0,1}",
         },
     )?;
     ensure(
-        l_swapcm != F::ZERO,
+        l_side + r_side == F::ONE,
         AggregationError::SwapPairRejected {
             leaf,
-            reason: "left swapcm is zero",
-        },
-    )?;
-    ensure(
-        r_swapcm != F::ZERO,
-        AggregationError::SwapPairRejected {
-            leaf,
-            reason: "right swapcm is zero",
+            reason: "side markers not opposite (side_L + side_R != 1)",
         },
     )?;
 

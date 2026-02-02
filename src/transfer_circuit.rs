@@ -45,8 +45,8 @@ pub struct Spend2Output2PublicInputs {
     pub nf2: F,
     // --- swap extension
     pub sterms: F,
-    pub swapcm: F,
     pub vto: F,
+    pub side: F, // 0 = pk_A leg, 1 = pk_B leg (0 in transfer mode)
 }
 
 impl Default for Spend2Output2PublicInputs {
@@ -60,8 +60,8 @@ impl Default for Spend2Output2PublicInputs {
             nf1: F::ZERO,
             nf2: F::ZERO,
             sterms: F::ZERO,
-            swapcm: F::ZERO,
             vto: F::ZERO,
+            side: F::ZERO,
         }
     }
 }
@@ -79,6 +79,8 @@ pub struct SwapTermsWitness {
     pub asset_id_a: F,
     /// Asset id spent by pk_b (B -> A leg).
     pub asset_id_b: F,
+    /// High-entropy nonce for swap-terms binding (rejection-sampled to avoid sterms==0 off-chain).
+    pub nonce: F,
     pub pk_a: JubjubSubgroup,
     pub pk_b: JubjubSubgroup,
     pub amt_a_to_b: u128,
@@ -90,6 +92,7 @@ impl Default for SwapTermsWitness {
         Self {
             asset_id_a: F::ZERO,
             asset_id_b: F::ZERO,
+            nonce: F::ZERO,
             pk_a: JubjubSubgroup::identity(),
             pk_b: JubjubSubgroup::identity(),
             amt_a_to_b: 0,
@@ -130,8 +133,8 @@ impl Relation for Spend2Output2 {
             instance.nf1,
             instance.nf2,
             instance.sterms,
-            instance.swapcm,
             instance.vto,
+            instance.side,
         ])
     }
 
@@ -207,9 +210,6 @@ impl Relation for Spend2Output2 {
         let gates = swap_gates(std_lib, layouter, &swap_pi.sterms)?;
         // Make "transfer" mode (no swap) robust: opaque swap PIs must be zero.
         enforce_transfer_mode_defaults(std_lib, layouter, &gates, &swap_pi)?;
-        // in swap mode, make swap legs "self-validating" before rollup:
-        // - vto must be a u64
-        // - swapcm must bind (sterms, vto) as H2(sterms, vto)
         enforce_swap_mode_public_inputs(std_lib, layouter, &gates, &swap_pi)?;
 
         // Swap terms witness is still provided even for transfers; swap constraints are gated.
@@ -219,6 +219,7 @@ impl Relation for Spend2Output2 {
             layouter,
             &gates,
             &swap_pi.sterms,
+            &swap_pi.side,
             &old1.id,
             &sender,
             &new1,
@@ -318,8 +319,8 @@ struct SenderKeys {
 #[derive(Clone)]
 struct SwapPublicInputsAssigned {
     sterms: AssignedNative<F>,
-    swapcm: AssignedNative<F>,
     vto: AssignedNative<F>,
+    side: AssignedNative<F>,
 }
 
 #[derive(Clone)]
@@ -332,6 +333,7 @@ struct SwapGates {
 struct AssignedSwapTerms {
     asset_id_a: AssignedNative<F>,
     asset_id_b: AssignedNative<F>,
+    nonce: AssignedNative<F>,
     pk_a: AssignedPointXY,
     pk_b: AssignedPointXY,
     amt_a_to_b: AssignedNative<F>,
@@ -489,13 +491,9 @@ fn assign_swap_public_inputs<L: Layouter<F>>(
     instance: Value<Spend2Output2PublicInputs>,
 ) -> Result<SwapPublicInputsAssigned, Error> {
     let sterms: AssignedNative<F> = std_lib.assign(layouter, instance.map(|i| i.sterms))?;
-    let swapcm: AssignedNative<F> = std_lib.assign(layouter, instance.map(|i| i.swapcm))?;
     let vto: AssignedNative<F> = std_lib.assign(layouter, instance.map(|i| i.vto))?;
-    Ok(SwapPublicInputsAssigned {
-        sterms,
-        swapcm,
-        vto,
-    })
+    let side: AssignedNative<F> = std_lib.assign(layouter, instance.map(|i| i.side))?;
+    Ok(SwapPublicInputsAssigned { sterms, vto, side })
 }
 
 fn constrain_public_inputs<L: Layouter<F>>(
@@ -513,8 +511,8 @@ fn constrain_public_inputs<L: Layouter<F>>(
     std_lib.constrain_as_public_input(layouter, &core.nf1)?;
     std_lib.constrain_as_public_input(layouter, &core.nf2)?;
     std_lib.constrain_as_public_input(layouter, &swap.sterms)?;
-    std_lib.constrain_as_public_input(layouter, &swap.swapcm)?;
     std_lib.constrain_as_public_input(layouter, &swap.vto)?;
+    std_lib.constrain_as_public_input(layouter, &swap.side)?;
     Ok(())
 }
 
@@ -543,32 +541,35 @@ fn enforce_transfer_mode_defaults<L: Layouter<F>>(
     gates: &SwapGates,
     swap: &SwapPublicInputsAssigned,
 ) -> Result<(), Error> {
-    assert_zero_when_not_swap(std_lib, layouter, gates, &swap.swapcm)?;
     assert_zero_when_not_swap(std_lib, layouter, gates, &swap.vto)?;
+    assert_zero_when_not_swap(std_lib, layouter, gates, &swap.side)?;
     Ok(())
 }
 
-/// Swap-mode self-validation:
+/// Swap-mode typing:
 /// If `sterms != 0` then require:
 ///   - vto is a u64 (fits in 64 bits)
-///   - swapcm == H2(sterms, vto)  (Poseidon over [sterms, vto])
+///   - side ∈ {0,1}
 fn enforce_swap_mode_public_inputs<L: Layouter<F>>(
     std_lib: &ZkStdLib,
     layouter: &mut L,
     gates: &SwapGates,
     swap: &SwapPublicInputsAssigned,
 ) -> Result<(), Error> {
-    // Range-check vto into 64 bits (u64). This is cheap and makes vto well-typed.
-    // We don't need the bits; we only need the constraints.
+    // vto u64 only in swap mode (transfer mode already forces vto=0).
+    // Gate by selecting 0 when not swap so the range check is vacuous.
+    let zero = std_lib.assign_fixed(layouter, F::ZERO)?;
+    let vto_eff = std_lib.select(layouter, &gates.is_swap, &swap.vto, &zero)?;
     let _vto_bits =
-        std_lib.assigned_to_le_bits(layouter, &swap.vto, Some(VTO_BITS as usize), true)?;
+        std_lib.assigned_to_le_bits(layouter, &vto_eff, Some(VTO_BITS as usize), true)?;
 
-    // swapcm_expected := H2(sterms, vto)
-    // (Assumes the rollup leaf uses the same H2 definition.)
-    let swapcm_expected = std_lib.poseidon(layouter, &[swap.sterms.clone(), swap.vto.clone()])?;
-
-    // Enforce only in swap mode (sterms != 0).
-    assert_eq_when_swap(std_lib, layouter, gates, &swap.swapcm, &swapcm_expected)?;
+    // side ∈ {0,1} in swap mode.
+    let one = std_lib.assign_fixed(layouter, F::ONE)?;
+    let side_minus_one = std_lib.sub(layouter, &swap.side, &one)?;
+    let side_is_zero = std_lib.is_zero(layouter, &swap.side)?;
+    let side_is_one = std_lib.is_zero(layouter, &side_minus_one)?;
+    let side_is_bool = std_lib.or(layouter, &[side_is_zero, side_is_one])?;
+    assert_when_swap(std_lib, layouter, gates, side_is_bool)?;
     Ok(())
 }
 
@@ -579,6 +580,7 @@ fn assign_swap_terms<L: Layouter<F>>(
 ) -> Result<AssignedSwapTerms, Error> {
     let asset_id_a = std_lib.assign(layouter, terms_val.clone().map(|t| t.asset_id_a))?;
     let asset_id_b = std_lib.assign(layouter, terms_val.clone().map(|t| t.asset_id_b))?;
+    let nonce = std_lib.assign(layouter, terms_val.clone().map(|t| t.nonce))?;
 
     let pk_a = assign_point_xy_from_value(std_lib, layouter, terms_val.clone().map(|t| t.pk_a))?;
     let pk_b = assign_point_xy_from_value(std_lib, layouter, terms_val.clone().map(|t| t.pk_b))?;
@@ -592,6 +594,7 @@ fn assign_swap_terms<L: Layouter<F>>(
     Ok(AssignedSwapTerms {
         asset_id_a,
         asset_id_b,
+        nonce,
         pk_a,
         pk_b,
         amt_a_to_b,
@@ -605,6 +608,7 @@ fn enforce_swap_mode<L: Layouter<F>>(
     layouter: &mut L,
     gates: &SwapGates,
     sterms: &AssignedNative<F>,
+    side: &AssignedNative<F>,
     asset_id: &AssignedNative<F>,
     sender: &SenderKeys,
     new1: &AssignedUtxo,
@@ -612,10 +616,38 @@ fn enforce_swap_mode<L: Layouter<F>>(
     out2_pk: &AssignedPointXY,
     terms: &AssignedSwapTerms,
 ) -> Result<(), Error> {
+    let one = std_lib.assign_fixed(layouter, F::ONE)?;
+
     // If swap: pk_a != pk_b (avoid degenerate "swap with self" and ambiguous direction).
     let pk_a_eq_pk_b = points_equal(std_lib, layouter, &terms.pk_a, &terms.pk_b)?;
     let pk_a_ne_pk_b = std_lib.not(layouter, &pk_a_eq_pk_b)?;
     assert_when_swap(std_lib, layouter, gates, pk_a_ne_pk_b)?;
+
+    // If swap: pk_a != identity and pk_b != identity (defense-in-depth vs malformed/degenerate parties).
+    let id_pt: AssignedNativePoint<Jubjub> = std_lib
+        .jubjub()
+        .assign_fixed(layouter, JubjubSubgroup::identity())?;
+    let (id_x, id_y) = point_to_xy(std_lib, layouter, &id_pt)?;
+    let pk_a_is_id = points_equal_xy(
+        std_lib,
+        layouter,
+        &terms.pk_a.x,
+        &terms.pk_a.y,
+        &id_x,
+        &id_y,
+    )?;
+    let pk_b_is_id = points_equal_xy(
+        std_lib,
+        layouter,
+        &terms.pk_b.x,
+        &terms.pk_b.y,
+        &id_x,
+        &id_y,
+    )?;
+    let pk_a_not_id = std_lib.not(layouter, &pk_a_is_id)?;
+    let pk_b_not_id = std_lib.not(layouter, &pk_b_is_id)?;
+    assert_when_swap(std_lib, layouter, gates, pk_a_not_id)?;
+    assert_when_swap(std_lib, layouter, gates, pk_b_not_id)?;
 
     // If swap: sterms must bind to full terms (BOTH assets + both pk + both amounts).
     let sterms_expected = compute_sterms_expected(std_lib, layouter, terms)?;
@@ -641,14 +673,37 @@ fn enforce_swap_mode<L: Layouter<F>>(
     let sender_ok = std_lib.or(layouter, &[sender_is_a.clone(), sender_is_b.clone()])?;
     assert_when_swap(std_lib, layouter, gates, sender_ok)?;
 
-    // Choose expected counterparty and amount based on which side the sender is.
-    // If sender_is_a, counterparty is pk_b and amount is amt_a_to_b; else counterparty is pk_a and amount is amt_b_to_a.
-    let exp_pk1x = std_lib.select(layouter, &sender_is_a, &terms.pk_b.x, &terms.pk_a.x)?;
-    let exp_pk1y = std_lib.select(layouter, &sender_is_a, &terms.pk_b.y, &terms.pk_a.y)?;
-    let exp_amt1 = std_lib.select(layouter, &sender_is_a, &terms.amt_a_to_b, &terms.amt_b_to_a)?;
-    // Multi-asset swap: this leg's spent asset id must match the sender's side in the terms.
-    let exp_asset_id =
-        std_lib.select(layouter, &sender_is_a, &terms.asset_id_a, &terms.asset_id_b)?;
+    // Side marker binding:
+    //  - side is a bit (already checked in enforce_swap_mode_public_inputs)
+    //  - side=0 <=> sender is pk_a, side=1 <=> sender is pk_b
+    let side_minus_one = std_lib.sub(layouter, side, &one)?;
+    let side_is_zero = std_lib.is_zero(layouter, side)?;
+    let side_is_one = std_lib.is_zero(layouter, &side_minus_one)?;
+    // sender_is_b == side_is_one   (bit equality: (a&b) | (!a & !b))
+    let a_and_b = std_lib.and(layouter, &[sender_is_b.clone(), side_is_one.clone()])?;
+    let nota = std_lib.not(layouter, &sender_is_b)?;
+    let notb = std_lib.not(layouter, &side_is_one)?;
+    let nota_and_notb = std_lib.and(layouter, &[nota, notb])?;
+    let eq_bit = std_lib.or(layouter, &[a_and_b, nota_and_notb])?;
+    assert_when_swap(std_lib, layouter, gates, eq_bit)?;
+
+    // Choose expected counterparty and amount based on PUBLIC side marker:
+    // If side==0 (pk_a leg): counterparty is pk_b and amount is amt_a_to_b.
+    // If side==1 (pk_b leg): counterparty is pk_a and amount is amt_b_to_a.
+    let exp_pk1x = std_lib.select(layouter, &side_is_zero, &terms.pk_b.x, &terms.pk_a.x)?;
+    let exp_pk1y = std_lib.select(layouter, &side_is_zero, &terms.pk_b.y, &terms.pk_a.y)?;
+    let exp_amt1 = std_lib.select(
+        layouter,
+        &side_is_zero,
+        &terms.amt_a_to_b,
+        &terms.amt_b_to_a,
+    )?;
+    let exp_asset_id = std_lib.select(
+        layouter,
+        &side_is_zero,
+        &terms.asset_id_a,
+        &terms.asset_id_b,
+    )?;
     assert_eq_when_swap(std_lib, layouter, gates, asset_id, &exp_asset_id)?;
 
     // If swap => out1 recipient + amount match expectation
@@ -673,6 +728,7 @@ fn compute_sterms_expected<L: Layouter<F>>(
         layouter,
         &[
             tag,
+            terms.nonce.clone(),
             terms.asset_id_a.clone(),
             terms.asset_id_b.clone(),
             terms.pk_a.x.clone(),
@@ -855,29 +911,6 @@ pub(crate) fn host_nullify(commit: F, pk_x: F, pk_y: F) -> F {
     let tag = F::from(UTXO_NULLIFY_TAG);
     let h = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[tag, commit, pk_x]);
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h, pk_y, F::ZERO])
-}
-
-pub(crate) fn host_swap_terms(
-    asset_id_a: F,
-    asset_id_b: F,
-    pk_ax: F,
-    pk_ay: F,
-    pk_bx: F,
-    pk_by: F,
-    amt_a_to_b: u128,
-    amt_b_to_a: u128,
-) -> F {
-    let tag = F::from(SWAP_TERMS_TAG);
-    let a2b = F::from_u128(amt_a_to_b);
-    let b2a = F::from_u128(amt_b_to_a);
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[
-        tag, asset_id_a, asset_id_b, pk_ax, pk_ay, pk_bx, pk_by, a2b, b2a,
-    ])
-}
-
-pub(crate) fn host_swapcm(sterms: F, vto: F) -> F {
-    // H2(sterms, vto)
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[sterms, vto])
 }
 
 // -----------------------------
@@ -1144,8 +1177,8 @@ mod tests {
             nf1,
             nf2,
             sterms: F::ZERO,
-            swapcm: F::ZERO,
             vto: F::ZERO,
+            side: F::ZERO,
         };
 
         let witness = (
@@ -1282,15 +1315,22 @@ mod tests {
         while asset_id_b == asset_id {
             asset_id_b = F::random(&mut rng);
         }
+
+        // Nonce is rejection-sampled off-chain to avoid sterms==0 (SPEC).
+        let mut nonce = F::random(&mut rng);
         let mut sterms = host_swap_terms(
-            asset_id, asset_id_b, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 0,
+            nonce, asset_id, asset_id_b, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 0,
         );
-        if sterms == F::ZERO {
-            // extremely unlikely; perturb by changing the "other direction" amount
+        for _ in 0..8 {
+            if sterms != F::ZERO {
+                break;
+            }
+            nonce = F::random(&mut rng);
             sterms = host_swap_terms(
-                asset_id, asset_id_b, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 1,
+                nonce, asset_id, asset_id_b, pk_sx, pk_sy, pk_bx_t, pk_by_t, amt_a_to_b, 0,
             );
         }
+        assert_ne!(sterms, F::ZERO);
 
         // vto must be a u64; swapcm must be H2(sterms, vto)
         let vto_u64: u64 = rng.r#gen::<u64>();
@@ -1306,13 +1346,14 @@ mod tests {
             nf1,
             nf2,
             sterms,
-            swapcm,
             vto,
+            side: F::ZERO, // sender is pk_a in this test
         };
 
         let terms = SwapTermsWitness {
             asset_id_a: asset_id,
             asset_id_b,
+            nonce,
             pk_a: pk_sender,
             pk_b,
             amt_a_to_b,
@@ -1492,11 +1533,10 @@ mod tests {
 
     #[test]
     fn negative_transfer_mode_nonzero_swap_fields_is_rejected() {
-        // This specifically exercises the new robustness rule:
-        // if sterms == 0, swapcm and vto must be zero.
+        // if sterms == 0 (transfer), vto and side must be zero.
         let seed = 1011;
         let (mut instance, witness) = make_valid_transfer_case(seed);
-        instance.swapcm = F::from(7u64);
+        instance.side = F::ONE;
         assert!(rejects(&instance, witness, seed));
     }
 
@@ -1509,11 +1549,11 @@ mod tests {
     }
 
     #[test]
-    fn negative_swap_mode_bad_swapcm_is_rejected() {
-        // if sterms != 0 then swapcm must equal H2(sterms, vto)
+    fn negative_swap_mode_bad_side_is_rejected() {
+        // SPEC: side binds spend authorization (pk_a leg => side=0, pk_b leg => side=1).
         let seed = 1013;
         let (mut instance, witness) = make_valid_swap_case(seed);
-        instance.swapcm = instance.swapcm.add(&F::ONE);
+        instance.side = F::ONE; // wrong: sender is pk_a in make_valid_swap_case
         assert!(rejects(&instance, witness, seed));
     }
 }

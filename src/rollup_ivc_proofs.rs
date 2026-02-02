@@ -101,6 +101,9 @@ pub enum AggregationError {
 
     #[error("internal AGG proof failed")]
     InternalAggProofFailed,
+
+    #[error("leaf {leaf} swap pair rejected: {reason}")]
+    SwapPairRejected { leaf: usize, reason: &'static str },
 }
 
 fn ensure(cond: bool, err: AggregationError) -> Result<(), AggregationError> {
@@ -112,8 +115,8 @@ fn hash_pair(a: F, b: F) -> F {
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[a, b])
 }
 
-// Host-side: single Poseidon hash of all 7 public items
-fn host_instance_hash(items: [F; 7]) -> F {
+// Host-side: single Poseidon hash of all CLIENT_ITEMS_WIDTH public items
+fn host_instance_hash(items: [F; rollup_ivc_circuits::CLIENT_ITEMS_WIDTH]) -> F {
     use midnight_circuits::instructions::hash::HashCPU;
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&items)
 }
@@ -157,6 +160,119 @@ fn apply_tx_effects(commit_map: Map, null_map: Map, items: [F; 7]) -> (Map, Map)
     let commit_map = map_insert_many(commit_map, [(c1, F::ONE), (c2, F::ONE)]);
     let null_map = map_insert_many(null_map, [(nf1, F::ONE), (nf2, F::ONE)]);
     (commit_map, null_map)
+}
+
+fn apply_tx_effects10(
+    commit_map: Map,
+    null_map: Map,
+    items: [F; rollup_ivc_circuits::CLIENT_ITEMS_WIDTH],
+) -> (Map, Map) {
+    //  Order: [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2, sterms, vto, side]
+    let c1 = items[3];
+    let c2 = items[4];
+    let nf1 = items[5];
+    let nf2 = items[6];
+    let commit_map = map_insert_many(commit_map, [(c1, F::ONE), (c2, F::ONE)]);
+    let null_map = map_insert_many(null_map, [(nf1, F::ONE), (nf2, F::ONE)]);
+    (commit_map, null_map)
+}
+
+fn check_pair_swap_or_transfer(
+    leaf: usize,
+    left: &[F; rollup_ivc_circuits::CLIENT_ITEMS_WIDTH],
+    right: &[F; rollup_ivc_circuits::CLIENT_ITEMS_WIDTH],
+) -> Result<(), AggregationError> {
+    // Indices for swap extension
+    let l_sterms = left[7];
+    let l_vto = left[8];
+    let l_side = left[9];
+    let r_sterms = right[7];
+    let r_vto = right[8];
+    let r_side = right[9];
+
+    // SPEC: transfer-mode is indicated by sterms == 0; in that case vto==0 and side==0 must hold.
+    let l_is_transfer = l_sterms == F::ZERO;
+    let r_is_transfer = r_sterms == F::ZERO;
+
+    // Mixed modes are invalid (must be both transfer or both swap).
+    if l_is_transfer != r_is_transfer {
+        return Err(AggregationError::SwapPairRejected {
+            leaf,
+            reason: "mixed transfer/swap pair",
+        });
+    }
+
+    if l_is_transfer && r_is_transfer {
+        ensure(
+            l_vto == F::ZERO,
+            AggregationError::SwapPairRejected {
+                leaf,
+                reason: "transfer mode: left vto != 0",
+            },
+        )?;
+        ensure(
+            l_side == F::ZERO,
+            AggregationError::SwapPairRejected {
+                leaf,
+                reason: "transfer mode: left side != 0",
+            },
+        )?;
+        ensure(
+            r_vto == F::ZERO,
+            AggregationError::SwapPairRejected {
+                leaf,
+                reason: "transfer mode: right vto != 0",
+            },
+        )?;
+        ensure(
+            r_side == F::ZERO,
+            AggregationError::SwapPairRejected {
+                leaf,
+                reason: "transfer mode: right side != 0",
+            },
+        )?;
+        return Ok(());
+    }
+
+    // Swap case: matching intent digest; side markers must be opposite; vto is per-leg expiry.
+    ensure(
+        l_sterms == r_sterms,
+        AggregationError::SwapPairRejected {
+            leaf,
+            reason: "sterms mismatch",
+        },
+    )?;
+    ensure(
+        l_sterms != F::ZERO,
+        AggregationError::SwapPairRejected {
+            leaf,
+            reason: "sterms is zero",
+        },
+    )?;
+
+    ensure(
+        (l_side == F::ZERO) || (l_side == F::ONE),
+        AggregationError::SwapPairRejected {
+            leaf,
+            reason: "left side not in {0,1}",
+        },
+    )?;
+    ensure(
+        (r_side == F::ZERO) || (r_side == F::ONE),
+        AggregationError::SwapPairRejected {
+            leaf,
+            reason: "right side not in {0,1}",
+        },
+    )?;
+    ensure(
+        l_side + r_side == F::ONE,
+        AggregationError::SwapPairRejected {
+            leaf,
+            reason: "side markers not opposite (side_L + side_R != 1)",
+        },
+    )?;
+
+    Ok(())
 }
 
 fn verify_and_extract_acc(
@@ -252,7 +368,7 @@ pub struct TreeNode {
 pub struct ClientProof {
     pub state: F,
     pub proof: Vec<u8>,
-    pub public_items: [F; 7],
+    pub public_items: [F; rollup_ivc_circuits::CLIENT_ITEMS_WIDTH],
 }
 
 #[derive(Clone, Debug)]
@@ -324,7 +440,7 @@ fn check_client(
     side: &'static str,
     proof: &ClientProof,
 ) -> Result<(), AggregationError> {
-    let [tx_root, ..] = proof.public_items;
+    let tx_root = proof.public_items[0];
 
     ensure(
         roots.get(&tx_root) == F::ONE,
@@ -363,6 +479,7 @@ fn plan_leaves<'a>(
 
             check_client(&roots_map, i, "left", left)?;
             check_client(&roots_map, i, "right", right)?;
+            check_pair_swap_or_transfer(i, &left.public_items, &right.public_items)?;
 
             let c_pre = c_map.succinct_repr();
             let n_pre = n_map.succinct_repr();
@@ -370,8 +487,8 @@ fn plan_leaves<'a>(
             let pre_c_for_leaf = c_map.clone();
             let pre_n_for_leaf = n_map.clone();
 
-            let (c1, n1) = apply_tx_effects(c_map, n_map, left.public_items);
-            let (c2, n2) = apply_tx_effects(c1, n1, right.public_items);
+            let (c1, n1) = apply_tx_effects10(c_map, n_map, left.public_items);
+            let (c2, n2) = apply_tx_effects10(c1, n1, right.public_items);
 
             let expected_state = rollup_ivc_circuits::AggState {
                 c_pre,

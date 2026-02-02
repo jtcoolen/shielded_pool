@@ -1,9 +1,8 @@
 use std::time::Instant;
 
 use ff::Field;
+use ff::PrimeField;
 use group::Group;
-use thiserror::Error;
-
 use midnight_circuits::{
     compact_std_lib::{self, MidnightPK, cost_model},
     hash::poseidon::{PoseidonChip, PoseidonState},
@@ -19,6 +18,7 @@ use midnight_proofs::{
 };
 use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
+use thiserror::Error;
 
 use midnight_circuits::{
     ecc::foreign::ForeignEccChip,
@@ -26,6 +26,8 @@ use midnight_circuits::{
     types::AssignedForeignPoint,
     verifier::{BlstrsEmulation, SelfEmulation},
 };
+
+use crate::transfer_circuit::SwapTermsWitness;
 
 mod keccak_transcript;
 mod rollup_ivc_circuits;
@@ -53,7 +55,10 @@ type CommitmentMap = MapMt<F, PoseidonChip<F>>;
 const BATCH_SIZE: usize = 4;
 
 /// Probability that a client proof is generated against an older confirmed root.
-const LAG_TX_PROB: f64 = 0.35;
+const LAG_TX_PROB: f64 = 0.50;
+
+const SWAP_PAIR_PROB: f64 = 0.50;
+const SWAP_MAX_DELTA_BLKS: u64 = rollup_ivc_circuits::SWAP_MAX_DELTA_BLKS;
 
 const K_INTERNAL: u32 = 19;
 pub const AGG_K: u32 = K_INTERNAL;
@@ -87,10 +92,47 @@ fn err_string<E: std::fmt::Display>(e: E) -> String {
 // Host-side structures + helpers
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Single Poseidon hash of all 7 would-be public inputs (host-side).
-fn host_instance_hash(items: [F; 7]) -> F {
+/// Single Poseidon hash of all public inputs (host-side).
+fn host_instance_hash(items: [F; rollup_ivc_circuits::CLIENT_ITEMS_WIDTH]) -> F {
     use midnight_circuits::instructions::hash::HashCPU;
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&items)
+}
+
+fn host_hash2(a: F, b: F) -> F {
+    use midnight_circuits::instructions::hash::HashCPU;
+    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[a, b])
+}
+
+/// Poseidon commitment to swap terms:
+///   (tag, nonce, asset_id_a, asset_id_b, pk_a.x, pk_a.y, pk_b.x, pk_b.y, amt_a_to_b, amt_b_to_a)
+///
+/// Must match the in-circuit hashing for `sterms_expected`.
+fn host_swap_terms_hash(
+    nonce: F,
+    asset_id_a: F,
+    asset_id_b: F,
+    pk_a: &JubjubSubgroup,
+    pk_b: &JubjubSubgroup,
+    amt_a_to_b: u128,
+    amt_b_to_a: u128,
+) -> F {
+    use midnight_circuits::instructions::hash::HashCPU;
+
+    let a_xy = AssignedNativePoint::<Jubjub>::as_public_input(pk_a);
+    let b_xy = AssignedNativePoint::<Jubjub>::as_public_input(pk_b);
+
+    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[
+        F::from(transfer_circuit::SWAP_TERMS_TAG),
+        nonce,
+        asset_id_a,
+        asset_id_b,
+        a_xy[0],
+        a_xy[1],
+        b_xy[0],
+        b_xy[1],
+        F::from_u128(amt_a_to_b),
+        F::from_u128(amt_b_to_a),
+    ])
 }
 
 /// A note is spendable if it is unspent and confirmed at or before `latest_confirmed_root_idx`.
@@ -121,7 +163,7 @@ fn choose_sender_idx(
     let viable: Vec<usize> = accounts
         .iter()
         .enumerate()
-        .filter(|(_, a)| spendable_note_indices(a, latest_confirmed_root_idx).len() >= 2)
+        .filter(|(_, a)| has_two_spendable_same_asset(a, latest_confirmed_root_idx))
         .map(|(i, _)| i)
         .collect();
 
@@ -185,7 +227,24 @@ fn blind_pubkey(sender_pk: JubjubSubgroup, alpha: JubjubScalar) -> (JubjubSubgro
     (pk_blinded_point, fields[0], fields[1])
 }
 
-fn build_public_items(
+#[derive(Clone, Copy, Debug)]
+struct SwapFields {
+    sterms: F,
+    vto: F,
+    side: F,
+}
+
+impl SwapFields {
+    fn transfer() -> Self {
+        Self {
+            sterms: F::ZERO,
+            vto: F::ZERO,
+            side: F::ZERO,
+        }
+    }
+}
+
+fn build_public_items_with_swap(
     root_before: F,
     pk_bx: F,
     pk_by: F,
@@ -193,7 +252,12 @@ fn build_public_items(
     new2_commit: F,
     nf1: F,
     nf2: F,
-) -> ([F; 7], F, transfer_circuit::Spend2Output2PublicInputs) {
+    swap: SwapFields,
+) -> (
+    [F; rollup_ivc_circuits::CLIENT_ITEMS_WIDTH],
+    F,
+    transfer_circuit::Spend2Output2PublicInputs,
+) {
     let public_items = [
         root_before,
         pk_bx,
@@ -202,7 +266,11 @@ fn build_public_items(
         new2_commit,
         nf1,
         nf2,
+        swap.sterms,
+        swap.vto,
+        swap.side,
     ];
+
     let state = host_instance_hash(public_items);
 
     let instance = transfer_circuit::Spend2Output2PublicInputs {
@@ -213,6 +281,9 @@ fn build_public_items(
         new_c2: new2_commit,
         nf1,
         nf2,
+        sterms: swap.sterms,
+        vto: swap.vto,
+        side: swap.side,
     };
 
     (public_items, state, instance)
@@ -232,8 +303,9 @@ fn scalar_to_field(alpha: JubjubScalar) -> Result<F, AppError> {
 
 #[derive(Clone)]
 struct ChainState {
-    /// Single global asset id used for all notes in this demo.
-    asset_id: F,
+    /// Demo: multiple assets exist simultaneously; each note carries its own asset id.
+    /// (The spend circuit still requires a single asset *per transaction leg*.)
+    asset_ids: Vec<F>,
 
     accounts: Vec<transfer_circuit::Account>,
     commitment_map: CommitmentMap,
@@ -283,11 +355,12 @@ fn seed_deposits(
     rng: &mut ChaCha8Rng,
     accounts: &mut [transfer_circuit::Account],
     commitment_map: &mut CommitmentMap,
-    asset_id: F,
+    asset_ids: &[F],
     deposits_per_account: usize,
 ) {
     for acc in accounts.iter_mut() {
         for _ in 0..deposits_per_account {
+            let asset_id = asset_ids[rng.gen_range(0..asset_ids.len())];
             let utxo = transfer_circuit::Utxo {
                 asset_id,
                 amount: random_amount(&mut *rng),
@@ -312,7 +385,13 @@ fn init_chain_state(
     num_accounts: usize,
     deposits_per_account: usize,
 ) -> ChainState {
-    let asset_id = F::random(&mut *rng);
+    // Demo: create two distinct assets.
+    let asset_a = F::random(&mut *rng);
+    let mut asset_b = F::random(&mut *rng);
+    while asset_b == asset_a {
+        asset_b = F::random(&mut *rng);
+    }
+    let asset_ids = vec![asset_a, asset_b];
 
     let mut accounts = init_accounts(num_accounts);
     let mut commitment_map = CommitmentMap::new(&F::ZERO);
@@ -322,7 +401,7 @@ fn init_chain_state(
         &mut *rng,
         &mut accounts,
         &mut commitment_map,
-        asset_id,
+        &asset_ids,
         deposits_per_account,
     );
 
@@ -332,7 +411,7 @@ fn init_chain_state(
     commitment_roots_set.insert(&genesis_root, &F::ONE);
 
     ChainState {
-        asset_id,
+        asset_ids,
         accounts,
         commitment_map_history: vec![commitment_map.clone()],
         commitment_root_history: vec![genesis_root],
@@ -344,8 +423,49 @@ fn init_chain_state(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Transaction planning + execution
+// Transaction intent (Transfer vs Swap) + planning helpers
 ////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Clone, Debug)]
+struct SwapLegContext {
+    fields: SwapFields,
+    terms: SwapTermsWitness,
+    /// Amount routed to recipient1 (counterparty) for this leg.
+    out1_amount: u128,
+}
+
+#[derive(Clone, Debug)]
+enum TxIntent {
+    Transfer,
+    Swap(SwapLegContext),
+}
+
+impl TxIntent {
+    fn transfer() -> Self {
+        TxIntent::Transfer
+    }
+
+    fn swap_fields(&self) -> SwapFields {
+        match self {
+            TxIntent::Transfer => SwapFields::transfer(),
+            TxIntent::Swap(ctx) => ctx.fields,
+        }
+    }
+
+    fn swap_terms(&self) -> SwapTermsWitness {
+        match self {
+            TxIntent::Transfer => SwapTermsWitness::default(),
+            TxIntent::Swap(ctx) => ctx.terms.clone(),
+        }
+    }
+
+    fn out1_override(&self) -> Option<u128> {
+        match self {
+            TxIntent::Transfer => None,
+            TxIntent::Swap(ctx) => Some(ctx.out1_amount),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct PlannedTx {
@@ -363,14 +483,38 @@ fn plan_transaction(
     latest_confirmed_root_idx: usize,
 ) -> Option<PlannedTx> {
     let sender_idx = choose_sender_idx(rng, shadow_accounts, latest_confirmed_root_idx)?;
-    let spendable = spendable_note_indices(&shadow_accounts[sender_idx], latest_confirmed_root_idx);
-    let (old1_idx, old2_idx) = choose_two_distinct(rng, &spendable);
-
     let recipient1_idx = rng.gen_range(0..shadow_accounts.len());
     let recipient2_idx = rng.gen_range(0..shadow_accounts.len());
+    plan_transaction_for_sender(
+        rng,
+        shadow_accounts,
+        latest_confirmed_root_idx,
+        sender_idx,
+        recipient1_idx,
+        recipient2_idx,
+    )
+}
+
+fn plan_transaction_for_sender(
+    rng: &mut ChaCha8Rng,
+    shadow_accounts: &[transfer_circuit::Account],
+    latest_confirmed_root_idx: usize,
+    sender_idx: usize,
+    recipient1_idx: usize,
+    recipient2_idx: usize,
+) -> Option<PlannedTx> {
+    let (old1_idx, old2_idx) = choose_two_spendable_same_asset(
+        rng,
+        &shadow_accounts[sender_idx],
+        latest_confirmed_root_idx,
+    )?;
 
     let old1 = &shadow_accounts[sender_idx].wallet[old1_idx];
     let old2 = &shadow_accounts[sender_idx].wallet[old2_idx];
+    // Circuit requires old1.asset_id == old2.asset_id; selection above guarantees it, but keep invariant explicit.
+    if old1.utxo.asset_id != old2.utxo.asset_id {
+        return None;
+    }
     let min_root_idx_for_inputs = old1.confirmed_at_root_idx.max(old2.confirmed_at_root_idx);
 
     let root_idx_for_proof =
@@ -386,9 +530,411 @@ fn plan_transaction(
     })
 }
 
+fn mark_planned_inputs_spent(accounts: &mut [transfer_circuit::Account], plan: &PlannedTx) {
+    accounts[plan.sender_idx].wallet[plan.old1_idx].spent = true;
+    accounts[plan.sender_idx].wallet[plan.old2_idx].spent = true;
+}
+
+fn plan_transaction_with_retries(
+    rng: &mut ChaCha8Rng,
+    accounts: &[transfer_circuit::Account],
+    latest_confirmed_root_idx: usize,
+    max_attempts: usize,
+) -> Option<PlannedTx> {
+    (0..max_attempts).find_map(|_| plan_transaction(rng, accounts, latest_confirmed_root_idx))
+}
+
+/// For non-swap pairs, plan left then plan right while “reserving” left inputs in a temporary copy.
+/// This prevents accidental double-spends within the same pair.
+fn plan_transfer_pair(
+    rng: &mut ChaCha8Rng,
+    accounts: &[transfer_circuit::Account],
+    latest_confirmed_root_idx: usize,
+) -> Result<(PlannedTx, PlannedTx), AppError> {
+    const PLAN_RETRIES: usize = 32;
+
+    let left =
+        plan_transaction_with_retries(rng, accounts, latest_confirmed_root_idx, PLAN_RETRIES)
+            .ok_or_else(|| {
+                AppError::ReplayGuard("no viable sender for transfer (left)".to_string())
+            })?;
+
+    let mut reserved = accounts.to_vec();
+    mark_planned_inputs_spent(&mut reserved, &left);
+
+    let right =
+        plan_transaction_with_retries(rng, &reserved, latest_confirmed_root_idx, PLAN_RETRIES)
+            .ok_or_else(|| {
+                AppError::ReplayGuard("no viable sender for transfer (right)".to_string())
+            })?;
+
+    Ok((left, right))
+}
+
+/// Returns true iff an account has at least two spendable notes with the SAME asset id.
+fn has_two_spendable_same_asset(
+    account: &transfer_circuit::Account,
+    latest_confirmed_root_idx: usize,
+) -> bool {
+    let spendable = spendable_note_indices(account, latest_confirmed_root_idx);
+    if spendable.len() < 2 {
+        return false;
+    }
+    for (i, &idx_i) in spendable.iter().enumerate() {
+        let asset = account.wallet[idx_i].utxo.asset_id;
+        for &idx_j in spendable.iter().skip(i + 1) {
+            if account.wallet[idx_j].utxo.asset_id == asset {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Choose two distinct spendable notes with the same asset id. Returns (old1_idx, old2_idx).
+fn choose_two_spendable_same_asset(
+    rng: &mut ChaCha8Rng,
+    account: &transfer_circuit::Account,
+    latest_confirmed_root_idx: usize,
+) -> Option<(usize, usize)> {
+    let spendable = spendable_note_indices(account, latest_confirmed_root_idx);
+    if spendable.len() < 2 {
+        return None;
+    }
+
+    // Randomized attempts first.
+    for _ in 0..16 {
+        let a = spendable[rng.gen_range(0..spendable.len())];
+        let asset = account.wallet[a].utxo.asset_id;
+        let same: Vec<usize> = spendable
+            .iter()
+            .copied()
+            .filter(|i| account.wallet[*i].utxo.asset_id == asset)
+            .collect();
+        if same.len() >= 2 {
+            return Some(choose_two_distinct(rng, &same));
+        }
+    }
+
+    // Deterministic fallback.
+    for &a in &spendable {
+        let asset = account.wallet[a].utxo.asset_id;
+        let same: Vec<usize> = spendable
+            .iter()
+            .copied()
+            .filter(|i| account.wallet[*i].utxo.asset_id == asset)
+            .collect();
+        if same.len() >= 2 {
+            return Some(choose_two_distinct(rng, &same));
+        }
+    }
+
+    None
+}
+
+fn choose_sender_idx_excluding(
+    rng: &mut ChaCha8Rng,
+    accounts: &[transfer_circuit::Account],
+    latest_confirmed_root_idx: usize,
+    exclude: usize,
+) -> Option<usize> {
+    let viable: Vec<usize> = accounts
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| {
+            *i != exclude && has_two_spendable_same_asset(a, latest_confirmed_root_idx)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if viable.is_empty() {
+        None
+    } else {
+        Some(viable[rng.gen_range(0..viable.len())])
+    }
+}
+
+fn inputs_total_amount(accounts: &[transfer_circuit::Account], plan: &PlannedTx) -> u128 {
+    let a = &accounts[plan.sender_idx].wallet[plan.old1_idx].utxo.amount;
+    let b = &accounts[plan.sender_idx].wallet[plan.old2_idx].utxo.amount;
+    a.saturating_add(*b)
+}
+
+fn choose_swap_vto(rng: &mut ChaCha8Rng, blk_post_u64: u64) -> (u64, F) {
+    let vto_u64 = blk_post_u64 + rng.gen_range(0..=SWAP_MAX_DELTA_BLKS);
+    (vto_u64, F::from(vto_u64))
+}
+
+#[derive(Clone, Debug)]
+struct SwapAgreement {
+    a_idx: usize,
+    b_idx: usize,
+    asset_id_a: F,
+    asset_id_b: F,
+    pk_a: JubjubSubgroup,
+    pk_b: JubjubSubgroup,
+    amt_a_to_b: u128,
+    amt_b_to_a: u128,
+    nonce: F,
+    sterms: F,
+}
+
+fn sample_bounded_amount(rng: &mut ChaCha8Rng, max: u128) -> u128 {
+    if max == 0 { 0 } else { rng.gen_range(0..=max) }
+}
+
+fn build_swap_agreement(
+    rng: &mut ChaCha8Rng,
+    asset_id_a: F,
+    asset_id_b: F,
+    accounts: &[transfer_circuit::Account],
+    a_idx: usize,
+    b_idx: usize,
+    plan_a: &PlannedTx,
+    plan_b: &PlannedTx,
+) -> Result<SwapAgreement, AppError> {
+    // Totals for the selected inputs.
+    let total_a = inputs_total_amount(accounts, plan_a);
+    let total_b = inputs_total_amount(accounts, plan_b);
+
+    // The hash output being zero is astronomically unlikely, but if the circuit treats sterms==0
+    // specially (e.g., “no swap”), we robustly avoid that by resampling amounts a few times.
+    const MAX_STERMS_RESAMPLE: usize = 16;
+
+    let pk_a = accounts[a_idx].pk_point.clone();
+    let pk_b = accounts[b_idx].pk_point.clone();
+
+    for _ in 0..MAX_STERMS_RESAMPLE {
+        let amt_a_to_b = sample_bounded_amount(rng, total_a);
+        let amt_b_to_a = sample_bounded_amount(rng, total_b);
+        let nonce = F::random(&mut *rng);
+        let sterms = host_swap_terms_hash(
+            nonce, asset_id_a, asset_id_b, &pk_a, &pk_b, amt_a_to_b, amt_b_to_a,
+        );
+
+        if sterms != F::ZERO {
+            return Ok(SwapAgreement {
+                a_idx,
+                b_idx,
+                asset_id_a,
+                asset_id_b,
+                pk_a,
+                pk_b,
+                amt_a_to_b,
+                amt_b_to_a,
+                nonce,
+                sterms,
+            });
+        }
+    }
+
+    Err(AppError::ReplayGuard(
+        "failed to sample nonzero swap terms hash".to_string(),
+    ))
+}
+
+fn swap_terms_witness(ag: &SwapAgreement) -> SwapTermsWitness {
+    SwapTermsWitness {
+        asset_id_a: ag.asset_id_a,
+        asset_id_b: ag.asset_id_b,
+        nonce: ag.nonce,
+        pk_a: ag.pk_a.clone(),
+        pk_b: ag.pk_b.clone(),
+        amt_a_to_b: ag.amt_a_to_b,
+        amt_b_to_a: ag.amt_b_to_a,
+        ..Default::default()
+    }
+}
+
+fn swap_leg_intent_for_a_to_b(
+    rng: &mut ChaCha8Rng,
+    blk_post_u64: u64,
+    ag: &SwapAgreement,
+) -> TxIntent {
+    let (_vto_u64, vto) = choose_swap_vto(rng, blk_post_u64);
+
+    TxIntent::Swap(SwapLegContext {
+        fields: SwapFields {
+            sterms: ag.sterms,
+            vto,
+            side: F::ZERO, // pk_A leg
+        },
+        terms: swap_terms_witness(ag),
+        out1_amount: ag.amt_a_to_b,
+    })
+}
+
+fn swap_leg_intent_for_b_to_a(
+    rng: &mut ChaCha8Rng,
+    blk_post_u64: u64,
+    ag: &SwapAgreement,
+) -> TxIntent {
+    let (_vto_u64, vto) = choose_swap_vto(rng, blk_post_u64);
+
+    TxIntent::Swap(SwapLegContext {
+        fields: SwapFields {
+            sterms: ag.sterms,
+            vto,
+            side: F::ONE, // pk_B leg
+        },
+        terms: swap_terms_witness(ag),
+        out1_amount: ag.amt_b_to_a,
+    })
+}
+
+fn plan_swap_pair(
+    rng: &mut ChaCha8Rng,
+    accounts: &[transfer_circuit::Account],
+    latest_confirmed_root_idx: usize,
+    blk_post_u64: u64,
+) -> Option<(PlannedTx, PlannedTx, TxIntent, TxIntent)> {
+    const SWAP_RETRIES: usize = 32;
+    for _ in 0..SWAP_RETRIES {
+        let a = choose_sender_idx(rng, accounts, latest_confirmed_root_idx)?;
+        let b = choose_sender_idx_excluding(rng, accounts, latest_confirmed_root_idx, a)?;
+
+        // Plan A normally (random asset)
+        let plan_a =
+            plan_transaction_for_sender(rng, accounts, latest_confirmed_root_idx, a, b, a)?;
+        let asset_id_a = accounts[a].wallet[plan_a.old1_idx].utxo.asset_id;
+
+        // Force B to use a *different* asset if possible by retrying B planning
+        // (works great in your 2-asset demo)
+        let asset_id_b = {
+            // try a few times to get a different asset for B
+            let mut got: Option<(PlannedTx, F)> = None;
+            for _ in 0..16 {
+                let plan_b =
+                    plan_transaction_for_sender(rng, accounts, latest_confirmed_root_idx, b, a, b)?;
+                let asset = accounts[b].wallet[plan_b.old1_idx].utxo.asset_id;
+                if asset != asset_id_a {
+                    got = Some((plan_b, asset));
+                    break;
+                }
+            }
+            let (plan_b, asset_id_b) = match got {
+                Some(x) => x,
+                None => continue, // IMPORTANT: retry outer loop, don't return None
+            };
+            // Continue with swap agreement creation using plan_b
+            let ag = build_swap_agreement(
+                rng, asset_id_a, asset_id_b, accounts, a, b, &plan_a, &plan_b,
+            )
+            .ok()?;
+            let intent_a = swap_leg_intent_for_a_to_b(rng, blk_post_u64, &ag);
+            let intent_b = swap_leg_intent_for_b_to_a(rng, blk_post_u64, &ag);
+            return Some((plan_a, plan_b, intent_a, intent_b));
+        };
+        let _ = asset_id_b; // (kept for clarity)
+    }
+    return None;
+}
+
+#[derive(Clone, Debug)]
+struct PairPlan {
+    left: PlannedTx,
+    right: PlannedTx,
+    left_intent: TxIntent,
+    right_intent: TxIntent,
+    label: &'static str,
+}
+
+fn decide_pair_plan(
+    rng: &mut ChaCha8Rng,
+    do_swap: bool,
+    accounts: &[transfer_circuit::Account],
+    latest_confirmed_root_idx: usize,
+    blk_post_u64: u64,
+) -> Result<PairPlan, AppError> {
+    if do_swap {
+        if let Some((pl, pr, il, ir)) =
+            plan_swap_pair(rng, accounts, latest_confirmed_root_idx, blk_post_u64)
+        {
+            return Ok(PairPlan {
+                left: pl,
+                right: pr,
+                left_intent: il,
+                right_intent: ir,
+                label: "SWAP",
+            });
+        }
+
+        // Fallback cleanly to transfers if a swap pair is not feasible.
+        let (pl, pr) = plan_transfer_pair(rng, accounts, latest_confirmed_root_idx)?;
+        return Ok(PairPlan {
+            left: pl,
+            right: pr,
+            left_intent: TxIntent::transfer(),
+            right_intent: TxIntent::transfer(),
+            label: "XFER(fallback)",
+        });
+    }
+
+    let (pl, pr) = plan_transfer_pair(rng, accounts, latest_confirmed_root_idx)?;
+    Ok(PairPlan {
+        left: pl,
+        right: pr,
+        left_intent: TxIntent::transfer(),
+        right_intent: TxIntent::transfer(),
+        label: "XFER",
+    })
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Transaction building + execution
+////////////////////////////////////////////////////////////////////////////////
+
+fn ensure_note_unspent_in_shadow(
+    account: &transfer_circuit::Account,
+    note_idx: usize,
+    context: &str,
+) -> Result<(), AppError> {
+    if account
+        .wallet
+        .get(note_idx)
+        .map(|n| n.spent)
+        .unwrap_or(true)
+    {
+        return Err(AppError::ReplayGuard(format!(
+            "{context}: selected note is already spent (idx={note_idx})"
+        )));
+    }
+    Ok(())
+}
+
+fn load_historic_commit_state(
+    commitment_map_history: &[CommitmentMap],
+    commitment_root_history: &[F],
+    root_idx_for_proof: usize,
+) -> Result<(CommitmentMap, F), AppError> {
+    let historic_commit_map = commitment_map_history
+        .get(root_idx_for_proof)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::ReplayGuard(format!(
+                "root_idx_for_proof out of bounds: {root_idx_for_proof}"
+            ))
+        })?;
+    let root_before = *commitment_root_history
+        .get(root_idx_for_proof)
+        .ok_or_else(|| {
+            AppError::ReplayGuard(format!(
+                "commitment_root_history missing idx: {root_idx_for_proof}"
+            ))
+        })?;
+
+    let map_root = historic_commit_map.succinct_repr();
+    if map_root != root_before {
+        return Err(AppError::ReplayGuard(format!(
+            "historic map drift at idx {root_idx_for_proof}: stored_root={root_before:?} map_root={map_root:?}"
+        )));
+    }
+
+    Ok((historic_commit_map, root_before))
+}
+
 struct BuiltTx {
     // For proof payload
-    public_items: [F; 7],
+    public_items: [F; rollup_ivc_circuits::CLIENT_ITEMS_WIDTH],
     state: F,
     instance: transfer_circuit::Spend2Output2PublicInputs,
     witness: (
@@ -401,6 +947,7 @@ struct BuiltTx {
         transfer_circuit::Utxo,
         JubjubSubgroup,
         JubjubSubgroup,
+        SwapTermsWitness,
     ),
 
     // For state updates
@@ -427,25 +974,26 @@ struct TxEffects {
     recipient2_idx: usize,
 }
 
-fn effects_from(plan: &PlannedTx, built: &BuiltTx) -> TxEffects {
-    TxEffects {
-        nf1: built.nf1,
-        nf2: built.nf2,
-        new1_commit: built.new1_commit,
-        new2_commit: built.new2_commit,
-        new1_utxo: built.new1_utxo.clone(),
-        new2_utxo: built.new2_utxo.clone(),
-        sender_idx: plan.sender_idx,
-        old1_idx: plan.old1_idx,
-        old2_idx: plan.old2_idx,
-        recipient1_idx: plan.recipient1_idx,
-        recipient2_idx: plan.recipient2_idx,
+impl TxEffects {
+    fn from_plan_and_built(plan: &PlannedTx, built: &BuiltTx) -> Self {
+        Self {
+            nf1: built.nf1,
+            nf2: built.nf2,
+            new1_commit: built.new1_commit,
+            new2_commit: built.new2_commit,
+            new1_utxo: built.new1_utxo.clone(),
+            new2_utxo: built.new2_utxo.clone(),
+            sender_idx: plan.sender_idx,
+            old1_idx: plan.old1_idx,
+            old2_idx: plan.old2_idx,
+            recipient1_idx: plan.recipient1_idx,
+            recipient2_idx: plan.recipient2_idx,
+        }
     }
 }
 
 fn build_transaction(
     rng: &mut ChaCha8Rng,
-    asset_id: F,
     shadow_accounts: &[transfer_circuit::Account],
     commitment_map_history: &[CommitmentMap],
     commitment_root_history: &[F],
@@ -453,14 +1001,44 @@ fn build_transaction(
     latest_confirmed_root_idx: usize,
     batch_idx: usize,
     tx_idx: usize,
+    intent: TxIntent,
 ) -> Result<(BuiltTx, F), AppError> {
+    // Defensive: don’t allow selecting already-spent inputs in the evolving shadow state.
+    ensure_note_unspent_in_shadow(
+        &shadow_accounts[plan.sender_idx],
+        plan.old1_idx,
+        "build_transaction(old1)",
+    )?;
+    ensure_note_unspent_in_shadow(
+        &shadow_accounts[plan.sender_idx],
+        plan.old2_idx,
+        "build_transaction(old2)",
+    )?;
+
     let sender = shadow_accounts[plan.sender_idx].clone();
     let old1 = shadow_accounts[plan.sender_idx].wallet[plan.old1_idx].clone();
     let old2 = shadow_accounts[plan.sender_idx].wallet[plan.old2_idx].clone();
+    // Per-leg constraint: both inputs (and therefore both outputs) share the same asset id.
+    let asset_id = old1.utxo.asset_id;
+    if old2.utxo.asset_id != asset_id {
+        return Err(AppError::ReplayGuard(
+            "selected inputs have different asset ids".to_string(),
+        ));
+    }
 
-    let historic_commit_map = commitment_map_history[plan.root_idx_for_proof].clone();
-    let root_before = commitment_root_history[plan.root_idx_for_proof];
-    debug_assert_eq!(historic_commit_map.succinct_repr(), root_before);
+    // Validate chosen proof root is within admissible range for the shadow state.
+    if plan.root_idx_for_proof > latest_confirmed_root_idx {
+        return Err(AppError::ReplayGuard(format!(
+            "root_idx_for_proof {} > latest_confirmed_root_idx {}",
+            plan.root_idx_for_proof, latest_confirmed_root_idx
+        )));
+    }
+
+    let (historic_commit_map, root_before) = load_historic_commit_state(
+        commitment_map_history,
+        commitment_root_history,
+        plan.root_idx_for_proof,
+    )?;
 
     if plan.root_idx_for_proof != latest_confirmed_root_idx {
         println!(
@@ -469,8 +1047,17 @@ fn build_transaction(
         );
     }
 
-    let total = old1.utxo.amount + old2.utxo.amount;
-    let (out1_amt, out2_amt) = split_amount(&mut *rng, total);
+    let total = old1.utxo.amount.saturating_add(old2.utxo.amount);
+
+    let (out1_amt, out2_amt) = match intent.out1_override() {
+        Some(a) => {
+            if a > total {
+                return Err(AppError::ReplayGuard("swap out1_amt > inputs".to_string()));
+            }
+            (a, total - a)
+        }
+        None => split_amount(&mut *rng, total),
+    };
 
     let new1_utxo = transfer_circuit::Utxo {
         asset_id,
@@ -504,7 +1091,10 @@ fn build_transaction(
     let (_pk_blinded_point, pk_bx, pk_by) = blind_pubkey(sender.pk_point, alpha);
     let alpha_f = scalar_to_field(alpha)?;
 
-    let (public_items, state, instance) = build_public_items(
+    let swap_fields = intent.swap_fields();
+    let swap_terms = intent.swap_terms();
+
+    let (public_items, state, instance) = build_public_items_with_swap(
         root_before,
         pk_bx,
         pk_by,
@@ -512,6 +1102,7 @@ fn build_transaction(
         new2_commit,
         nf1,
         nf2,
+        swap_fields,
     );
 
     let witness = (
@@ -524,6 +1115,7 @@ fn build_transaction(
         new2_utxo.clone(),
         shadow_accounts[r1].pk_point,
         shadow_accounts[r2].pk_point,
+        swap_terms,
     );
 
     Ok((
@@ -606,6 +1198,51 @@ fn prove_client(
         proof,
         public_items: built.public_items,
     })
+}
+
+fn build_prove_apply_one(
+    rng: &mut ChaCha8Rng,
+    srs: &ParamsKZG<E>,
+    pk: &MidnightPK<transfer_circuit::Spend2Output2>,
+    relation: &transfer_circuit::Spend2Output2,
+    plan: &PlannedTx,
+    intent: TxIntent,
+    // Shadow state (in-batch)
+    shadow_accounts: &mut [transfer_circuit::Account],
+    shadow_commitment_map: &mut CommitmentMap,
+    shadow_nullifier_map: &mut CommitmentMap,
+    // Historic (committed) state
+    commitment_map_history: &[CommitmentMap],
+    commitment_root_history: &[F],
+    latest_confirmed_root_idx: usize,
+    confirm_at_idx: usize,
+    batch_idx: usize,
+    tx_idx: usize,
+) -> Result<rollup_ivc_proofs::ClientProof, AppError> {
+    let (built, _root_before) = build_transaction(
+        rng,
+        shadow_accounts,
+        commitment_map_history,
+        commitment_root_history,
+        plan,
+        latest_confirmed_root_idx,
+        batch_idx,
+        tx_idx,
+        intent,
+    )?;
+
+    let effects = TxEffects::from_plan_and_built(plan, &built);
+    let proof = prove_client(srs, pk, relation, built)?;
+
+    apply_tx_effects(
+        shadow_accounts,
+        shadow_commitment_map,
+        shadow_nullifier_map,
+        confirm_at_idx,
+        &effects,
+    );
+
+    Ok(proof)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -724,10 +1361,6 @@ fn run() -> Result<(), AppError> {
     let mut chain = init_chain_state(&mut rng, NUM_ACCOUNTS, NUM_SEED_DEPOSITS_PER_ACCOUNT);
 
     // Global L2 block counter (demo "on-chain head").
-    //
-    // We will prove in the final wrap proof that:
-    //   blk_post = blk_pre + 1
-    // and bind the batch to blk_post.
     let mut blk_head: u64 = chain.blk_head;
 
     println!(
@@ -758,6 +1391,9 @@ fn run() -> Result<(), AppError> {
         let mut shadow_nullifier_map = chain.nullifier_map.clone();
         let mut shadow_commitment_map = chain.commitment_map.clone();
 
+        // New outputs become spendable at the next committed root index.
+        let confirm_at_idx = chain.commitment_root_history.len();
+
         println!(
             "\n=== Starting batch {} from commitment root {:?} ===",
             batch_idx,
@@ -765,66 +1401,78 @@ fn run() -> Result<(), AppError> {
         );
 
         let mut client_proofs: Vec<rollup_ivc_proofs::ClientProof> = Vec::with_capacity(BATCH_SIZE);
-        let mut batch_failed = false;
 
-        for _ in 0..BATCH_SIZE {
+        // We must produce proofs in PAIRS (leaf base_step aggregates left+right).
+        for pair_idx in 0..(BATCH_SIZE / 2) {
             if total_transfers_done >= NUM_TRANSFERS {
                 break;
             }
 
-            let plan = match plan_transaction(
-                &mut rng,
-                &shadow_accounts,
-                pre.latest_confirmed_root_idx,
-            ) {
-                Some(p) => p,
-                None => {
-                    println!(
-                        "[batch {}] no account has two spendable confirmed notes; stopping batching.",
-                        batch_idx
-                    );
-                    batch_failed = true;
-                    break;
-                }
-            };
+            let do_swap = rng.gen_bool(SWAP_PAIR_PROB);
 
-            // Build ONCE per tx (do not rebuild for effects; that breaks consistency).
-            let (built, _root_before) = build_transaction(
+            let pair = decide_pair_plan(
                 &mut rng,
-                chain.asset_id,
+                do_swap,
                 &shadow_accounts,
-                &chain.commitment_map_history,
-                &chain.commitment_root_history,
-                &plan,
                 pre.latest_confirmed_root_idx,
-                batch_idx,
-                total_transfers_done,
+                blk_post_u64,
             )?;
 
-            let effects = effects_from(&plan, &built);
-            let proof = prove_client(&srs, &pk, &relation, built)?;
-            client_proofs.push(proof);
-
-            // Apply state transition to shadow rollup state using the exact same tx data as proved.
-            apply_tx_effects(
-                &mut shadow_accounts,
-                &mut shadow_commitment_map,
-                &mut shadow_nullifier_map,
-                chain.commitment_root_history.len(),
-                &effects,
-            );
-
             println!(
-                "[batch {}, tx {}] shadow commitment root updated: {:?}",
-                batch_idx,
-                total_transfers_done,
-                shadow_commitment_map.succinct_repr()
+                "[batch {}, pair {}] kind={}, blk_post={}",
+                batch_idx, pair_idx, pair.label, blk_post_u64
             );
 
-            total_transfers_done += 1;
+            // LEFT
+            {
+                let tx_left_idx = total_transfers_done;
+                let proof_l = build_prove_apply_one(
+                    &mut rng,
+                    &srs,
+                    &pk,
+                    &relation,
+                    &pair.left,
+                    pair.left_intent,
+                    &mut shadow_accounts,
+                    &mut shadow_commitment_map,
+                    &mut shadow_nullifier_map,
+                    &chain.commitment_map_history,
+                    &chain.commitment_root_history,
+                    pre.latest_confirmed_root_idx,
+                    confirm_at_idx,
+                    batch_idx,
+                    tx_left_idx,
+                )?;
+                client_proofs.push(proof_l);
+                total_transfers_done += 1;
+            }
+
+            // RIGHT
+            {
+                let tx_right_idx = total_transfers_done;
+                let proof_r = build_prove_apply_one(
+                    &mut rng,
+                    &srs,
+                    &pk,
+                    &relation,
+                    &pair.right,
+                    pair.right_intent,
+                    &mut shadow_accounts,
+                    &mut shadow_commitment_map,
+                    &mut shadow_nullifier_map,
+                    &chain.commitment_map_history,
+                    &chain.commitment_root_history,
+                    pre.latest_confirmed_root_idx,
+                    confirm_at_idx,
+                    batch_idx,
+                    tx_right_idx,
+                )?;
+                client_proofs.push(proof_r);
+                total_transfers_done += 1;
+            }
         }
 
-        if batch_failed || client_proofs.is_empty() {
+        if client_proofs.is_empty() {
             break;
         }
 
@@ -911,7 +1559,7 @@ fn run() -> Result<(), AppError> {
                 agg_result.root_state.c_post,
                 agg_result.root_state.n_pre,
                 agg_result.root_state.n_post,
-                // block counter transition (public) TODO we can expose only one block level
+                // block counter transition (public)
                 blk_pre_f,
                 blk_post_f,
                 // batch subroot (public)
@@ -1152,8 +1800,6 @@ mod tests {
     // -----------------------------
     // Integration-style tests (prove + aggregate)
     // These validate the rollup safety properties end-to-end.
-    //
-    // NOTE: These are "integration-style" but live in the module to access private helpers.
     // -----------------------------
 
     struct MiniEnv {
@@ -1219,6 +1865,8 @@ mod tests {
         let mut shadow_nullifier_map = chain.nullifier_map.clone();
         let mut shadow_commitment_map = chain.commitment_map.clone();
 
+        let confirm_at_idx = chain.commitment_root_history.len();
+
         let mut client_proofs: Vec<rollup_ivc_proofs::ClientProof> = Vec::with_capacity(batch_size);
 
         for tx_idx in 0..batch_size {
@@ -1230,7 +1878,6 @@ mod tests {
             // Build tx ONCE; proof must match effects
             let (built, _root_before) = build_transaction(
                 &mut rng,
-                chain.asset_id,
                 &shadow_accounts,
                 &chain.commitment_map_history,
                 &chain.commitment_root_history,
@@ -1238,6 +1885,7 @@ mod tests {
                 pre.latest_confirmed_root_idx,
                 /*batch_idx=*/ 0,
                 /*tx_idx=*/ tx_idx,
+                TxIntent::transfer(),
             )?;
 
             // Local conservation check (safety property: no inflation)
@@ -1255,7 +1903,7 @@ mod tests {
             assert_eq!(built.witness.3.asset_id, built.witness.5.asset_id);
             assert_eq!(built.witness.4.asset_id, built.witness.6.asset_id);
 
-            let effects = effects_from(&plan, &built);
+            let effects = TxEffects::from_plan_and_built(&plan, &built);
 
             let proof = prove_client(&env.srs, &env.pk, &env.relation, built)?;
             client_proofs.push(proof);
@@ -1264,7 +1912,7 @@ mod tests {
                 &mut shadow_accounts,
                 &mut shadow_commitment_map,
                 &mut shadow_nullifier_map,
-                chain.commitment_root_history.len(), // new outputs confirmed at next root index
+                confirm_at_idx,
                 &effects,
             );
         }
@@ -1416,7 +2064,6 @@ mod tests {
         for tx_idx in 0..batch_size {
             let (built, _) = build_transaction(
                 &mut rng,
-                chain.asset_id,
                 &shadow_accounts,
                 &chain.commitment_map_history,
                 &chain.commitment_root_history,
@@ -1424,6 +2071,7 @@ mod tests {
                 pre.latest_confirmed_root_idx,
                 0,
                 tx_idx,
+                TxIntent::transfer(),
             )?;
             let proof = prove_client(&env.srs, &env.pk, &env.relation, built)?;
             proofs.push(proof);
@@ -1445,6 +2093,592 @@ mod tests {
         assert!(
             res.is_err(),
             "batch must reject duplicate nullifiers (double-spend) inside the same batch"
+        );
+
+        Ok(())
+    }
+
+    fn sum_unspent_of_asset(acc: &transfer_circuit::Account, asset: F) -> u128 {
+        acc.wallet
+            .iter()
+            .filter(|n| !n.spent && n.utxo.asset_id == asset)
+            .fold(0u128, |s, n| s.saturating_add(n.utxo.amount))
+    }
+
+    fn sum_unspent_of_asset_all(accounts: &[transfer_circuit::Account], asset: F) -> u128 {
+        accounts
+            .iter()
+            .map(|a| sum_unspent_of_asset(a, asset))
+            .sum()
+    }
+
+    #[test]
+    fn swap_balances_reflect_terms() -> Result<(), AppError> {
+        use rand::SeedableRng;
+
+        // -----------------------------
+        // Proving + aggregation env (like run(), but test-scoped)
+        // -----------------------------
+        const K: u32 = 14;
+        const BATCH_SIZE_TEST: usize = 4;
+        const LEAF_VK_NAME: &str = "spend2output2_vk_swap_test";
+
+        let srs = trusted_setup::filecoin_srs_agg(K)
+            .map_err(|e| AppError::TrustedSetup(err_string(e)))?;
+        let relation = transfer_circuit::Spend2Output2;
+        let vk_mid = compact_std_lib::setup_vk(&srs, &relation);
+        let pk = compact_std_lib::setup_pk(&relation, &vk_mid);
+        let leaf_vk = vk_mid.vk().clone();
+
+        let agg_setup =
+            setup_ivc::prepare_agg_setup(&srs, &leaf_vk, LEAF_VK_NAME, K, BATCH_SIZE_TEST);
+
+        // -----------------------------
+        // Deterministic initial state
+        // -----------------------------
+        let mut rng = ChaCha8Rng::seed_from_u64(999);
+
+        let asset_a = F::from(11u64);
+        let asset_b = F::from(22u64);
+        assert_ne!(asset_a, asset_b);
+
+        // 4 accounts so we can fill a batch of 4 txs deterministically:
+        // - swap between 0 and 1
+        // - transfers between 2 and 3 (do not affect 0/1 balances)
+        let mut accounts = init_accounts(4);
+
+        let mut commitment_map = CommitmentMap::new(&F::ZERO);
+        let nullifier_map = CommitmentMap::new(&F::ZERO);
+
+        let mut mint_note = |acc: &mut transfer_circuit::Account,
+                             asset: F,
+                             amount: u128,
+                             rng: &mut ChaCha8Rng,
+                             cmap: &mut CommitmentMap| {
+            let utxo = transfer_circuit::Utxo {
+                asset_id: asset,
+                amount,
+                randomness: F::random(rng),
+            };
+            let commit = commitment_for_utxo(&utxo, acc.pk_x, acc.pk_y);
+            cmap.insert(&commit, &F::ONE);
+
+            acc.wallet.push(transfer_circuit::Note {
+                utxo,
+                commit,
+                spent: false,
+                confirmed_at_root_idx: 0,
+            });
+        };
+
+        // Swap parties:
+        // A (idx 0) owns asset A: 100 + 50
+        mint_note(
+            &mut accounts[0],
+            asset_a,
+            100,
+            &mut rng,
+            &mut commitment_map,
+        );
+        mint_note(&mut accounts[0], asset_a, 50, &mut rng, &mut commitment_map);
+
+        // B (idx 1) owns asset B: 80 + 40
+        mint_note(&mut accounts[1], asset_b, 80, &mut rng, &mut commitment_map);
+        mint_note(&mut accounts[1], asset_b, 40, &mut rng, &mut commitment_map);
+
+        // Two extra deterministic senders to fill the batch with transfers:
+        // C (idx 2) owns asset A: 30 + 20
+        mint_note(&mut accounts[2], asset_a, 30, &mut rng, &mut commitment_map);
+        mint_note(&mut accounts[2], asset_a, 20, &mut rng, &mut commitment_map);
+
+        // D (idx 3) owns asset B: 25 + 15
+        mint_note(&mut accounts[3], asset_b, 25, &mut rng, &mut commitment_map);
+        mint_note(&mut accounts[3], asset_b, 15, &mut rng, &mut commitment_map);
+
+        // Build ChainState (genesis root + roots set)
+        let genesis_root = commitment_map.succinct_repr();
+        let mut commitment_roots_set = CommitmentMap::new(&F::ZERO);
+        commitment_roots_set.insert(&genesis_root, &F::ONE);
+
+        let mut chain = ChainState {
+            asset_ids: vec![asset_a, asset_b],
+            accounts,
+            commitment_map_history: vec![commitment_map.clone()],
+            commitment_root_history: vec![genesis_root],
+            commitment_roots_set,
+            commitment_map,
+            nullifier_map,
+            blk_head: 0,
+        };
+
+        // -----------------------------
+        // Prepare a single batch (like run())
+        // -----------------------------
+        let pre = snapshot_batch_pre_state(&chain);
+
+        let blk_pre_u64 = chain.blk_head;
+        let blk_post_u64 = blk_pre_u64 + 1;
+        let batch_blk = F::from(blk_post_u64);
+
+        let latest_confirmed_root_idx = pre.latest_confirmed_root_idx; // 0
+        let confirm_at_idx = chain.commitment_root_history.len(); // 1 (new notes become spendable at idx 1)
+
+        let mut shadow_accounts = chain.accounts.clone();
+        let mut shadow_commitment_map = chain.commitment_map.clone();
+        let mut shadow_nullifier_map = chain.nullifier_map.clone();
+
+        // -----------------------------
+        // Build the swap agreement & intents (deterministic terms)
+        // -----------------------------
+        let plan_a = PlannedTx {
+            sender_idx: 0,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 1, // B gets trade output
+            recipient2_idx: 0, // A gets change
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+        let plan_b = PlannedTx {
+            sender_idx: 1,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 0, // A gets trade output
+            recipient2_idx: 1, // B gets change
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+
+        let total_a = inputs_total_amount(&shadow_accounts, &plan_a); // 150
+        let total_b = inputs_total_amount(&shadow_accounts, &plan_b); // 120
+        assert_eq!(total_a, 150);
+        assert_eq!(total_b, 120);
+
+        let amt_a_to_b: u128 = 70;
+        let amt_b_to_a: u128 = 60;
+
+        let nonce = F::from(99u64);
+        let sterms = host_swap_terms_hash(
+            nonce,
+            asset_a,
+            asset_b,
+            &shadow_accounts[0].pk_point,
+            &shadow_accounts[1].pk_point,
+            amt_a_to_b,
+            amt_b_to_a,
+        );
+        assert_ne!(sterms, F::ZERO);
+
+        let ag = SwapAgreement {
+            a_idx: 0,
+            b_idx: 1,
+            asset_id_a: asset_a,
+            asset_id_b: asset_b,
+            pk_a: shadow_accounts[0].pk_point,
+            pk_b: shadow_accounts[1].pk_point,
+            amt_a_to_b,
+            amt_b_to_a,
+            nonce,
+            sterms,
+        };
+
+        let intent_a = swap_leg_intent_for_a_to_b(&mut rng, blk_post_u64, &ag);
+        let intent_b = swap_leg_intent_for_b_to_a(&mut rng, blk_post_u64, &ag);
+
+        // Two filler transfers that don't touch accounts 0/1:
+        let plan_c = PlannedTx {
+            sender_idx: 2,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 3, // D receives some asset A
+            recipient2_idx: 2, // C receives change
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+        let plan_d = PlannedTx {
+            sender_idx: 3,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 2, // C receives some asset B
+            recipient2_idx: 3, // D receives change
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+
+        // -----------------------------
+        // Build -> prove -> apply effects for 4 txs (batch)
+        // -----------------------------
+        let mut client_proofs: Vec<rollup_ivc_proofs::ClientProof> =
+            Vec::with_capacity(BATCH_SIZE_TEST);
+
+        let txs: [(&PlannedTx, TxIntent); BATCH_SIZE_TEST] = [
+            (&plan_a, intent_a),
+            (&plan_b, intent_b),
+            (&plan_c, TxIntent::transfer()),
+            (&plan_d, TxIntent::transfer()),
+        ];
+
+        for (tx_idx, (plan, intent)) in txs.into_iter().enumerate() {
+            let (built, _) = build_transaction(
+                &mut rng,
+                &shadow_accounts,
+                &chain.commitment_map_history,
+                &chain.commitment_root_history,
+                plan,
+                latest_confirmed_root_idx,
+                /*batch_idx=*/ 0,
+                /*tx_idx=*/ tx_idx,
+                intent,
+            )?;
+
+            let effects = TxEffects::from_plan_and_built(plan, &built);
+
+            // Proof
+            let proof = prove_client(&srs, &pk, &relation, built)?;
+            client_proofs.push(proof);
+
+            // State update (in-batch shadow)
+            apply_tx_effects(
+                &mut shadow_accounts,
+                &mut shadow_commitment_map,
+                &mut shadow_nullifier_map,
+                confirm_at_idx,
+                &effects,
+            );
+        }
+
+        assert_eq!(client_proofs.len(), BATCH_SIZE_TEST);
+        assert!(client_proofs.len().is_power_of_two());
+
+        // -----------------------------
+        // Aggregate the batch (this is what you asked for)
+        // -----------------------------
+        let agg = rollup_ivc_proofs::aggregate_client_proofs_cached(
+            &agg_setup,
+            &srs,
+            &leaf_vk,
+            &client_proofs,
+            pre.pre_commitment_map.clone(),
+            pre.pre_nullifier_map.clone(),
+            pre.pre_roots_set_map.clone(),
+            batch_blk,
+        );
+
+        // Root bindings must match the actual maps
+        assert_eq!(agg.root_state.c_pre, pre.pre_commitment_map.succinct_repr());
+        assert_eq!(agg.root_state.n_pre, pre.pre_nullifier_map.succinct_repr());
+        assert_eq!(agg.root_state.c_post, shadow_commitment_map.succinct_repr());
+        assert_eq!(agg.root_state.n_post, shadow_nullifier_map.succinct_repr());
+
+        // Replay-guard precondition: c_post not in roots set yet
+        assert_eq!(pre.pre_roots_set_map.get(&agg.root_state.c_post), F::ZERO);
+
+        // -----------------------------
+        // Commit batch state updates to chain (like run())
+        // -----------------------------
+        let mut shadow_commitment_roots_set = pre.pre_roots_set_map.clone();
+        shadow_commitment_roots_set.insert(&agg.root_state.c_post, &F::ONE);
+
+        chain.accounts = shadow_accounts;
+        chain.commitment_map = shadow_commitment_map;
+        chain.nullifier_map = shadow_nullifier_map;
+        chain.commitment_roots_set = shadow_commitment_roots_set;
+
+        chain
+            .commitment_root_history
+            .push(chain.commitment_map.succinct_repr());
+        chain
+            .commitment_map_history
+            .push(chain.commitment_map.clone());
+
+        chain.blk_head = blk_post_u64;
+
+        // Now roots-set must contain the newly committed root
+        assert_ne!(
+            chain.commitment_roots_set.get(&agg.root_state.c_post),
+            F::ZERO
+        );
+        assert_eq!(
+            *chain.commitment_root_history.last().unwrap(),
+            agg.root_state.c_post
+        );
+
+        // -----------------------------
+        // Swap balance assertions (accounts 0 and 1)
+        // -----------------------------
+        // After swap:
+        // A: keeps (150 - 70)=80 of asset A, receives 60 of asset B
+        // B: keeps (120 - 60)=60 of asset B, receives 70 of asset A
+        let a_a = sum_unspent_of_asset(&chain.accounts[0], asset_a);
+        let a_b = sum_unspent_of_asset(&chain.accounts[0], asset_b);
+        let b_a = sum_unspent_of_asset(&chain.accounts[1], asset_a);
+        let b_b = sum_unspent_of_asset(&chain.accounts[1], asset_b);
+
+        assert_eq!(a_a, 80);
+        assert_eq!(a_b, 60);
+        assert_eq!(b_a, 70);
+        assert_eq!(b_b, 60);
+
+        // -----------------------------
+        // Supply conservation (across all accounts)
+        // -----------------------------
+        // Initial totals:
+        // asset_a: 100+50 + 30+20 = 200
+        // asset_b: 80+40 + 25+15 = 160
+        assert_eq!(sum_unspent_of_asset_all(&chain.accounts, asset_a), 200);
+        assert_eq!(sum_unspent_of_asset_all(&chain.accounts, asset_b), 160);
+
+        // -----------------------------
+        // Spendability semantics (confirmed-at-root index)
+        // -----------------------------
+        // At latest_confirmed_root_idx=0, newly created notes (confirmed_at_root_idx=1) are not spendable.
+        assert_eq!(spendable_note_indices(&chain.accounts[0], 0).len(), 0);
+        assert_eq!(spendable_note_indices(&chain.accounts[1], 0).len(), 0);
+
+        // After commit, latest idx is 1, so the 2 swap outputs per party become spendable.
+        let latest_after_commit = chain.commitment_root_history.len() - 1; // 1
+        assert_eq!(latest_after_commit, 1);
+        assert_eq!(
+            spendable_note_indices(&chain.accounts[0], latest_after_commit).len(),
+            2
+        );
+        assert_eq!(
+            spendable_note_indices(&chain.accounts[1], latest_after_commit).len(),
+            2
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn negative_cannot_pair_swap_with_transfer_batch4_panics() -> Result<(), AppError> {
+        use rand::SeedableRng;
+        use std::panic;
+
+        // Batch size MUST be 4
+        let batch_size = 4usize;
+        let env = mini_env(/*k=*/ 14, batch_size)?;
+
+        let mut rng = ChaCha8Rng::seed_from_u64(999);
+
+        let asset_a = F::from(11u64);
+        let asset_b = F::from(22u64);
+        assert_ne!(asset_a, asset_b);
+
+        // 4 accounts so we can fill a batch of 4 txs
+        let mut accounts = init_accounts(4);
+
+        let mut commitment_map = CommitmentMap::new(&F::ZERO);
+        let nullifier_map = CommitmentMap::new(&F::ZERO);
+
+        let mint_note = |acc: &mut transfer_circuit::Account,
+                         asset: F,
+                         amount: u128,
+                         rng: &mut ChaCha8Rng,
+                         cmap: &mut CommitmentMap| {
+            let utxo = transfer_circuit::Utxo {
+                asset_id: asset,
+                amount,
+                randomness: F::random(rng),
+            };
+            let commit = commitment_for_utxo(&utxo, acc.pk_x, acc.pk_y);
+            cmap.insert(&commit, &F::ONE);
+            acc.wallet.push(transfer_circuit::Note {
+                utxo,
+                commit,
+                spent: false,
+                confirmed_at_root_idx: 0,
+            });
+        };
+
+        // Swap party A (idx 0) has asset_a
+        mint_note(
+            &mut accounts[0],
+            asset_a,
+            100,
+            &mut rng,
+            &mut commitment_map,
+        );
+        mint_note(&mut accounts[0], asset_a, 50, &mut rng, &mut commitment_map);
+
+        // Swap party B (idx 1) has asset_b (won't do its swap leg in this test)
+        mint_note(&mut accounts[1], asset_b, 80, &mut rng, &mut commitment_map);
+        mint_note(&mut accounts[1], asset_b, 40, &mut rng, &mut commitment_map);
+
+        // Extra senders to fill batch with transfers
+        mint_note(&mut accounts[2], asset_a, 30, &mut rng, &mut commitment_map);
+        mint_note(&mut accounts[2], asset_a, 20, &mut rng, &mut commitment_map);
+
+        mint_note(&mut accounts[3], asset_b, 25, &mut rng, &mut commitment_map);
+        mint_note(&mut accounts[3], asset_b, 15, &mut rng, &mut commitment_map);
+
+        // ChainState (genesis root + roots set)
+        let genesis_root = commitment_map.succinct_repr();
+        let mut commitment_roots_set = CommitmentMap::new(&F::ZERO);
+        commitment_roots_set.insert(&genesis_root, &F::ONE);
+
+        let chain = ChainState {
+            asset_ids: vec![asset_a, asset_b],
+            accounts,
+            commitment_map_history: vec![commitment_map.clone()],
+            commitment_root_history: vec![genesis_root],
+            commitment_roots_set,
+            commitment_map,
+            nullifier_map,
+            blk_head: 0,
+        };
+
+        let pre = snapshot_batch_pre_state(&chain);
+        let latest_confirmed_root_idx = pre.latest_confirmed_root_idx; // 0
+        let confirm_at_idx = chain.commitment_root_history.len(); // 1
+        let blk_post_u64 = chain.blk_head + 1;
+        let batch_blk = F::from(blk_post_u64);
+
+        let mut shadow_accounts = chain.accounts.clone();
+        let mut shadow_commitment_map = chain.commitment_map.clone();
+        let mut shadow_nullifier_map = chain.nullifier_map.clone();
+
+        // -----------------------------
+        // Build swap agreement (deterministic terms) for (A=0, B=1)
+        // -----------------------------
+        let plan_swap_leg = PlannedTx {
+            sender_idx: 0,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 1, // B gets trade output
+            recipient2_idx: 0, // A gets change
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+
+        let total_a = inputs_total_amount(&shadow_accounts, &plan_swap_leg); // 150
+        assert_eq!(total_a, 150);
+
+        let amt_a_to_b: u128 = 70;
+        let amt_b_to_a: u128 = 60; // included in terms hash even though we won't execute B->A leg
+
+        let nonce = F::from(99u64);
+        let sterms = host_swap_terms_hash(
+            nonce,
+            asset_a,
+            asset_b,
+            &shadow_accounts[0].pk_point,
+            &shadow_accounts[1].pk_point,
+            amt_a_to_b,
+            amt_b_to_a,
+        );
+        assert_ne!(sterms, F::ZERO);
+
+        let ag = SwapAgreement {
+            a_idx: 0,
+            b_idx: 1,
+            asset_id_a: asset_a,
+            asset_id_b: asset_b,
+            pk_a: shadow_accounts[0].pk_point,
+            pk_b: shadow_accounts[1].pk_point,
+            amt_a_to_b,
+            amt_b_to_a,
+            nonce,
+            sterms,
+        };
+
+        let intent_swap_leg = swap_leg_intent_for_a_to_b(&mut rng, blk_post_u64, &ag);
+
+        // -----------------------------
+        // Build three transfer txs to fill batch
+        // tx1 is paired with swap leg tx0 => forbidden mixed pair
+        // -----------------------------
+        let plan_xfer_1 = PlannedTx {
+            sender_idx: 2,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 3,
+            recipient2_idx: 2,
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+        let plan_xfer_2 = PlannedTx {
+            sender_idx: 1,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 0,
+            recipient2_idx: 1,
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+        let plan_xfer_3 = PlannedTx {
+            sender_idx: 3,
+            old1_idx: 0,
+            old2_idx: 1,
+            recipient1_idx: 2,
+            recipient2_idx: 3,
+            root_idx_for_proof: latest_confirmed_root_idx,
+        };
+
+        let txs: [(&PlannedTx, TxIntent); 4] = [
+            (&plan_swap_leg, intent_swap_leg),    // tx0: SWAP
+            (&plan_xfer_1, TxIntent::transfer()), // tx1: TRANSFER  <-- mixed with swap in pair 0
+            (&plan_xfer_2, TxIntent::transfer()), // tx2: TRANSFER
+            (&plan_xfer_3, TxIntent::transfer()), // tx3: TRANSFER
+        ];
+
+        // -----------------------------
+        // Prove all 4 txs + apply shadow effects (like run())
+        // -----------------------------
+        let mut proofs: Vec<rollup_ivc_proofs::ClientProof> = Vec::with_capacity(4);
+
+        for (tx_idx, (plan, intent)) in txs.into_iter().enumerate() {
+            let (built, _) = build_transaction(
+                &mut rng,
+                &shadow_accounts,
+                &chain.commitment_map_history,
+                &chain.commitment_root_history,
+                plan,
+                latest_confirmed_root_idx,
+                /*batch_idx=*/ 0,
+                /*tx_idx=*/ tx_idx,
+                intent,
+            )?;
+
+            let effects = TxEffects::from_plan_and_built(plan, &built);
+
+            proofs.push(prove_client(&env.srs, &env.pk, &env.relation, built)?);
+
+            apply_tx_effects(
+                &mut shadow_accounts,
+                &mut shadow_commitment_map,
+                &mut shadow_nullifier_map,
+                confirm_at_idx,
+                &effects,
+            );
+        }
+
+        assert_eq!(proofs.len(), 4);
+
+        // Sanity: first pair is indeed (swap, transfer)
+        assert_ne!(
+            proofs[0].public_items[7],
+            F::ZERO,
+            "tx0 must be swap (sterms!=0)"
+        );
+        assert_eq!(
+            proofs[1].public_items[7],
+            F::ZERO,
+            "tx1 must be transfer (sterms==0)"
+        );
+
+        // -----------------------------
+        // Aggregation must reject mixed pair (swap + transfer) in the same base-step pair
+        // -----------------------------
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _ = rollup_ivc_proofs::aggregate_client_proofs_cached(
+                &env.agg_setup,
+                &env.srs,
+                &env.leaf_vk,
+                &proofs,
+                pre.pre_commitment_map.clone(),
+                pre.pre_nullifier_map.clone(),
+                pre.pre_roots_set_map.clone(),
+                batch_blk,
+            );
+        }));
+
+        assert!(
+            res.is_err(),
+            "expected aggregation to reject pairing swap with transfer (batch_size=4)"
         );
 
         Ok(())

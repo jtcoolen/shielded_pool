@@ -1152,6 +1152,7 @@ dependencies = [
  "midnight-circuits",
  "midnight-curves",
  "midnight-proofs",
+ "num-bigint",
  "proptest",
  "rand 0.8.5",
  "rand_chacha 0.3.1",

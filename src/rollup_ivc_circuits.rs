@@ -1,3 +1,5 @@
+use std::ops::Shl;
+
 use ff::Field;
 use group::Group;
 
@@ -16,11 +18,12 @@ use midnight_circuits::{
         NB_POSEIDON_ADVICE_COLS, NB_POSEIDON_FIXED_COLS, PoseidonChip, PoseidonConfig,
     },
     instructions::{
-        ArithInstructions, AssertionInstructions, AssignmentInstructions, HashInstructions,
-        PublicInputInstructions, map::MapInstructions,
+        ArithInstructions, AssertionInstructions, AssignmentInstructions, BinaryInstructions,
+        ControlFlowInstructions, HashInstructions, PublicInputInstructions, RangeCheckInstructions,
+        ZeroInstructions, map::MapInstructions,
     },
     map::cpu::MapMt,
-    types::{AssignedForeignPoint, AssignedNative, ComposableChip, Instantiable},
+    types::{AssignedBit, AssignedForeignPoint, AssignedNative, ComposableChip, Instantiable},
     verifier::{
         Accumulator, AssignedAccumulator, AssignedVk, BlstrsEmulation, SelfEmulation,
         VerifierGadget,
@@ -31,6 +34,7 @@ use midnight_proofs::{
     plonk::{Circuit, ConstraintSystem, Error},
     poly::EvaluationDomain,
 };
+use num_bigint::BigUint;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Small utilities (local helpers)
@@ -62,7 +66,7 @@ fn project_value_array<const N: usize, F: Copy>(v: Value<[F; N]>) -> [Value<F>; 
     core::array::from_fn(|i| v.as_ref().map(|arr| arr[i]))
 }
 
-/// Assign `[Value<F>; N]` into `[AssignedNative<F>; N]`
+/// Assign `[Value<F>; N]` into `[AssignedNative<F>; N]`.
 fn assign_values<const N: usize>(
     ctx: &AggCtx,
     layouter: &mut impl Layouter<F>,
@@ -106,7 +110,10 @@ pub const AGG_K: u32 = K_INTERNAL;
 pub const AGG_STATE_WIDTH: usize = 7;
 
 /// Width of client proof public items (canonical order).
-pub const CLIENT_ITEMS_WIDTH: usize = 7;
+/// Canonical order:
+/// `[root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2, sterms, vto, side]`.
+///  `side` is 0 in transfer mode; in swap mode it is a bit (0=pk_A leg, 1=pk_B leg).
+pub const CLIENT_ITEMS_WIDTH: usize = 10;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Aggregation state
@@ -218,9 +225,10 @@ pub fn configure_agg_circuit(meta: &mut ConstraintSystem<F>) -> AggCircuitConfig
 // Encodings (struct <-> array)
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Typed encoding for the 7 public items in client proofs.
+/// Typed encoding for the 10 public items in client proofs.
 ///
-/// Canonical order: `[root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2]`.
+/// Canonical order:
+/// `[root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2, sterms, swapcm, vto]`.
 #[derive(Clone, Debug)]
 pub struct ClientPublicItems<T> {
     pub root_before: T,
@@ -230,11 +238,25 @@ pub struct ClientPublicItems<T> {
     pub new_c2: T,
     pub nf1: T,
     pub nf2: T,
+    pub sterms: T,
+    pub vto: T,
+    pub side: T,
 }
 
 impl<T> From<[T; CLIENT_ITEMS_WIDTH]> for ClientPublicItems<T> {
     fn from(arr: [T; CLIENT_ITEMS_WIDTH]) -> Self {
-        let [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2] = arr;
+        let [
+            root_before,
+            pk_bx,
+            pk_by,
+            new_c1,
+            new_c2,
+            nf1,
+            nf2,
+            sterms,
+            vto,
+            side,
+        ] = arr;
         Self {
             root_before,
             pk_bx,
@@ -243,6 +265,9 @@ impl<T> From<[T; CLIENT_ITEMS_WIDTH]> for ClientPublicItems<T> {
             new_c2,
             nf1,
             nf2,
+            sterms,
+            vto,
+            side,
         }
     }
 }
@@ -258,6 +283,9 @@ impl<T: Clone> ClientPublicItems<T> {
             self.new_c2.clone(),
             self.nf1.clone(),
             self.nf2.clone(),
+            self.sterms.clone(),
+            self.vto.clone(),
+            self.side.clone(),
         ]
     }
 
@@ -277,12 +305,357 @@ impl<T> ClientPublicItems<T> {
     pub fn nullifiers(&self) -> impl Iterator<Item = &T> {
         core::iter::once(&self.nf1).chain(core::iter::once(&self.nf2))
     }
+
+    #[inline]
+    pub fn swap_fields(&self) -> (&T, &T, &T) {
+        (&self.sterms, &self.vto, &self.side)
+    }
 }
 
-/// Typed encoding for the Agg state public inputs (6 fields).
+////////////////////////////////////////////////////////////////////////////////
+// Swap / block-number policy knobs
+////////////////////////////////////////////////////////////////////////////////
+
+/// Integer width used for `blk` and `vto` comparisons.
+const BLK_BITS: usize = 64;
+
+/// Optional mitigation: require `vto - blk >= W` for swap legs. Set to 0 to disable.
+const MIN_VALIDITY_WINDOW: u64 = 0;
+
+/// Hard cap: `vto - blk <= SWAP_MAX_DELTA_BLKS` for swap legs.
+pub const SWAP_MAX_DELTA_BLKS: u64 = 16;
+
+////////////////////////////////////////////////////////////////////////////////
+// Constraint helpers (boolean gating, u64 range and inequalities)
+////////////////////////////////////////////////////////////////////////////////
+
+#[inline]
+fn forbid_when(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    cond: &AssignedBit<F>,
+    one: &AssignedNative<F>,
+    zero: &AssignedNative<F>,
+) -> Result<(), Error> {
+    // If cond == 1 => select(one) and then force == zero => unsat.
+    let cond_cell = ctx.native.select(layouter, cond, one, zero)?;
+    ctx.assert_eq(layouter, &cond_cell, zero)?;
+    Ok(())
+}
+
+#[inline]
+fn assert_equal_when(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    cond: &AssignedBit<F>,
+    a: &AssignedNative<F>,
+    b: &AssignedNative<F>,
+    zero: &AssignedNative<F>,
+) -> Result<(), Error> {
+    let diff = ctx.scalar.sub(layouter, a, b)?;
+    let gated = ctx.native.select(layouter, cond, &diff, zero)?;
+    ctx.assert_eq(layouter, &gated, zero)
+}
+
+#[inline]
+fn assert_nonzero_when(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    cond: &AssignedBit<F>,
+    x: &AssignedNative<F>,
+    one: &AssignedNative<F>,
+    zero: &AssignedNative<F>,
+) -> Result<(), Error> {
+    let is_zero = ctx.scalar.is_zero(layouter, x)?;
+    let bad = ctx.native.and(layouter, &[cond.clone(), is_zero])?;
+    forbid_when(ctx, layouter, &bad, one, zero)
+}
+
+#[inline]
+fn range_u64(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    x: &AssignedNative<F>,
+) -> Result<(), Error> {
+    ctx.scalar
+        .assert_lower_than_fixed(layouter, &x, &BigUint::shl(1u64.into(), BLK_BITS))
+}
+
+#[inline]
+fn range_u64_when(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    cond: &AssignedBit<F>,
+    x: &AssignedNative<F>,
+    zero: &AssignedNative<F>,
+) -> Result<AssignedNative<F>, Error> {
+    let eff = ctx.native.select(layouter, cond, x, zero)?;
+    range_u64(ctx, layouter, &eff)?;
+    Ok(eff)
+}
+
+/// Enforce `a >= b` for u64 values by range-checking `a - b` (no underflow).
+#[inline]
+fn enforce_u64_ge(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    a: &AssignedNative<F>,
+    b: &AssignedNative<F>,
+) -> Result<AssignedNative<F>, Error> {
+    let diff = ctx.scalar.sub(layouter, a, b)?;
+    range_u64(ctx, layouter, &diff)?;
+    Ok(diff)
+}
+
+/// Enforce `a <= b` for u64 values by range-checking `b - a` (no underflow).
+#[inline]
+fn enforce_u64_le(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    a: &AssignedNative<F>,
+    b: &AssignedNative<F>,
+) -> Result<AssignedNative<F>, Error> {
+    let diff = ctx.scalar.sub(layouter, b, a)?;
+    range_u64(ctx, layouter, &diff)?;
+    Ok(diff)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Swap semantics (leaf/base step)
+////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Clone, Copy)]
+struct SwapLeg<'a> {
+    sterms: &'a AssignedNative<F>,
+    vto: &'a AssignedNative<F>,
+    side: &'a AssignedNative<F>,
+}
+
+impl<'a> SwapLeg<'a> {
+    #[inline]
+    fn from_items(items: &'a ClientPublicItems<AssignedNative<F>>) -> Self {
+        let (sterms, vto, side) = items.swap_fields();
+        Self { sterms, vto, side }
+    }
+}
+
+#[derive(Clone)]
+struct SwapLegKind {
+    is_transfer: AssignedBit<F>, // sterms == 0
+    is_swap: AssignedBit<F>,     // sterms != 0
+}
+
+fn analyze_leg_kind(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    leg: SwapLeg<'_>,
+) -> Result<SwapLegKind, Error> {
+    let sterms_is_zero = ctx.scalar.is_zero(layouter, leg.sterms)?;
+    let is_transfer = sterms_is_zero.clone();
+    let is_swap = ctx.native.not(layouter, &sterms_is_zero)?;
+
+    Ok(SwapLegKind {
+        is_transfer,
+        is_swap,
+    })
+}
+
+/// Enforce "either two transfers OR two swaps" (reject mixed pairs) and return `is_swap_pair`.
+fn enforce_pair_kind(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    left: &SwapLegKind,
+    right: &SwapLegKind,
+    one: &AssignedNative<F>,
+    zero: &AssignedNative<F>,
+) -> Result<AssignedBit<F>, Error> {
+    let both_transfers = ctx.native.and(
+        layouter,
+        &[left.is_transfer.clone(), right.is_transfer.clone()],
+    )?;
+    let both_swaps = ctx
+        .native
+        .and(layouter, &[left.is_swap.clone(), right.is_swap.clone()])?;
+
+    // ok = both_transfers OR both_swaps
+    let ok = ctx
+        .native
+        .or(layouter, &[both_transfers, both_swaps.clone()])?;
+    let bad = ctx.native.not(layouter, &ok)?;
+
+    // Forbid bad.
+    forbid_when(ctx, layouter, &bad, one, zero)?;
+
+    Ok(both_swaps)
+}
+
+/// Enforce swap-specific constraints, gated by `is_swap_pair`.
+fn enforce_swap_constraints(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    blk: &AssignedNative<F>,
+    left_leg: SwapLeg<'_>,
+    right_leg: SwapLeg<'_>,
+    left_kind: &SwapLegKind,
+    right_kind: &SwapLegKind,
+    is_swap_pair: &AssignedBit<F>,
+    one: &AssignedNative<F>,
+    zero: &AssignedNative<F>,
+) -> Result<(), Error> {
+    // 1) Sterms match (two-party atomic swap).
+    assert_equal_when(
+        ctx,
+        layouter,
+        is_swap_pair,
+        left_leg.sterms,
+        right_leg.sterms,
+        zero,
+    )?;
+
+    // 2) sterms != 0 if swap.
+    assert_nonzero_when(ctx, layouter, is_swap_pair, left_leg.sterms, one, zero)?;
+
+    // 3) side typing (bit) when swap: b * side*(side-1) = 0. TODO use AssignedBit directly
+    let mut side_bool = |side: &AssignedNative<F>| -> Result<(), Error> {
+        let side_minus_one = ctx.scalar.sub(layouter, side, one)?;
+        let prod = ctx.scalar.mul(layouter, side, &side_minus_one, None)?;
+        let gated = ctx.native.select(layouter, is_swap_pair, &prod, zero)?;
+        ctx.assert_eq(layouter, &gated, zero)
+    };
+    side_bool(left_leg.side)?;
+    side_bool(right_leg.side)?;
+
+    // 4) Opposite-side constraint when swap: side_L + side_R = 1 (SPEC).
+    let sum = ctx.scalar.add(layouter, left_leg.side, right_leg.side)?;
+    let sum_minus_one = ctx.scalar.sub(layouter, &sum, one)?;
+    let gated = ctx
+        .native
+        .select(layouter, is_swap_pair, &sum_minus_one, zero)?;
+    ctx.assert_eq(layouter, &gated, zero)?;
+    // 5) Expiry constraints (u64):
+    //    - blk <= vto
+    //    - (optional) vto - blk >= MIN_VALIDITY_WINDOW
+    //    - vto - blk <= SWAP_MAX_DELTA_BLKS
+    //
+    // Gate by selecting operands to 0 in transfer case.
+    range_u64(ctx, layouter, blk)?;
+
+    let max_delta = ctx
+        .scalar
+        .assign_fixed(layouter, F::from(SWAP_MAX_DELTA_BLKS))?;
+
+    let maybe_min_window = if MIN_VALIDITY_WINDOW > 0 {
+        Some(
+            ctx.scalar
+                .assign_fixed(layouter, F::from(MIN_VALIDITY_WINDOW))?,
+        )
+    } else {
+        None
+    };
+
+    for vto in [left_leg.vto, right_leg.vto] {
+        // Gate blk/vto/max/min to 0 if not swap, so all subsequent range/ineq checks become trivial.
+        let blk_eff = range_u64_when(ctx, layouter, is_swap_pair, blk, zero)?;
+        let vto_eff = range_u64_when(ctx, layouter, is_swap_pair, vto, zero)?;
+        let max_eff = range_u64_when(ctx, layouter, is_swap_pair, &max_delta, zero)?;
+
+        // Enforce vto_eff >= blk_eff; diff is u64.
+        let diff = enforce_u64_ge(ctx, layouter, &vto_eff, &blk_eff)?;
+
+        // Optional minimum window: diff >= min_window.
+        if let Some(min_window) = &maybe_min_window {
+            let w_eff = range_u64_when(ctx, layouter, is_swap_pair, min_window, zero)?;
+            let _ = enforce_u64_ge(ctx, layouter, &diff, &w_eff)?;
+        }
+
+        // Enforce diff <= max_eff.
+        let _ = enforce_u64_le(ctx, layouter, &diff, &max_eff)?;
+    }
+
+    Ok(())
+}
+
+/// Enforce either:
+///  - both transfers: (sterms, swapcm, vto) == (0,0,0) for both legs, OR
+///  - a matched swap pair:
+///      sterms_L == sterms_R != 0,
+///      swapcm_i == H2(sterms_i, vto_i) != 0,
+///      blk <= vto_i and (vto_i - blk) <= SWAP_MAX_DELTA_BLKS (and optional MIN_VALIDITY_WINDOW).
+fn enforce_pair_swap_or_transfer_semantics(
+    ctx: &AggCtx,
+    layouter: &mut impl Layouter<F>,
+    blk: &AssignedNative<F>,
+    left: &ClientPublicItems<AssignedNative<F>>,
+    right: &ClientPublicItems<AssignedNative<F>>,
+    zero: &AssignedNative<F>,
+    one: &AssignedNative<F>,
+) -> Result<(), Error> {
+    let left_leg = SwapLeg::from_items(left);
+    let right_leg = SwapLeg::from_items(right);
+
+    let left_kind = analyze_leg_kind(ctx, layouter, left_leg)?;
+    let right_kind = analyze_leg_kind(ctx, layouter, right_leg)?;
+
+    // Transfer-mode canonical zeros (SPEC): if sterms==0 then vto=0 and side=0.
+    assert_equal_when(
+        ctx,
+        layouter,
+        &left_kind.is_transfer,
+        left_leg.vto,
+        zero,
+        zero,
+    )?;
+    assert_equal_when(
+        ctx,
+        layouter,
+        &left_kind.is_transfer,
+        left_leg.side,
+        zero,
+        zero,
+    )?;
+    assert_equal_when(
+        ctx,
+        layouter,
+        &right_kind.is_transfer,
+        right_leg.vto,
+        zero,
+        zero,
+    )?;
+    assert_equal_when(
+        ctx,
+        layouter,
+        &right_kind.is_transfer,
+        right_leg.side,
+        zero,
+        zero,
+    )?;
+
+    // Either both transfers or both swaps.
+    let is_swap_pair = enforce_pair_kind(ctx, layouter, &left_kind, &right_kind, one, zero)?;
+
+    // Swap-case constraints (all gated).
+    enforce_swap_constraints(
+        ctx,
+        layouter,
+        blk,
+        left_leg,
+        right_leg,
+        &left_kind,
+        &right_kind,
+        &is_swap_pair,
+        one,
+        zero,
+    )
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Agg state public encoding
+////////////////////////////////////////////////////////////////////////////////
+
+/// Typed encoding for the Agg state public inputs (7 fields).
 ///
 /// Canonical order (must match `AggState::to_fields()`):
-/// `[c_pre, c_post, n_pre, n_post, subroot, commitment_roots_set_root]`.
+/// `[c_pre, c_post, n_pre, n_post, subroot, commitment_roots_set_root, block_level]`.
 #[derive(Clone, Debug)]
 pub struct AggStateFields<T> {
     pub c_pre: T,
@@ -292,6 +665,29 @@ pub struct AggStateFields<T> {
     pub subroot: T,
     pub commitment_roots_set_root: T,
     pub block_level: T,
+}
+
+impl<T> From<[T; AGG_STATE_WIDTH]> for AggStateFields<T> {
+    fn from(arr: [T; AGG_STATE_WIDTH]) -> Self {
+        let [
+            c_pre,
+            c_post,
+            n_pre,
+            n_post,
+            subroot,
+            commitment_roots_set_root,
+            block_level,
+        ] = arr;
+        Self {
+            c_pre,
+            c_post,
+            n_pre,
+            n_post,
+            subroot,
+            commitment_roots_set_root,
+            block_level,
+        }
+    }
 }
 
 impl<T> AggStateFields<T> {
@@ -339,9 +735,6 @@ impl<T: Clone> AggStateFields<T> {
 ////////////////////////////////////////////////////////////////////////////////
 
 /// Bundles all chips required by the aggregation circuits.
-///
-/// This keeps synthesize methods focused on *workflow*, while gadget logic lives in
-/// small helper functions.
 #[derive(Clone)]
 pub struct AggCtx {
     pub native: NativeChip<F>,
@@ -447,6 +840,9 @@ impl AggCtx {
         one: &AssignedNative<F>,
     ) -> Result<(), Error> {
         for commitment in items.commitments() {
+            // commitment inserts must be fresh (old value == 0) before setting to 1.
+            let existing = commit_map.get(layouter, commitment)?;
+            self.assert_eq(layouter, &existing, zero)?;
             commit_map.insert(layouter, commitment, one)?;
         }
 
@@ -469,25 +865,8 @@ pub fn assign_state_array(
     layouter: &mut impl Layouter<F>,
     fields: [Value<F>; AGG_STATE_WIDTH],
 ) -> Result<AggStateFields<AssignedNative<F>>, Error> {
-    let [
-        c_pre,
-        c_post,
-        n_pre,
-        n_post,
-        subroot,
-        commitment_roots_set_root,
-        block_level,
-    ] = assign_values(ctx, layouter, fields)?;
-
-    Ok(AggStateFields {
-        c_pre,
-        c_post,
-        n_pre,
-        n_post,
-        subroot,
-        commitment_roots_set_root,
-        block_level,
-    })
+    let assigned = assign_values(ctx, layouter, fields)?;
+    Ok(AggStateFields::from(assigned))
 }
 
 pub fn assign_state_value(
@@ -509,18 +888,8 @@ fn assign_client_items(
     layouter: &mut impl Layouter<F>,
     items: Value<[F; CLIENT_ITEMS_WIDTH]>,
 ) -> Result<ClientPublicItems<AssignedNative<F>>, Error> {
-    let [root_before, pk_bx, pk_by, new_c1, new_c2, nf1, nf2] =
-        assign_values(ctx, layouter, project_value_array(items))?;
-
-    Ok(ClientPublicItems {
-        root_before,
-        pk_bx,
-        pk_by,
-        new_c1,
-        new_c2,
-        nf1,
-        nf2,
-    })
+    let assigned = assign_values(ctx, layouter, project_value_array(items))?;
+    Ok(ClientPublicItems::from(assigned))
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -559,8 +928,8 @@ fn init_map(
 ///
 /// Returns:
 /// - updated aggregation state
-/// - left base PI (instance hash)
-/// - right base PI (instance hash)
+/// - left base PI (unhashed client public items, canonical order)
+/// - right base PI (unhashed client public items, canonical order)
 pub fn base_step(
     ctx: &AggCtx,
     layouter: &mut impl Layouter<F>,
@@ -582,7 +951,7 @@ pub fn base_step(
     let zero = ctx.zero(layouter)?;
 
     // Batch block number (bound into state; used for swap expiry checks).
-    let blk_assigned = ctx.scalar.assign(layouter, block_level)?;
+    let blk_assigned: AssignedNative<F> = ctx.scalar.assign(layouter, block_level)?;
 
     // Rollup sets.
     let (mut commit_map, c_pre) = init_map_with_root(ctx, layouter, pre_commitment_map)?;
@@ -602,6 +971,17 @@ pub fn base_step(
         layouter,
         &commitment_roots_set_map,
         &right.root_before,
+        &one,
+    )?;
+
+    // Enforce transfer-vs-swap pairing semantics (atomic two-party swap).
+    enforce_pair_swap_or_transfer_semantics(
+        ctx,
+        layouter,
+        &blk_assigned,
+        &left,
+        &right,
+        &zero,
         &one,
     )?;
 
@@ -633,8 +1013,8 @@ pub fn base_step(
             commitment_roots_set_root,
             block_level: blk_assigned,
         },
-        left.as_vec(),  // <-- verify client proof with its 7 unhashed public inputs
-        right.as_vec(), // <-- verify client proof with its 7 unhashed public inputs
+        left.as_vec(),  // verify client proof with its unhashed public inputs
+        right.as_vec(), // verify client proof with its unhashed public inputs
     ))
 }
 
@@ -644,7 +1024,7 @@ pub fn base_step(
 
 /// Internal-node state transition:
 /// - assigns both child states
-/// - enforces sequential stitching constraints (c/n boundary + commitment_roots_set_root)
+/// - enforces sequential stitching constraints (c/n boundary + commitment_roots_set_root + blk)
 /// - computes parent subroot = H(left.subroot, right.subroot)
 ///
 /// Returns:
@@ -762,7 +1142,7 @@ pub fn wrap_step(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Recursive partial verification (formerly misnamed "fold_step")
+// Recursive partial verification
 ////////////////////////////////////////////////////////////////////////////////
 
 /// Input for recursive partial verification:
@@ -1053,12 +1433,6 @@ fn synthesize_two_child<const K: u32, L: Layouter<F>>(
 // Circuit: base_step (Leaf layer)
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Leaf-layer aggregation circuit.
-///
-/// This circuit runs:
-/// 1) `base_step` state transition (leaf semantics)
-/// 2) recursive partial verification of two client proofs
-/// 3) exposes `state || accumulator_PI`
 #[derive(Clone, Debug)]
 pub struct BaseStepCircuit<const K: u32> {
     pub child_vk: VkData,
@@ -1147,12 +1521,6 @@ pub type LeafAggCircuit = BaseStepCircuit<K_LEAF>;
 // Circuit: fold_step (Internal nodes)
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Internal aggregation circuit.
-///
-/// This circuit runs:
-/// 1) `fold_step` state transition (internal stitching semantics)
-/// 2) recursive partial verification of two aggregation proofs
-/// 3) exposes `state || accumulator_PI`
 #[derive(Clone, Debug)]
 pub struct FoldStepCircuit<const K: u32> {
     pub child_vk: VkData,
@@ -1224,15 +1592,6 @@ pub fn accumulator_as_public_input(acc: &AggAccumulator) -> Vec<F> {
     AssignedAccumulator::as_public_input(acc)
 }
 
-/// Final aggregation circuit.
-///
-/// This circuit:
-/// - exposes the global (c/n) boundary as public input
-/// - checks left/right child states stitch and match the declared boundary
-/// - exposes the final subroot as public input
-/// - runs `wrap_step` to bind + update the historic commitment-roots-set and exposes its pre/post roots
-/// - performs recursive partial verification of the two top aggregation proofs
-/// - exposes final accumulator PI
 #[derive(Clone, Debug)]
 pub struct WrapStepCircuit {
     pub child_vk: VkData,

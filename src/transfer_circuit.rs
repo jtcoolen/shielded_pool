@@ -1,9 +1,9 @@
 use ff::{Field, PrimeField};
 use group::Group;
+use midnight_zk_stdlib::{self, Relation, ZkStdLib, ZkStdLibArch};
 
 use midnight_circuits::{
     biguint::AssignedBigUint,
-    compact_std_lib::{Relation, ZkStdLib, ZkStdLibArch},
     ecc::native::AssignedScalarOfNativeCurve,
     hash::poseidon::PoseidonChip,
     instructions::{
@@ -186,8 +186,11 @@ impl Relation for Spend2Output2 {
         ZkStdLibArch {
             jubjub: true,
             poseidon: true,
-            sha256: false,
-            sha512: false,
+            sha2_256: false,
+            sha2_512: false,
+            keccak_256: false,
+            sha3_256: false,
+            blake2b: false,
             secp256k1: false,
             bls12_381: false,
             base64: false,
@@ -335,9 +338,9 @@ mod tests {
 
     type E = <S as SelfEmulation>::Engine;
 
-    // Poseidon transcript state used by compact_std_lib
-    use midnight_circuits::compact_std_lib::{self, MidnightPK};
+    // Poseidon transcript state used by midnight_zk_stdlib
     use midnight_circuits::hash::poseidon::PoseidonState;
+    use midnight_zk_stdlib::MidnightPK;
 
     const K_TEST: u32 = 14;
 
@@ -345,7 +348,7 @@ mod tests {
     struct Env {
         srs: ParamsKZG<E>,
         relation: Spend2Output2,
-        vk: midnight_circuits::compact_std_lib::MidnightVK,
+        vk: midnight_zk_stdlib::MidnightVK,
         pk: MidnightPK<Spend2Output2>,
     }
 
@@ -360,10 +363,10 @@ mod tests {
             let relation = Spend2Output2;
 
             // Optional but nice if available in your crate (seen in midnight_zk_stdlib):
-            // compact_std_lib::downsize_srs_for_relation(&mut srs, &relation);
+            // midnight_zk_stdlib::downsize_srs_for_relation(&mut srs, &relation);
 
-            let vk = compact_std_lib::setup_vk(&srs, &relation);
-            let pk = compact_std_lib::setup_pk(&relation, &vk);
+            let vk = midnight_zk_stdlib::setup_vk(&srs, &relation);
+            let pk = midnight_zk_stdlib::setup_pk(&relation, &vk);
 
             Env {
                 srs,
@@ -377,13 +380,13 @@ mod tests {
     // Treat "reject" as: either proving fails OR verification fails.
     fn accepts(
         instance: &Spend2Output2PublicInputs,
-        witness: <Spend2Output2 as midnight_circuits::compact_std_lib::Relation>::Witness,
+        witness: <Spend2Output2 as midnight_zk_stdlib::Relation>::Witness,
         seed: u64,
     ) -> bool {
         let e = env();
         let mut prover_rng = ChaCha8Rng::seed_from_u64(seed ^ 0xA5A5_A5A5_A5A5_A5A5);
 
-        let proof = match compact_std_lib::prove::<Spend2Output2, PoseidonState<F>>(
+        let proof = match midnight_zk_stdlib::prove::<Spend2Output2, PoseidonState<F>>(
             &e.srs,
             &e.pk,
             &e.relation,
@@ -396,8 +399,8 @@ mod tests {
         };
 
         // This matches the verify API shape shown in docs.rs for midnight_zk_stdlib.
-        // compact_std_lib in your codebase typically mirrors it; if not, swap for your verifier.
-        compact_std_lib::verify::<Spend2Output2, PoseidonState<F>>(
+        // midnight_zk_stdlib in your codebase typically mirrors it; if not, swap for your verifier.
+        midnight_zk_stdlib::verify::<Spend2Output2, PoseidonState<F>>(
             &e.srs.verifier_params(),
             &e.vk,
             instance,
@@ -409,7 +412,7 @@ mod tests {
 
     fn rejects(
         instance: &Spend2Output2PublicInputs,
-        witness: <Spend2Output2 as midnight_circuits::compact_std_lib::Relation>::Witness,
+        witness: <Spend2Output2 as midnight_zk_stdlib::Relation>::Witness,
         seed: u64,
     ) -> bool {
         !accepts(instance, witness, seed)

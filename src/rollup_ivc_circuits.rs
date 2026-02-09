@@ -422,8 +422,8 @@ impl AggCtx {
         name: &str,
         vk: &VkData,
     ) -> Result<AssignedVk<S>, Error> {
-        let vk_repr: AssignedNative<F> = self.native.assign_fixed(layouter, vk.transcript_repr)?;
-        self.verifier.assign_vk(name, &vk.domain, &vk.cs, vk_repr)
+        self.verifier
+            .assign_vk_to_fixed(layouter, name, &vk.domain, &vk.cs, vk.transcript_repr)
     }
 
     fn verify_map_membership_is_one(

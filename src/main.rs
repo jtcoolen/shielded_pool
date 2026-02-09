@@ -5,7 +5,6 @@ use group::Group;
 use thiserror::Error;
 
 use midnight_circuits::{
-    compact_std_lib::{self, MidnightPK, cost_model},
     hash::poseidon::{PoseidonChip, PoseidonState},
     instructions::map::MapCPU,
     map::cpu::MapMt,
@@ -17,6 +16,7 @@ use midnight_proofs::{
     plonk::{VerifyingKey, create_proof, keygen_pk, keygen_vk_with_k, prepare},
     poly::kzg::{KZGCommitmentScheme, params::ParamsKZG},
 };
+use midnight_zk_stdlib::{self, MidnightPK, cost_model};
 use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -589,7 +589,7 @@ fn prove_client(
     built: BuiltTx,
 ) -> Result<rollup_ivc_proofs::ClientProof, AppError> {
     let now = Instant::now();
-    let proof = compact_std_lib::prove::<transfer_circuit::Spend2Output2, PoseidonState<F>>(
+    let proof = midnight_zk_stdlib::prove::<transfer_circuit::Spend2Output2, PoseidonState<F>>(
         srs,
         pk,
         relation,
@@ -687,8 +687,8 @@ fn run() -> Result<(), AppError> {
     let srs =
         trusted_setup::filecoin_srs_agg(K).map_err(|e| AppError::TrustedSetup(err_string(e)))?;
     let relation = transfer_circuit::Spend2Output2;
-    let vk = compact_std_lib::setup_vk(&srs, &relation);
-    let pk = compact_std_lib::setup_pk(&relation, &vk);
+    let vk = midnight_zk_stdlib::setup_vk(&srs, &relation);
+    let pk = midnight_zk_stdlib::setup_pk(&relation, &vk);
 
     // Cache aggregation setup once (fixed batch size).
     let agg_setup = setup_ivc::prepare_agg_setup(&srs, vk.vk(), LEAF_VK_NAME, K, BATCH_SIZE);
@@ -1173,8 +1173,8 @@ mod tests {
             .map_err(|e| AppError::TrustedSetup(err_string(e)))?;
 
         let relation = transfer_circuit::Spend2Output2;
-        let vk_mid = compact_std_lib::setup_vk(&srs, &relation);
-        let pk = compact_std_lib::setup_pk(&relation, &vk_mid);
+        let vk_mid = midnight_zk_stdlib::setup_vk(&srs, &relation);
+        let pk = midnight_zk_stdlib::setup_pk(&relation, &vk_mid);
         let leaf_vk = vk_mid.vk().clone();
 
         let agg_setup = setup_ivc::prepare_agg_setup(&srs, &leaf_vk, LEAF_VK_NAME, k, batch_size);

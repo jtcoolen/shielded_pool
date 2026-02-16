@@ -318,7 +318,7 @@ fn load_and_verify_srs(
 }
 
 fn load_srs(k: u32) -> Result<ParamsKZG<Bls12>, AggSetupError> {
-    trusted_setup::filecoin_srs_agg(k).map_err(|_| AggSetupError::SrsLoadFailed { k })
+    trusted_setup::mock_srs_agg(k).map_err(|_| AggSetupError::SrsLoadFailed { k })
 }
 
 fn verify_srs_compatibility(

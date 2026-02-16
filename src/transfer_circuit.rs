@@ -358,7 +358,7 @@ mod tests {
         ENV.get_or_init(|| {
             // --- swap this line if needed in your repo ---
             let mut srs =
-                crate::trusted_setup::filecoin_srs_agg(K_TEST).expect("SRS must load in tests");
+                crate::trusted_setup::mock_srs_agg(K_TEST).expect("SRS must load in tests");
 
             let relation = Spend2Output2;
 

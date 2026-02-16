@@ -685,7 +685,7 @@ fn run() -> Result<(), AppError> {
 
     // --- Setup leaf circuit keys ---
     let srs =
-        trusted_setup::filecoin_srs_agg(K).map_err(|e| AppError::TrustedSetup(err_string(e)))?;
+        trusted_setup::mock_srs_agg(K).map_err(|e| AppError::TrustedSetup(err_string(e)))?;
     let relation = transfer_circuit::Spend2Output2;
     let vk = midnight_zk_stdlib::setup_vk(&srs, &relation);
     let pk = midnight_zk_stdlib::setup_pk(&relation, &vk);
@@ -694,7 +694,7 @@ fn run() -> Result<(), AppError> {
     let agg_setup = setup_ivc::prepare_agg_setup(&srs, vk.vk(), LEAF_VK_NAME, K, BATCH_SIZE);
 
     // Cache final aggregation vk/pk once (depends only on cached agg_setup for this batch size).
-    let final_agg_srs = trusted_setup::filecoin_srs_agg(AGG_K)
+    let final_agg_srs = trusted_setup::mock_srs_agg(AGG_K)
         .map_err(|e| AppError::TrustedSetup(err_string(e)))?;
 
     let default_final_circuit = rollup_ivc_circuits::WrapStepCircuit {
@@ -1173,7 +1173,7 @@ mod tests {
     fn mini_env(k: u32, batch_size: usize) -> Result<MiniEnv, AppError> {
         const LEAF_VK_NAME: &str = "spend2output2_vk_test";
 
-        let srs = trusted_setup::filecoin_srs_agg(k)
+        let srs = trusted_setup::mock_srs_agg(k)
             .map_err(|e| AppError::TrustedSetup(err_string(e)))?;
 
         let relation = transfer_circuit::Spend2Output2;

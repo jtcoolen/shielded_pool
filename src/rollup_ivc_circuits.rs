@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use ff::Field;
 use group::Group;
 
@@ -20,7 +22,7 @@ use midnight_circuits::{
         PublicInputInstructions, map::MapInstructions,
     },
     map::cpu::MapMt,
-    types::{AssignedForeignPoint, AssignedNative, ComposableChip, Instantiable},
+    types::{AssignedForeignPoint, AssignedNative, ComposableChip},
     verifier::{
         Accumulator, AssignedAccumulator, AssignedVk, BlstrsEmulation, SelfEmulation,
         VerifierGadget,
@@ -99,7 +101,7 @@ pub const K_LEAF: u32 = 19;
 pub const K_INTERNAL: u32 = 19;
 
 /// K used by the wrap circuit (final aggregation).
-pub const AGG_K: u32 = K_INTERNAL;
+pub const AGG_K: u32 = 20;
 
 /// Width of the aggregation state exposed by aggregation circuits.
 /// This includes the historic commitment-roots-set Merkle map root, used to bind membership checks.
@@ -1220,10 +1222,6 @@ pub type InternalAggCircuit = FoldStepCircuit<K_INTERNAL>;
 
 pub type AggAccumulator = Accumulator<S>;
 
-pub fn accumulator_as_public_input(acc: &AggAccumulator) -> Vec<F> {
-    AssignedAccumulator::as_public_input(acc)
-}
-
 /// Final aggregation circuit.
 ///
 /// This circuit:
@@ -1243,6 +1241,7 @@ pub struct WrapStepCircuit {
     pub left_pi_acc: Value<AggAccumulator>,
     pub right_pi_acc: Value<AggAccumulator>,
     pub fixed_base_names: Vec<String>,
+    pub fixed_bases: BTreeMap<String, C>,
 
     pub left_child_state: Value<AggState>,
     pub right_child_state: Value<AggState>,
@@ -1272,6 +1271,7 @@ impl Circuit<F> for WrapStepCircuit {
             left_pi_acc: Value::unknown(),
             right_pi_acc: Value::unknown(),
             fixed_base_names: self.fixed_base_names.clone(),
+            fixed_bases: self.fixed_bases.clone(),
             left_child_state: Value::unknown(),
             right_child_state: Value::unknown(),
             agg_state: Value::unknown(),
@@ -1386,10 +1386,13 @@ impl Circuit<F> for WrapStepCircuit {
             },
         )?;
 
-        // Public: final accumulator PI
-        let final_acc_pi = ctx
-            .verifier
-            .as_public_input(&mut layouter, &rpv_out.next_acc)?;
+        // Public: final (fully collapsed) accumulator PI
+        let (final_lhs, final_rhs) =
+            rpv_out
+                .next_acc
+                .fully_collapse(&mut layouter, &ctx.curve, &self.fixed_bases)?;
+        let mut final_acc_pi = ctx.curve.as_public_input(&mut layouter, &final_lhs)?;
+        final_acc_pi.extend(ctx.curve.as_public_input(&mut layouter, &final_rhs)?);
         expose_native(&ctx, &mut layouter, final_acc_pi)?;
 
         ctx.load(&mut layouter)

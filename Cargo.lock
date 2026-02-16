@@ -589,7 +589,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 [[package]]
 name = "midnight-aggregator"
 version = "0.1.2"
-source = "git+https://github.com/EYBlockchain/midfall?rev=20b048568ec30749338710cb842d7932efa75b1d#20b048568ec30749338710cb842d7932efa75b1d"
+source = "git+https://github.com/EYBlockchain/midfall#66e4bfe4e6fe166d5abd41bce5398df5259e731a"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -605,7 +605,7 @@ dependencies = [
 [[package]]
 name = "midnight-circuits"
 version = "6.0.0"
-source = "git+https://github.com/EYBlockchain/midfall?rev=20b048568ec30749338710cb842d7932efa75b1d#20b048568ec30749338710cb842d7932efa75b1d"
+source = "git+https://github.com/EYBlockchain/midfall#66e4bfe4e6fe166d5abd41bce5398df5259e731a"
 dependencies = [
  "base64",
  "ff",
@@ -628,7 +628,7 @@ dependencies = [
 [[package]]
 name = "midnight-curves"
 version = "0.2.0"
-source = "git+https://github.com/EYBlockchain/midfall?rev=20b048568ec30749338710cb842d7932efa75b1d#20b048568ec30749338710cb842d7932efa75b1d"
+source = "git+https://github.com/EYBlockchain/midfall#66e4bfe4e6fe166d5abd41bce5398df5259e731a"
 dependencies = [
  "bitvec",
  "blst",
@@ -654,7 +654,7 @@ dependencies = [
 [[package]]
 name = "midnight-proofs"
 version = "0.7.0"
-source = "git+https://github.com/EYBlockchain/midfall?rev=20b048568ec30749338710cb842d7932efa75b1d#20b048568ec30749338710cb842d7932efa75b1d"
+source = "git+https://github.com/EYBlockchain/midfall#66e4bfe4e6fe166d5abd41bce5398df5259e731a"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -673,7 +673,7 @@ dependencies = [
 [[package]]
 name = "midnight-zk-stdlib"
 version = "1.0.0"
-source = "git+https://github.com/EYBlockchain/midfall?rev=20b048568ec30749338710cb842d7932efa75b1d#20b048568ec30749338710cb842d7932efa75b1d"
+source = "git+https://github.com/EYBlockchain/midfall#66e4bfe4e6fe166d5abd41bce5398df5259e731a"
 dependencies = [
  "base64",
  "bincode",

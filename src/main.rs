@@ -56,7 +56,7 @@ const BATCH_SIZE: usize = 4;
 const LAG_TX_PROB: f64 = 0.35;
 
 const K_INTERNAL: u32 = 19;
-pub const AGG_K: u32 = K_INTERNAL;
+pub const AGG_K: u32 = 20;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -685,7 +685,7 @@ fn run() -> Result<(), AppError> {
 
     // --- Setup leaf circuit keys ---
     let srs =
-        trusted_setup::filecoin_srs_agg(K).map_err(|e| AppError::TrustedSetup(err_string(e)))?;
+        trusted_setup::mock_srs_agg(K).map_err(|e| AppError::TrustedSetup(err_string(e)))?;
     let relation = transfer_circuit::Spend2Output2;
     let vk = midnight_zk_stdlib::setup_vk(&srs, &relation);
     let pk = midnight_zk_stdlib::setup_pk(&relation, &vk);
@@ -694,7 +694,7 @@ fn run() -> Result<(), AppError> {
     let agg_setup = setup_ivc::prepare_agg_setup(&srs, vk.vk(), LEAF_VK_NAME, K, BATCH_SIZE);
 
     // Cache final aggregation vk/pk once (depends only on cached agg_setup for this batch size).
-    let final_agg_srs = trusted_setup::filecoin_srs_agg(AGG_K)
+    let final_agg_srs = trusted_setup::mock_srs_agg(AGG_K)
         .map_err(|e| AppError::TrustedSetup(err_string(e)))?;
 
     let default_final_circuit = rollup_ivc_circuits::WrapStepCircuit {
@@ -705,6 +705,7 @@ fn run() -> Result<(), AppError> {
         left_pi_acc: Value::unknown(),
         right_pi_acc: Value::unknown(),
         fixed_base_names: agg_setup.fixed_base_names().to_vec(),
+        fixed_bases: agg_setup.fixed_bases.clone(),
         left_child_state: Value::unknown(),
         right_child_state: Value::unknown(),
         agg_state: Value::unknown(),
@@ -887,7 +888,9 @@ fn run() -> Result<(), AppError> {
                     agg_result.right_top.pi_acc.clone(),
                 ]);
             final_acc.collapse();
-            let final_acc_pi = rollup_ivc_circuits::accumulator_as_public_input(&final_acc);
+            let (final_acc_lhs, final_acc_rhs) = final_acc.fully_collapse(&agg_result.fixed_bases);
+            let mut final_acc_pi = IdPoint::as_public_input(&final_acc_lhs);
+            final_acc_pi.extend(IdPoint::as_public_input(&final_acc_rhs));
 
             let final_circuit = rollup_ivc_circuits::WrapStepCircuit {
                 child_vk: agg_result.child_vk.clone(),
@@ -897,6 +900,7 @@ fn run() -> Result<(), AppError> {
                 left_pi_acc: Value::known(agg_result.left_top.pi_acc.clone()),
                 right_pi_acc: Value::known(agg_result.right_top.pi_acc.clone()),
                 fixed_base_names: agg_result.fixed_base_names.clone(),
+                fixed_bases: agg_result.fixed_bases.clone(),
                 left_child_state: Value::known(agg_result.left_top.state),
                 right_child_state: Value::known(agg_result.right_top.state),
                 agg_state: Value::known(agg_result.root_state),
@@ -1169,7 +1173,7 @@ mod tests {
     fn mini_env(k: u32, batch_size: usize) -> Result<MiniEnv, AppError> {
         const LEAF_VK_NAME: &str = "spend2output2_vk_test";
 
-        let srs = trusted_setup::filecoin_srs_agg(k)
+        let srs = trusted_setup::mock_srs_agg(k)
             .map_err(|e| AppError::TrustedSetup(err_string(e)))?;
 
         let relation = transfer_circuit::Spend2Output2;

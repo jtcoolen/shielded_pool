@@ -56,7 +56,7 @@ const BATCH_SIZE: usize = 4;
 const LAG_TX_PROB: f64 = 0.35;
 
 const K_INTERNAL: u32 = 19;
-pub const AGG_K: u32 = K_INTERNAL;
+pub const AGG_K: u32 = 20;
 
 #[derive(Debug, Error)]
 enum AppError {

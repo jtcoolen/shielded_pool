@@ -101,7 +101,7 @@ pub const K_LEAF: u32 = 19;
 pub const K_INTERNAL: u32 = 19;
 
 /// K used by the wrap circuit (final aggregation).
-pub const AGG_K: u32 = K_INTERNAL;
+pub const AGG_K: u32 = 20;
 
 /// Width of the aggregation state exposed by aggregation circuits.
 /// This includes the historic commitment-roots-set Merkle map root, used to bind membership checks.

@@ -152,6 +152,44 @@ fn map_insert_many(map: Map, entries: impl IntoIterator<Item = (F, F)>) -> Map {
     })
 }
 
+fn parse_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+fn outer_proof_jobs() -> usize {
+    parse_env_usize("SHIELDED_POOL_OUTER_PROOF_JOBS").unwrap_or_else(rayon::current_num_threads)
+}
+
+fn par_map_limited<T, U, E, F>(items: &[T], max_jobs: usize, f: F) -> Result<Vec<U>, E>
+where
+    T: Sync,
+    U: Send,
+    E: Send,
+    F: Fn(&T) -> Result<U, E> + Sync + Send,
+{
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let jobs = max_jobs.max(1);
+    if jobs == 1 {
+        return items.iter().map(f).collect();
+    }
+    if jobs >= items.len() {
+        return items.par_iter().map(f).collect();
+    }
+
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in items.chunks(jobs) {
+        let mut partial = chunk.par_iter().map(&f).collect::<Result<Vec<_>, _>>()?;
+        out.append(&mut partial);
+    }
+    Ok(out)
+}
+
 fn apply_tx_effects(commit_map: Map, null_map: Map, items: [F; 7]) -> (Map, Map) {
     let [_tx_root, _x1, _x2, c1, c2, nf1, nf2] = items;
     let commit_map = map_insert_many(commit_map, [(c1, F::ONE), (c2, F::ONE)]);
@@ -416,13 +454,13 @@ fn prove_leaf(
     let leaf_pk = leaf_keys.pk.clone();
     let leaf_vk_arc = leaf_keys.vk.clone();
 
-    let fixed_base_names = setup.fixed_base_names.clone();
-    let fixed_bases = setup.fixed_bases.clone();
-    let trivial = setup.trivial_combined.clone();
+    let fixed_base_names = &setup.fixed_base_names;
+    let fixed_bases = &setup.fixed_bases;
+    let trivial = &setup.trivial_combined;
 
     let leaf_vk_data = setup.leaf_vk_data.clone();
     let leaf_vk_name = setup.leaf_vk_name.clone();
-    let leaf_fixed_bases = setup.leaf_fixed_bases.clone();
+    let leaf_fixed_bases = &setup.leaf_fixed_bases;
 
     let (left, right) = plan.children;
 
@@ -447,20 +485,28 @@ fn prove_leaf(
         fixed_base_names: fixed_base_names.clone(),
     };
 
-    let acc_l = verify_and_extract_acc(
-        leaf_srs,
-        leaf_vk,
-        &leaf_fixed_bases,
-        &left.proof,
-        &left.public_items,
-    )?;
-    let acc_r = verify_and_extract_acc(
-        leaf_srs,
-        leaf_vk,
-        &leaf_fixed_bases,
-        &right.proof,
-        &right.public_items,
-    )?;
+    let (acc_l_res, acc_r_res) = rayon::join(
+        || {
+            verify_and_extract_acc(
+                leaf_srs,
+                leaf_vk,
+                leaf_fixed_bases,
+                &left.proof,
+                &left.public_items,
+            )
+        },
+        || {
+            verify_and_extract_acc(
+                leaf_srs,
+                leaf_vk,
+                leaf_fixed_bases,
+                &right.proof,
+                &right.public_items,
+            )
+        },
+    );
+    let acc_l = acc_l_res?;
+    let acc_r = acc_r_res?;
 
     let pi_acc = collapse_acc(Accumulator::accumulate(&[
         acc_l,
@@ -470,7 +516,7 @@ fn prove_leaf(
     ]));
 
     ensure(
-        pi_acc.check(&agg_srs2.s_g2().into(), &fixed_bases),
+        pi_acc.check(&agg_srs2.s_g2().into(), fixed_bases),
         AggregationError::PiAccumulatorDidNotCheck("leaf accumulated PI"),
     )?;
 
@@ -548,8 +594,8 @@ fn prove_parent(
     let parent_keys = setup.agg_store.get(parent_level);
 
     let agg_srs2 = &setup.agg_srs_internal;
-    let fixed_base_names = setup.fixed_base_names.clone();
-    let fixed_bases = setup.fixed_bases.clone();
+    let fixed_base_names = &setup.fixed_base_names;
+    let fixed_bases = &setup.fixed_bases;
 
     let state = rollup_ivc_circuits::AggState {
         c_pre: left.state.c_pre,
@@ -585,7 +631,7 @@ fn prove_parent(
     ]));
 
     ensure(
-        pi_acc.check(&agg_srs2.s_g2().into(), &fixed_bases),
+        pi_acc.check(&agg_srs2.s_g2().into(), fixed_bases),
         AggregationError::PiAccumulatorDidNotCheck("internal accumulated PI"),
     )?;
 
@@ -638,76 +684,45 @@ fn prove_parent(
     })
 }
 
-/// Build a full subtree to a single root node.
-///
-/// This uses divide-and-conquer with `rayon::join` so independent subtrees are proved
-/// concurrently instead of synchronizing all nodes at each global tree level.
-fn build_to_single_node(
+/// Reduce one level: [n0,n1,n2,n3,...] -> [p0,p1,...], pairing without indexing.
+fn build_next_level(
     setup: &setup_ivc::AggSetup,
+    parent_level: usize,
     child_level: usize,
-    mut nodes: Vec<TreeNode>,
-) -> Result<(usize, TreeNode), AggregationError> {
-    match nodes.len() {
-        0 => Err(AggregationError::Empty),
-        1 => Ok((child_level, nodes.pop().expect("len checked"))),
-        2 => {
-            let right = nodes.pop().expect("len checked");
-            let left = nodes.pop().expect("len checked");
-            let parent_level = child_level + 1;
-            let parent = prove_parent(setup, parent_level, child_level, (&left, &right))?;
-            Ok((parent_level, parent))
-        }
-        _ => {
-            let mid = nodes.len() / 2;
-            let right_nodes = nodes.split_off(mid);
-            let left_nodes = nodes;
-
-            let (left_res, right_res) = rayon::join(
-                || build_to_single_node(setup, child_level, left_nodes),
-                || build_to_single_node(setup, child_level, right_nodes),
-            );
-
-            let (left_level, left_root) = left_res?;
-            let (right_level, right_root) = right_res?;
-            debug_assert_eq!(left_level, right_level);
-
-            let parent_level = left_level + 1;
-            let parent = prove_parent(setup, parent_level, left_level, (&left_root, &right_root))?;
-            Ok((parent_level, parent))
-        }
-    }
+    nodes: Vec<TreeNode>,
+    max_jobs: usize,
+) -> Result<Vec<TreeNode>, AggregationError> {
+    let pairs: Vec<&[TreeNode]> = nodes.chunks_exact(2).collect();
+    par_map_limited(&pairs, max_jobs, |chunk| match *chunk {
+        [l, r] => prove_parent(setup, parent_level, child_level, (l, r)),
+        _ => unreachable!("chunks_exact(2)"),
+    })
 }
 
-/// Build internal levels to the top `(left,right)` pair.
-///
-/// For large batches this keeps better worker utilization than global level barriers.
+/// Build internal levels to the top `(left,right)` pair with tunable outer proof fanout.
 fn build_to_top_pair(
     setup: &setup_ivc::AggSetup,
     child_level: usize,
     mut nodes: Vec<TreeNode>,
 ) -> Result<(usize, (TreeNode, TreeNode)), AggregationError> {
-    match nodes.len() {
-        0 => Err(AggregationError::Empty),
-        1 => Err(AggregationError::NeedAtLeastFour { got: 2 }),
-        2 => {
-            let right = nodes.pop().expect("len checked");
-            let left = nodes.pop().expect("len checked");
-            Ok((child_level, (left, right)))
-        }
-        _ => {
-            let mid = nodes.len() / 2;
-            let right_nodes = nodes.split_off(mid);
-            let left_nodes = nodes;
+    let mut level = child_level;
+    let max_outer_jobs = outer_proof_jobs();
 
-            let (left_res, right_res) = rayon::join(
-                || build_to_single_node(setup, child_level, left_nodes),
-                || build_to_single_node(setup, child_level, right_nodes),
-            );
-
-            let (left_level, left_top) = left_res?;
-            let (right_level, right_top) = right_res?;
-            debug_assert_eq!(left_level, right_level);
-            Ok((left_level, (left_top, right_top)))
+    loop {
+        match nodes.len() {
+            0 => return Err(AggregationError::Empty),
+            1 => return Err(AggregationError::NeedAtLeastFour { got: 2 }),
+            2 => {
+                let right = nodes.pop().expect("len checked");
+                let left = nodes.pop().expect("len checked");
+                return Ok((level, (left, right)));
+            }
+            _ => {
+                let parent_level = level + 1;
+                let jobs_this_level = max_outer_jobs.min(nodes.len() / 2).max(1);
+                nodes = build_next_level(setup, parent_level, level, nodes, jobs_this_level)?;
+                level = parent_level;
+            }
         }
     }
 }
@@ -786,10 +801,9 @@ pub fn try_aggregate_client_proofs_cached(
     )?;
 
     // 2) prove leaves (parallel)
-    let leaf_nodes = leaf_plans
-        .par_iter()
-        .map(|p| prove_leaf(setup, leaf_srs, leaf_vk, p))
-        .collect::<Result<Vec<_>, _>>()?;
+    let leaf_nodes = par_map_limited(&leaf_plans, outer_proof_jobs(), |p| {
+        prove_leaf(setup, leaf_srs, leaf_vk, p)
+    })?;
 
     // 3) build internal levels to (left,right) tuple
     let (child_level, top_pair) = build_to_top_pair(setup, 1, leaf_nodes)?;

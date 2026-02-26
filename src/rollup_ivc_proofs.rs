@@ -638,35 +638,76 @@ fn prove_parent(
     })
 }
 
-/// Reduce one level: [n0,n1,n2,n3,...] -> [p0,p1,...], pairing without indexing.
-fn build_next_level(
+/// Build a full subtree to a single root node.
+///
+/// This uses divide-and-conquer with `rayon::join` so independent subtrees are proved
+/// concurrently instead of synchronizing all nodes at each global tree level.
+fn build_to_single_node(
     setup: &setup_ivc::AggSetup,
-    parent_level: usize,
     child_level: usize,
-    nodes: Vec<TreeNode>,
-) -> Result<Vec<TreeNode>, AggregationError> {
-    nodes
-        .par_chunks_exact(2)
-        .map(|chunk| match chunk {
-            [l, r] => prove_parent(setup, parent_level, child_level, (l, r)),
-            _ => unreachable!("par_chunks_exact(2)"),
-        })
-        .collect()
+    mut nodes: Vec<TreeNode>,
+) -> Result<(usize, TreeNode), AggregationError> {
+    match nodes.len() {
+        0 => Err(AggregationError::Empty),
+        1 => Ok((child_level, nodes.pop().expect("len checked"))),
+        2 => {
+            let right = nodes.pop().expect("len checked");
+            let left = nodes.pop().expect("len checked");
+            let parent_level = child_level + 1;
+            let parent = prove_parent(setup, parent_level, child_level, (&left, &right))?;
+            Ok((parent_level, parent))
+        }
+        _ => {
+            let mid = nodes.len() / 2;
+            let right_nodes = nodes.split_off(mid);
+            let left_nodes = nodes;
+
+            let (left_res, right_res) = rayon::join(
+                || build_to_single_node(setup, child_level, left_nodes),
+                || build_to_single_node(setup, child_level, right_nodes),
+            );
+
+            let (left_level, left_root) = left_res?;
+            let (right_level, right_root) = right_res?;
+            debug_assert_eq!(left_level, right_level);
+
+            let parent_level = left_level + 1;
+            let parent = prove_parent(setup, parent_level, left_level, (&left_root, &right_root))?;
+            Ok((parent_level, parent))
+        }
+    }
 }
 
-/// Recursively build internal levels to the top pair, returning a tuple (left,right) instead
-/// of “unpacking from a vec”.
+/// Build internal levels to the top `(left,right)` pair.
+///
+/// For large batches this keeps better worker utilization than global level barriers.
 fn build_to_top_pair(
     setup: &setup_ivc::AggSetup,
     child_level: usize,
-    nodes: Vec<TreeNode>,
+    mut nodes: Vec<TreeNode>,
 ) -> Result<(usize, (TreeNode, TreeNode)), AggregationError> {
-    match nodes.as_slice() {
-        [left, right] => Ok((child_level, (left.clone(), right.clone()))),
+    match nodes.len() {
+        0 => Err(AggregationError::Empty),
+        1 => Err(AggregationError::NeedAtLeastFour { got: 2 }),
+        2 => {
+            let right = nodes.pop().expect("len checked");
+            let left = nodes.pop().expect("len checked");
+            Ok((child_level, (left, right)))
+        }
         _ => {
-            let parent_level = child_level + 1;
-            let next = build_next_level(setup, parent_level, child_level, nodes)?;
-            build_to_top_pair(setup, parent_level, next)
+            let mid = nodes.len() / 2;
+            let right_nodes = nodes.split_off(mid);
+            let left_nodes = nodes;
+
+            let (left_res, right_res) = rayon::join(
+                || build_to_single_node(setup, child_level, left_nodes),
+                || build_to_single_node(setup, child_level, right_nodes),
+            );
+
+            let (left_level, left_top) = left_res?;
+            let (right_level, right_top) = right_res?;
+            debug_assert_eq!(left_level, right_level);
+            Ok((left_level, (left_top, right_top)))
         }
     }
 }

@@ -484,7 +484,11 @@ fn build_transaction(
         );
     }
 
-    let total = old1.utxo.amount + old2.utxo.amount;
+    let total = old1
+        .utxo
+        .amount
+        .checked_add(old2.utxo.amount)
+        .expect("amount overflow: sum of two input notes exceeds u128");
     let (out1_amt, out2_amt) = split_amount(&mut *rng, total);
 
     let new1_utxo = transfer_circuit::Utxo {

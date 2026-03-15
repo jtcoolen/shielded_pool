@@ -526,7 +526,7 @@ mod tests {
             amount: out1_amt,
             randomness: F::random(&mut rng),
         };
-        let new2 = Utxo {
+        let mut new2 = Utxo {
             asset_id,
             amount: out2_amt,
             randomness: F::random(&mut rng),
@@ -537,16 +537,13 @@ mod tests {
 
         // Ensure new_c1 != new_c2; if collision / accidental equality, tweak randomness
         if new_c2 == new_c1 {
-            let tweaked = Utxo {
-                randomness: F::random(&mut rng),
-                ..new2.clone()
-            };
+            new2.randomness = F::random(&mut rng);
             new_c2 = host_commit(
-                tweaked.asset_id,
-                tweaked.amount,
+                new2.asset_id,
+                new2.amount,
                 pk2x,
                 pk2y,
-                tweaked.randomness,
+                new2.randomness,
             );
         }
 

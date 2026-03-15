@@ -28,9 +28,9 @@ pub mod circuit;
 pub mod engine;
 
 // Re-export the public API.
-pub use ctx::{AggCircuitConfig, IvcCtx, configure_ivc_circuit};
-pub use circuit::{FrameworkWitness, IvcDeciderCircuit, IvcLeafCircuit, IvcNodeCircuit};
-pub use engine::{IvcProver, IvcSetup};
+pub use ctx::IvcCtx;
+pub use circuit::IvcDeciderCircuit;
+pub use engine::IvcProver;
 
 use std::fmt::Debug;
 
@@ -110,6 +110,7 @@ pub struct NodeState<S> {
     pub merkle_digest: F,
 }
 
+#[allow(dead_code)]
 impl<S: HostState> NodeState<S> {
     /// Flatten into the field representation used as circuit public inputs
     /// (before the accumulator PI).
@@ -139,6 +140,7 @@ pub struct TreeResult<S> {
 /// Application state that can be serialized to/from field elements.
 ///
 /// Implemented by the application (e.g. `RollupAppState`).
+#[allow(dead_code)]
 pub trait HostState: Clone + Debug + Send + Sync {
     const WIDTH: usize;
     fn to_fields(&self) -> Vec<F>;
@@ -221,7 +223,8 @@ pub trait DeciderStep: Clone + Send + Sync {
 
 /// Host-side leaf planning: validates client proofs and computes the
 /// expected application state.
-pub trait HostLeafStep: Send + Sync {
+#[allow(dead_code)]
+pub trait HostLeafStep {
     type AppState: HostState;
 
     fn plan_pair(
@@ -232,7 +235,8 @@ pub trait HostLeafStep: Send + Sync {
 }
 
 /// Host-side fold: validates stitching and computes the merged state.
-pub trait HostFoldStep: Send + Sync {
+#[allow(dead_code)]
+pub trait HostFoldStep {
     type AppState: HostState;
 
     fn validate_and_merge(

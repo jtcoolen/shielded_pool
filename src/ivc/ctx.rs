@@ -25,7 +25,7 @@ use midnight_circuits::{
         ArithInstructions, AssertionInstructions, AssignmentInstructions, HashInstructions,
         PublicInputInstructions, map::MapInstructions,
     },
-    types::{AssignedNative, ComposableChip, Instantiable},
+    types::{AssignedNative, ComposableChip},
     verifier::{AssignedAccumulator, AssignedVk, VerifierGadget},
 };
 use midnight_proofs::{
@@ -33,7 +33,7 @@ use midnight_proofs::{
     plonk::{ConstraintSystem, Error},
 };
 
-use super::{Acc, C, CurveChip, F, IdPoint, MapGadget, NG, S, VkData};
+use super::{Acc, C, CurveChip, F, IdPoint, MapGadget, NG, S};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Circuit configuration
@@ -148,6 +148,7 @@ impl IvcCtx {
         self.scalar.assign(layouter, v)
     }
 
+    #[allow(dead_code)]
     pub fn assign_fixed(
         &self,
         layouter: &mut impl Layouter<F>,
@@ -322,7 +323,7 @@ pub(crate) fn recursive_partial_verify(
         r_child_pi.extend(ctx.verifier.as_public_input(layouter, &r_pi_acc)?);
     }
 
-    let id = ctx.curve.assign_fixed(layouter, C::identity())?;
+    let id: super::IdPoint = ctx.curve.assign_fixed(layouter, C::identity())?;
     let l_proof_acc = prepare_proof_acc(ctx, layouter, assigned_vk, id.clone(), &l_child_pi, left_proof)?;
     let r_proof_acc = prepare_proof_acc(ctx, layouter, assigned_vk, id, &r_child_pi, right_proof)?;
 

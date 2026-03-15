@@ -6,10 +6,7 @@
 use ff::Field;
 use midnight_circuits::{
     hash::poseidon::PoseidonChip,
-    instructions::{
-        AssertionInstructions, AssignmentInstructions, hash::HashCPU,
-        map::MapInstructions, ZeroInstructions,
-    },
+    instructions::{hash::HashCPU, map::MapInstructions},
     types::AssignedNative,
 };
 use midnight_proofs::circuit::{Layouter, Value};
@@ -17,9 +14,10 @@ use midnight_proofs::plonk::Error;
 
 use crate::ivc::{
     self, ClientProof, DeciderStep, F, FoldStep, HostLeafStep, HostState, IvcCtx, LeafStep,
-    Map, MapGadget, NodeState,
-    engine::AggregationError,
+    Map, MapGadget, engine::AggregationError,
 };
+
+use midnight_circuits::instructions::map::MapCPU;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Application state
@@ -64,6 +62,30 @@ impl HostState for RollupAppState {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// SendableMap wrapper (Map contains Rc, needs unsafe Send for rayon)
+////////////////////////////////////////////////////////////////////////////////
+
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct SendableMap(pub Map);
+
+// SAFETY — Send: each rayon task receives its own cloned Map via LeafPlan.
+// No Map instance is shared mutably across threads.
+//
+// SAFETY — Sync: required by rayon par_iter which hands out &LeafPlan.
+// Map is an immutable Poseidon Merkle tree of field elements with no
+// interior mutability beyond the Rc bookkeeping; the only use through
+// &SendableMap is cloning.
+unsafe impl Send for SendableMap {}
+unsafe impl Sync for SendableMap {}
+
+impl SendableMap {
+    #[allow(dead_code)]
+    pub fn inner(&self) -> &Map { &self.0 }
+    pub fn into_inner(self) -> Map { self.0 }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Leaf step: processes two client transactions
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -72,9 +94,9 @@ pub struct RollupLeafStep;
 
 #[derive(Clone)]
 pub struct LeafWitness {
-    pub pre_commitment_map: Map,
-    pub pre_nullifier_map: Map,
-    pub pre_commitment_roots_set_map: Map,
+    pub pre_commitment_map: SendableMap,
+    pub pre_nullifier_map: SendableMap,
+    pub pre_commitment_roots_set_map: SendableMap,
     pub block_level: F,
 }
 
@@ -93,14 +115,14 @@ impl LeafStep for RollupLeafStep {
         let zero = ctx.zero(layouter)?;
         let blk = ctx.assign(layouter, witness.clone().map(|w| w.block_level))?;
 
-        // Init rollup maps
-        let mut commit_map = ctx.init_map(layouter, witness.clone().map(|w| w.pre_commitment_map))?;
+        // Init rollup maps (unwrap SendableMap)
+        let mut commit_map = ctx.init_map(layouter, witness.clone().map(|w| w.pre_commitment_map.into_inner()))?;
         let c_pre = commit_map.succinct_repr();
-        let mut null_map = ctx.init_map(layouter, witness.clone().map(|w| w.pre_nullifier_map))?;
+        let mut null_map = ctx.init_map(layouter, witness.clone().map(|w| w.pre_nullifier_map.into_inner()))?;
         let n_pre = null_map.succinct_repr();
 
         // Historic roots set (read-only at leaf level)
-        let roots_set = ctx.init_map(layouter, witness.map(|w| w.pre_commitment_roots_set_map))?;
+        let roots_set = ctx.init_map(layouter, witness.map(|w| w.pre_commitment_roots_set_map.into_inner()))?;
         let roots_set_root = roots_set.succinct_repr();
 
         // Check each tx root ∈ historic roots set
@@ -168,7 +190,7 @@ pub struct RollupDeciderStep;
 
 #[derive(Clone)]
 pub struct DeciderWitness {
-    pub pre_commitment_roots_set_map: Map,
+    pub pre_commitment_roots_set_map: SendableMap,
     pub post_commitment_roots_set_root: F,
     pub blk_pre: F,
     pub blk_post: F,
@@ -210,7 +232,7 @@ impl DeciderStep for RollupDeciderStep {
         ctx.assert_eq(layouter, &right_app[5], &blk_post)?;
 
         // Historic roots-set: bind, check c_pre ∈ set, check c_post ∉ set, insert c_post
-        let mut roots_set = ctx.init_map(layouter, witness.clone().map(|w| w.pre_commitment_roots_set_map))?;
+        let mut roots_set = ctx.init_map(layouter, witness.clone().map(|w| w.pre_commitment_roots_set_map.into_inner()))?;
         let pre_roots_root = roots_set.succinct_repr();
         let zero = ctx.zero(layouter)?;
 
@@ -249,6 +271,7 @@ pub struct RollupHostLeaf {
     pub block_level: F,
 }
 
+#[allow(dead_code)]
 impl HostLeafStep for RollupHostLeaf {
     type AppState = RollupAppState;
 
@@ -307,7 +330,7 @@ pub fn rollup_host_merge(left: &[F], right: &[F]) -> Vec<F> {
 // Leaf plan construction
 ////////////////////////////////////////////////////////////////////////////////
 
-use crate::ivc::engine::{LeafPlan, host_instance_hash};
+use crate::ivc::engine::LeafPlan;
 
 /// Build leaf plans from a batch of client proofs.
 ///
@@ -369,9 +392,9 @@ pub fn plan_rollup_leaves(
             app_state,
             merkle_digest,
             witness: LeafWitness {
-                pre_commitment_map: pre_cmap_for_witness,
-                pre_nullifier_map: pre_nmap_for_witness,
-                pre_commitment_roots_set_map: pre_roots_set_map.clone(),
+                pre_commitment_map: SendableMap(pre_cmap_for_witness),
+                pre_nullifier_map: SendableMap(pre_nmap_for_witness),
+                pre_commitment_roots_set_map: SendableMap(pre_roots_set_map.clone()),
                 block_level,
             },
         });

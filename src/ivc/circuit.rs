@@ -4,14 +4,14 @@
 //! recursive partial verification and accumulator folding.  The user never
 //! constructs these directly — [`super::engine::IvcProver`] does.
 
-use midnight_circuits::verifier::AssignedAccumulator;
+use midnight_circuits::instructions::PublicInputInstructions;
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{Circuit, ConstraintSystem, Error},
 };
 
 use super::{
-    Acc, DeciderStep, F, FoldStep, LeafStep, S, VkData,
+    Acc, DeciderStep, F, FoldStep, LeafStep, VkData,
     ctx::{
         AggCircuitConfig, IvcCtx, RpvInput,
         configure_ivc_circuit, expose_node_outputs, recursive_partial_verify,
@@ -64,12 +64,12 @@ struct StepPhaseOutput {
     right_child_pi: Vec<AssignedNative<F>>,
 }
 
-fn synthesize_node<const K: u32>(
+fn synthesize_node<const K: u32, L: Layouter<F>>(
     config: AggCircuitConfig,
-    layouter: &mut impl Layouter<F>,
+    layouter: &mut L,
     fw: &FrameworkWitness,
     children_are_client_proofs: bool,
-    step_phase: impl FnOnce(&IvcCtx, &mut dyn Layouter<F>) -> Result<StepPhaseOutput, Error>,
+    step_phase: impl FnOnce(&IvcCtx, &mut L) -> Result<StepPhaseOutput, Error>,
 ) -> Result<(), Error> {
     let ctx = IvcCtx::new(&config, (K as usize).saturating_sub(1));
     let assigned_vk = ctx.verifier.assign_vk_to_fixed(
@@ -151,7 +151,7 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
         let witness = self.witness.clone();
         let width = self.client_pi_width;
 
-        synthesize_node::<K>(
+        synthesize_node::<K, _>(
             config,
             &mut layouter,
             &self.fw,
@@ -230,7 +230,7 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
         let right_vals = self.right_child_state.clone();
         let w = self.app_state_width;
 
-        synthesize_node::<K>(
+        synthesize_node::<K, _>(
             config,
             &mut layouter,
             &self.fw,

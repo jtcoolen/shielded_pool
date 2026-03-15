@@ -13,6 +13,7 @@ use thiserror::Error;
 use midnight_circuits::{
     hash::poseidon::PoseidonState,
     instructions::hash::HashCPU,
+    types::Instantiable,
     verifier::{Accumulator, AssignedAccumulator, Msm},
 };
 use midnight_curves::Bls12;
@@ -20,15 +21,15 @@ use midnight_proofs::{
     circuit::Value,
     plonk::{Circuit, ConstraintSystem, ProvingKey, VerifyingKey, create_proof, keygen_pk, keygen_vk_with_k},
     poly::{EvaluationDomain, kzg::{KZGCommitmentScheme, params::ParamsKZG}},
-    transcript::CircuitTranscript,
+    transcript::{CircuitTranscript, Transcript},
 };
 
 use midnight_circuits::hash::poseidon::PoseidonChip;
 
 use super::{
-    Acc, C, E, F, FoldStep,
+    Acc, C, ClientProof, E, F, FoldStep,
     LeafStep, NodeState, S, TreeNode, TreeResult, VkData,
-    circuit::{FrameworkWitness, IvcDeciderCircuit, IvcLeafCircuit, IvcNodeCircuit},
+    circuit::{FrameworkWitness, IvcLeafCircuit, IvcNodeCircuit},
     ctx::configure_ivc_circuit,
 };
 
@@ -37,6 +38,7 @@ use super::{
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum AggregationError {
     #[error("need at least one client proof")]
     Empty,
@@ -96,6 +98,7 @@ type Pk = ProvingKey<F, KZGCommitmentScheme<E>>;
 
 #[derive(Clone)]
 pub(crate) struct AggLevelKeys {
+    #[allow(dead_code)]
     pub level: usize,
     pub name: String,
     pub vk: Arc<Vk>,
@@ -180,7 +183,7 @@ impl IvcSetup {
 pub fn prepare_ivc_setup<L, Fo>(
     leaf_step: &L,
     fold_step: &Fo,
-    leaf_srs: &ParamsKZG<Bls12>,
+    _leaf_srs: &ParamsKZG<Bls12>,
     leaf_vk: &Vk,
     leaf_vk_name: &str,
     leaf_k: u32,
@@ -230,7 +233,7 @@ where
         let (child_vk_data, child_vk_name) = if level == 1 {
             (leaf_vk_data.clone(), leaf_vk_name.to_string())
         } else {
-            let prev = &levels[level - 2];
+            let prev: &AggLevelKeys = &levels[level - 2];
             (prev.vk_data.clone(), prev.name.clone())
         };
 
@@ -352,7 +355,7 @@ impl IvcProver {
             .collect::<Result<Vec<_>, _>>()?;
 
         // 2. Build internal levels up to the top pair
-        let (child_level, top_pair) =
+        let (_child_level, top_pair) =
             build_to_top_pair(setup, fold_step, &host_merge, 1, leaf_nodes)?;
 
         let (left, right) = top_pair;

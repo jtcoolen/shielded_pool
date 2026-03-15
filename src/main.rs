@@ -5,15 +5,14 @@ use group::Group;
 use thiserror::Error;
 
 use midnight_circuits::{
-    hash::poseidon::{PoseidonChip, PoseidonState},
+    hash::poseidon::PoseidonState,
     instructions::map::MapCPU,
-    map::cpu::MapMt,
     types::{AssignedNativePoint, Instantiable},
 };
 use midnight_curves::{Fr as JubjubScalar, JubjubExtended as Jubjub, JubjubSubgroup};
 use midnight_proofs::{circuit::Value, transcript::Transcript};
 use midnight_proofs::{
-    plonk::{VerifyingKey, create_proof, keygen_pk, keygen_vk_with_k, prepare},
+    plonk::{create_proof, keygen_pk, keygen_vk_with_k, prepare},
     poly::kzg::{KZGCommitmentScheme, params::ParamsKZG},
 };
 use midnight_zk_stdlib::{self, MidnightPK, cost_model};
@@ -28,16 +27,16 @@ mod rollup;
 mod transfer_circuit;
 mod trusted_setup;
 
-use ivc::{F, E, ClientProof, IvcSetup, IvcProver, TreeResult, IvcDeciderCircuit};
-use ivc::engine::{prepare_ivc_setup, host_instance_hash, LeafPlan};
+use ivc::{F, E, ClientProof, IvcProver, IvcDeciderCircuit};
+use ivc::engine::{prepare_ivc_setup, host_instance_hash};
 use ivc::circuit::FrameworkWitness;
 use rollup::{
-    RollupLeafStep, RollupFoldStep, RollupDeciderStep, RollupAppState,
-    LeafWitness, DeciderWitness, APP_STATE_WIDTH,
+    RollupLeafStep, RollupFoldStep, RollupDeciderStep, SendableMap,
+    DeciderWitness, APP_STATE_WIDTH,
     rollup_host_merge, plan_rollup_leaves,
 };
 
-type CommitmentMap = MapMt<F, PoseidonChip<F>>;
+type CommitmentMap = ivc::Map;
 
 const BATCH_SIZE: usize = 4;
 const LAG_TX_PROB: f64 = 0.35;
@@ -503,7 +502,7 @@ fn run() -> Result<(), AppError> {
                 left_child_state: left_full.iter().map(|f| Value::known(*f)).collect(),
                 right_child_state: right_full.iter().map(|f| Value::known(*f)).collect(),
                 witness: Value::known(DeciderWitness {
-                    pre_commitment_roots_set_map: pre.pre_roots_set_map.clone(),
+                    pre_commitment_roots_set_map: SendableMap(pre.pre_roots_set_map.clone()),
                     post_commitment_roots_set_root: post_roots_set_root,
                     blk_pre: F::from(blk_pre),
                     blk_post: blk_post_f,

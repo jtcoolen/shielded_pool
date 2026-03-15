@@ -24,7 +24,7 @@ use super::{
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone, Debug)]
-pub(crate) struct FrameworkWitness {
+pub struct FrameworkWitness {
     pub child_vk: VkData,
     pub child_vk_name: String,
     pub left_proof: Value<Vec<u8>>,
@@ -273,12 +273,12 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
 
 #[derive(Clone)]
 pub struct IvcDeciderCircuit<D: DeciderStep, const K: u32> {
-    pub(crate) step: D,
-    pub(crate) app_state_width: usize,
-    pub(crate) left_child_state: Vec<Value<F>>,
-    pub(crate) right_child_state: Vec<Value<F>>,
-    pub(crate) witness: Value<D::Witness>,
-    pub(crate) fw: FrameworkWitness,
+    pub step: D,
+    pub app_state_width: usize,
+    pub left_child_state: Vec<Value<F>>,
+    pub right_child_state: Vec<Value<F>>,
+    pub witness: Value<D::Witness>,
+    pub fw: FrameworkWitness,
 }
 
 impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {

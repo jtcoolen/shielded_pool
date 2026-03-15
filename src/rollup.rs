@@ -286,6 +286,105 @@ impl HostLeafStep for RollupHostLeaf {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Host-side fold (merge two child app states)
+////////////////////////////////////////////////////////////////////////////////
+
+/// Mirror of `RollupFoldStep::synthesize` on the host side.
+/// Used by `IvcProver::prove_tree` to compute parent app state.
+pub fn rollup_host_merge(left: &[F], right: &[F]) -> Vec<F> {
+    // left = [c_pre, c_post, n_pre, n_post, roots_set_root, blk]
+    vec![
+        left[0],   // c_pre (from left)
+        right[1],  // c_post (from right)
+        left[2],   // n_pre (from left)
+        right[3],  // n_post (from right)
+        left[4],   // roots_set_root (shared)
+        left[5],   // block_level (shared)
+    ]
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Leaf plan construction
+////////////////////////////////////////////////////////////////////////////////
+
+use crate::ivc::engine::{LeafPlan, host_instance_hash};
+
+/// Build leaf plans from a batch of client proofs.
+///
+/// Each pair `(2i, 2i+1)` of client proofs becomes one leaf plan.
+/// The running commitment/nullifier maps are updated sequentially so
+/// that each leaf sees the correct pre-state.
+pub fn plan_rollup_leaves(
+    client_proofs: &[ivc::ClientProof],
+    pre_commitment_map: Map,
+    pre_nullifier_map: Map,
+    pre_roots_set_map: &Map,
+    block_level: F,
+) -> Result<Vec<LeafPlan<LeafWitness>>, AggregationError> {
+    let mut cmap = pre_commitment_map;
+    let mut nmap = pre_nullifier_map;
+    let roots_set_root = pre_roots_set_map.succinct_repr();
+
+    let mut plans = Vec::with_capacity(client_proofs.len() / 2);
+
+    for (i, pair) in client_proofs.chunks_exact(2).enumerate() {
+        let left = &pair[0];
+        let right = &pair[1];
+
+        // Validate
+        if pre_roots_set_map.get(&left.public_inputs[0]) == F::ZERO {
+            return Err(AggregationError::LeafValidation(
+                format!("leaf {i} left tx root not in roots set"),
+            ));
+        }
+        if pre_roots_set_map.get(&right.public_inputs[0]) == F::ZERO {
+            return Err(AggregationError::LeafValidation(
+                format!("leaf {i} right tx root not in roots set"),
+            ));
+        }
+
+        let c_pre = cmap.succinct_repr();
+        let n_pre = nmap.succinct_repr();
+        let pre_cmap_for_witness = cmap.clone();
+        let pre_nmap_for_witness = nmap.clone();
+
+        host_apply_effects(&mut cmap, &mut nmap, &left.public_inputs)?;
+        host_apply_effects(&mut cmap, &mut nmap, &right.public_inputs)?;
+
+        let app_state = vec![
+            c_pre,
+            cmap.succinct_repr(),
+            n_pre,
+            nmap.succinct_repr(),
+            roots_set_root,
+            block_level,
+        ];
+
+        let merkle_digest = host_hash_pair(left.instance_hash, right.instance_hash);
+
+        plans.push(LeafPlan {
+            index: i,
+            left: left.clone(),
+            right: right.clone(),
+            app_state,
+            merkle_digest,
+            witness: LeafWitness {
+                pre_commitment_map: pre_cmap_for_witness,
+                pre_nullifier_map: pre_nmap_for_witness,
+                pre_commitment_roots_set_map: pre_roots_set_map.clone(),
+                block_level,
+            },
+        });
+    }
+
+    Ok(plans)
+}
+
+fn host_hash_pair(a: F, b: F) -> F {
+    <PoseidonChip<F> as HashCPU<F, F>>::hash(&[a, b])
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Helpers
 ////////////////////////////////////////////////////////////////////////////////
 

@@ -26,7 +26,7 @@ use midnight_proofs::{
 use midnight_circuits::hash::poseidon::PoseidonChip;
 
 use super::{
-    Acc, C, ClientProof, DeciderStep, E, F, FoldStep, HostFoldStep, HostLeafStep, HostState,
+    Acc, C, E, F, FoldStep,
     LeafStep, NodeState, S, TreeNode, TreeResult, VkData,
     circuit::{FrameworkWitness, IvcDeciderCircuit, IvcLeafCircuit, IvcNodeCircuit},
     ctx::configure_ivc_circuit,
@@ -154,7 +154,7 @@ pub struct IvcSetup {
     pub(crate) agg_store: AggKeyStore,
     pub(crate) leaf_fixed_bases: BTreeMap<String, C>,
     pub(crate) fixed_base_names: Vec<String>,
-    pub(crate) fixed_bases: BTreeMap<String, C>,
+    pub fixed_bases: BTreeMap<String, C>,
     pub(crate) trivial_combined: Acc,
 }
 
@@ -323,13 +323,16 @@ impl IvcProver {
     /// Prove the full binary tree from `2^d` client proofs.
     ///
     /// Returns the top two tree nodes (ready for the decider).
-    pub fn prove_tree<L, Fo, HS>(
+    /// `host_merge` computes the parent app state from two children
+    /// on the host side (must match FoldStep circuit logic).
+    pub fn prove_tree<L, Fo>(
         setup: &IvcSetup,
         client_srs: &ParamsKZG<Bls12>,
         client_vk: &Vk,
         leaf_step: &L,
         fold_step: &Fo,
         leaf_plans: Vec<LeafPlan<L::Witness>>,
+        host_merge: impl Fn(&[F], &[F]) -> Vec<F> + Send + Sync,
     ) -> Result<TreeResult<Vec<F>>, AggregationError>
     where
         L: LeafStep + 'static,
@@ -350,13 +353,13 @@ impl IvcProver {
 
         // 2. Build internal levels up to the top pair
         let (child_level, top_pair) =
-            build_to_top_pair(setup, fold_step, 1, leaf_nodes)?;
+            build_to_top_pair(setup, fold_step, &host_merge, 1, leaf_nodes)?;
 
         let (left, right) = top_pair;
 
         // 3. Compute the root state
         let root_digest = host_hash_pair(left.merkle_digest, right.merkle_digest);
-        let root_app = merge_app_states(&left.app_state, &right.app_state);
+        let root_app = host_merge(&left.app_state, &right.app_state);
         let root_state = NodeState {
             app_state: root_app,
             merkle_digest: root_digest,
@@ -442,6 +445,7 @@ fn prove_leaf<L: LeafStep>(
 fn prove_node<Fo: FoldStep>(
     setup: &IvcSetup,
     fold_step: &Fo,
+    host_merge: &(impl Fn(&[F], &[F]) -> Vec<F> + Send + Sync),
     parent_level: usize,
     child_level: usize,
     left: &TreeNode<Vec<F>>,
@@ -451,7 +455,7 @@ fn prove_node<Fo: FoldStep>(
     let parent_keys = setup.agg_store.get(parent_level);
     let srs = &setup.agg_srs_internal;
 
-    let app_state = merge_app_states(&left.app_state, &right.app_state);
+    let app_state = host_merge(&left.app_state, &right.app_state);
     let digest = host_hash_pair(left.merkle_digest, right.merkle_digest);
 
     let mut left_full: Vec<F> = left.app_state.clone();
@@ -506,6 +510,7 @@ fn prove_node<Fo: FoldStep>(
 fn build_to_top_pair<Fo: FoldStep>(
     setup: &IvcSetup,
     fold_step: &Fo,
+    host_merge: &(impl Fn(&[F], &[F]) -> Vec<F> + Send + Sync),
     child_level: usize,
     mut nodes: Vec<TreeNode<Vec<F>>>,
 ) -> Result<(usize, (TreeNode<Vec<F>>, TreeNode<Vec<F>>)), AggregationError> {
@@ -524,7 +529,7 @@ fn build_to_top_pair<Fo: FoldStep>(
                 let pairs: Vec<_> = nodes.chunks_exact(2).collect();
                 nodes = pairs
                     .par_iter()
-                    .map(|pair| prove_node(setup, fold_step, parent_level, level, &pair[0], &pair[1]))
+                    .map(|pair| prove_node(setup, fold_step, host_merge, parent_level, level, &pair[0], &pair[1]))
                     .collect::<Result<Vec<_>, _>>()?;
                 level = parent_level;
             }
@@ -542,14 +547,6 @@ fn host_hash_pair(a: F, b: F) -> F {
 
 pub fn host_instance_hash(items: &[F]) -> F {
     <PoseidonChip<F> as HashCPU<F, F>>::hash(items)
-}
-
-fn merge_app_states(left: &[F], right: &[F]) -> Vec<F> {
-    // The "merged" app state at a parent node is application-defined.
-    // For the generic framework, we just concatenate left boundary + right
-    // boundary.  The HostFoldStep determines the actual merge.
-    // Here we return a placeholder — the actual state comes from the host.
-    left.to_vec() // placeholder: overridden by the host-side fold
 }
 
 fn collapse(mut acc: Acc) -> Acc {

@@ -29,12 +29,11 @@ pub mod engine;
 
 // Re-export the public API.
 pub use ctx::{AggCircuitConfig, IvcCtx, configure_ivc_circuit};
-pub use circuit::{IvcDeciderCircuit, IvcLeafCircuit, IvcNodeCircuit};
+pub use circuit::{FrameworkWitness, IvcDeciderCircuit, IvcLeafCircuit, IvcNodeCircuit};
 pub use engine::{IvcProver, IvcSetup};
 
 use std::fmt::Debug;
 
-use ff::Field;
 use midnight_circuits::{
     ecc::foreign::ForeignEccChip,
     field::{

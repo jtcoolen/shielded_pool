@@ -35,8 +35,15 @@ type Map = midnight_circuits::map::cpu::MapMt<F, PoseidonChip<F>>;
 #[derive(Clone)]
 struct SendableMap(Map);
 
-// SAFETY: used only to move cloned maps into rayon tasks.
-// Each task works on its own cloned `Map` instance.
+// SAFETY — Send: each rayon task receives its own `LeafPlan` and immediately
+// clones the inner `Map` via `clone_inner()`.  No `Map` instance is ever
+// shared mutably across threads.
+//
+// SAFETY — Sync: required by `rayon::par_iter()` (which hands out `&LeafPlan`
+// to worker threads).  The only operation performed through `&SendableMap` is
+// `clone_inner(&self) -> Map`, which is a pure read / deep-clone.  `Map`
+// (a Poseidon Merkle tree) is an immutable tree of field elements with no
+// interior mutability, so `&Map` is safe to share across threads.
 unsafe impl Send for SendableMap {}
 unsafe impl Sync for SendableMap {}
 

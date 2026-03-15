@@ -742,13 +742,6 @@ fn run() -> Result<(), AppError> {
     let mut rng = ChaCha8Rng::from_entropy();
     let mut chain = init_chain_state(&mut rng, NUM_ACCOUNTS, NUM_SEED_DEPOSITS_PER_ACCOUNT);
 
-    // Global L2 block counter (demo "on-chain head").
-    //
-    // We will prove in the final wrap proof that:
-    //   blk_post = blk_pre + 1
-    // and bind the batch to blk_post.
-    let mut blk_head: u64 = chain.blk_head;
-
     println!(
         "Initial commitment root: {:?}",
         chain.commitment_root_history[0]
@@ -766,8 +759,8 @@ fn run() -> Result<(), AppError> {
         let pre = snapshot_batch_pre_state(&chain);
 
         // Compute this batch's block transition.
-        let blk_pre_u64 = blk_head;
-        let blk_post_u64 = blk_head + 1;
+        let blk_pre_u64 = chain.blk_head;
+        let blk_post_u64 = chain.blk_head + 1;
         let blk_pre_f = F::from(blk_pre_u64);
         let blk_post_f = F::from(blk_post_u64);
         let batch_blk = blk_post_f; // subtree is bound to blk_post per spec
@@ -1025,8 +1018,7 @@ fn run() -> Result<(), AppError> {
             .push(chain.commitment_map.clone());
 
         // Advance the global head block number after accepting the final wrap proof.
-        blk_head = blk_post_u64;
-        chain.blk_head = blk_head;
+        chain.blk_head = blk_post_u64;
 
         println!(
             "After batch {} committed commitment root: {:?}",

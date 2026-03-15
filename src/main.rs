@@ -662,24 +662,20 @@ fn demonstrate_replay_protection(
         nullifier_map.succinct_repr() == agg_state.n_post
     );
 
-    let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = rollup_ivc_proofs::aggregate_client_proofs_cached(
-            agg_setup,
-            srs,
-            vk,
-            client_proofs,
-            commitment_map,
-            nullifier_map,
-            roots_set_map,
-            F::ZERO,
-        );
-    }));
+    let replay = rollup_ivc_proofs::try_aggregate_client_proofs_cached(
+        agg_setup,
+        srs,
+        vk,
+        client_proofs,
+        commitment_map,
+        nullifier_map,
+        roots_set_map,
+        F::ZERO,
+    );
 
     match replay {
-        Ok(_) => println!("❌ Replay unexpectedly succeeded (BUG)"),
-        Err(_) => println!(
-            "✅ Replay correctly rejected (nullifiers already spent / state already advanced)"
-        ),
+        Ok(_) => println!("Replay unexpectedly succeeded (BUG)"),
+        Err(e) => println!("Replay correctly rejected: {e}"),
     }
 }
 
@@ -1068,7 +1064,6 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use rand_chacha::ChaCha8Rng;
-    use std::panic;
 
     // -----------------------------
     // Unit tests (helpers/invariants)
@@ -1331,7 +1326,7 @@ mod tests {
 
     /// Negative: replay using POST state should be rejected (nullifiers already spent / root advanced).
     #[test]
-    fn negative_replay_aggregation_with_post_state_panics() -> Result<(), AppError> {
+    fn negative_replay_aggregation_with_post_state_rejected() -> Result<(), AppError> {
         let batch_size = 4;
         let env = mini_env(14, batch_size)?;
         let chain = make_chain(1234, 4, 6);
@@ -1341,18 +1336,16 @@ mod tests {
 
         // Now attempt to re-aggregate the SAME client proofs, but against POST maps.
         // This should fail: leaves prove against old roots and nullifiers are already inserted.
-        let replay = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let _ = rollup_ivc_proofs::aggregate_client_proofs_cached(
-                &env.agg_setup,
-                &env.srs,
-                &env.leaf_vk,
-                &client_proofs,
-                post_cmap.clone(),
-                post_nmap.clone(),
-                pre.pre_roots_set_map.clone(),
-                F::ZERO,
-            );
-        }));
+        let replay = rollup_ivc_proofs::try_aggregate_client_proofs_cached(
+            &env.agg_setup,
+            &env.srs,
+            &env.leaf_vk,
+            &client_proofs,
+            post_cmap.clone(),
+            post_nmap.clone(),
+            pre.pre_roots_set_map.clone(),
+            F::ZERO,
+        );
 
         assert!(replay.is_err(), "replay must be rejected");
         Ok(())
@@ -1395,7 +1388,7 @@ mod tests {
     /// Negative (stronger double-spend): same nullifiers twice inside the same batch must be rejected.
     /// If this test fails, it’s a real bug relative to the stated safety property.
     #[test]
-    fn negative_duplicate_nullifiers_within_batch_panics() -> Result<(), AppError> {
+    fn negative_duplicate_nullifiers_within_batch_rejected() -> Result<(), AppError> {
         let batch_size = 4;
         let env = mini_env(14, batch_size)?;
         let chain = make_chain(7, 4, 6);
@@ -1440,18 +1433,16 @@ mod tests {
             proofs.push(proof);
         }
 
-        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let _ = rollup_ivc_proofs::aggregate_client_proofs_cached(
-                &env.agg_setup,
-                &env.srs,
-                &env.leaf_vk,
-                &proofs,
-                pre.pre_commitment_map.clone(),
-                pre.pre_nullifier_map.clone(),
-                pre.pre_roots_set_map.clone(),
-                F::ZERO,
-            );
-        }));
+        let res = rollup_ivc_proofs::try_aggregate_client_proofs_cached(
+            &env.agg_setup,
+            &env.srs,
+            &env.leaf_vk,
+            &proofs,
+            pre.pre_commitment_map.clone(),
+            pre.pre_nullifier_map.clone(),
+            pre.pre_roots_set_map.clone(),
+            F::ZERO,
+        );
 
         assert!(
             res.is_err(),

@@ -447,6 +447,8 @@ impl AggCtx {
         one: &AssignedNative<F>,
     ) -> Result<(), Error> {
         for commitment in items.commitments() {
+            let existing = commit_map.get(layouter, commitment)?;
+            self.assert_eq(layouter, &existing, zero)?;
             commit_map.insert(layouter, commitment, one)?;
         }
 

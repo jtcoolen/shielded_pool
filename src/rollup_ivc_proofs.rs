@@ -108,6 +108,12 @@ pub enum AggregationError {
 
     #[error("internal AGG proof failed")]
     InternalAggProofFailed,
+
+    #[error("commitment already exists in commitment map")]
+    CommitmentAlreadyExists,
+
+    #[error("nullifier already spent (exists in nullifier map)")]
+    NullifierAlreadySpent,
 }
 
 fn ensure(cond: bool, err: AggregationError) -> Result<(), AggregationError> {
@@ -197,11 +203,33 @@ where
     Ok(out)
 }
 
-fn apply_tx_effects(commit_map: Map, null_map: Map, items: [F; 7]) -> (Map, Map) {
+fn apply_tx_effects(
+    commit_map: Map,
+    null_map: Map,
+    items: [F; 7],
+) -> Result<(Map, Map), AggregationError> {
     let [_tx_root, _x1, _x2, c1, c2, nf1, nf2] = items;
+
+    ensure(
+        commit_map.get(&c1) == F::ZERO,
+        AggregationError::CommitmentAlreadyExists,
+    )?;
+    ensure(
+        commit_map.get(&c2) == F::ZERO,
+        AggregationError::CommitmentAlreadyExists,
+    )?;
+    ensure(
+        null_map.get(&nf1) == F::ZERO,
+        AggregationError::NullifierAlreadySpent,
+    )?;
+    ensure(
+        null_map.get(&nf2) == F::ZERO,
+        AggregationError::NullifierAlreadySpent,
+    )?;
+
     let commit_map = map_insert_many(commit_map, [(c1, F::ONE), (c2, F::ONE)]);
     let null_map = map_insert_many(null_map, [(nf1, F::ONE), (nf2, F::ONE)]);
-    (commit_map, null_map)
+    Ok((commit_map, null_map))
 }
 
 fn verify_and_extract_acc(
@@ -415,8 +443,8 @@ fn plan_leaves<'a>(
             let pre_c_for_leaf = c_map.clone();
             let pre_n_for_leaf = n_map.clone();
 
-            let (c1, n1) = apply_tx_effects(c_map, n_map, left.public_items);
-            let (c2, n2) = apply_tx_effects(c1, n1, right.public_items);
+            let (c1, n1) = apply_tx_effects(c_map, n_map, left.public_items)?;
+            let (c2, n2) = apply_tx_effects(c1, n1, right.public_items)?;
 
             let expected_state = rollup_ivc_circuits::AggState {
                 c_pre,

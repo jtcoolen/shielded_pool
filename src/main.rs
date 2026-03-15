@@ -133,14 +133,29 @@ fn choose_sender_idx(
 }
 
 /// Choose two distinct elements from a non-empty slice of candidates.
+///
+/// # Panics
+/// Panics if `candidates` contains fewer than 2 distinct values.
 fn choose_two_distinct(rng: &mut ChaCha8Rng, candidates: &[usize]) -> (usize, usize) {
-    debug_assert!(candidates.len() >= 2);
-    let a = candidates[rng.gen_range(0..candidates.len())];
-    let mut b = candidates[rng.gen_range(0..candidates.len())];
-    while b == a {
-        b = candidates[rng.gen_range(0..candidates.len())];
+    assert!(candidates.len() >= 2, "need at least 2 candidates");
+    let idx_a = rng.gen_range(0..candidates.len());
+    let a = candidates[idx_a];
+    // Fast path: random pick at a different index.
+    let mut idx_b = rng.gen_range(0..candidates.len() - 1);
+    if idx_b >= idx_a {
+        idx_b += 1;
     }
-    (a, b)
+    let b = candidates[idx_b];
+    if b != a {
+        return (a, b);
+    }
+    // Fallback: linear scan for a distinct value (handles duplicate entries).
+    for &c in candidates {
+        if c != a {
+            return (a, c);
+        }
+    }
+    panic!("choose_two_distinct requires at least 2 distinct values in candidates");
 }
 
 /// Choose a (possibly lagging) confirmed root index to prove against.

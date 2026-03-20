@@ -123,7 +123,14 @@ impl IvcCtx {
         let poseidon = PoseidonChip::new(&cfg.poseidon, &native);
         let verifier = VerifierGadget::<S>::new(&curve, &scalar, &poseidon);
 
-        Self { native, core_decomp, scalar, curve, poseidon, verifier }
+        Self {
+            native,
+            core_decomp,
+            scalar,
+            curve,
+            poseidon,
+            verifier,
+        }
     }
 
     pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
@@ -226,12 +233,9 @@ pub(crate) struct RpvInput<'a> {
     pub assigned_vk: &'a AssignedVk<S>,
     pub children_are_client_proofs: bool,
     pub fixed_base_names: &'a [String],
-    pub left_base_pi: Vec<AssignedNative<F>>,
-    pub right_base_pi: Vec<AssignedNative<F>>,
-    pub left_proof: Value<Vec<u8>>,
-    pub right_proof: Value<Vec<u8>>,
-    pub left_pi_acc: Value<Acc>,
-    pub right_pi_acc: Value<Acc>,
+    pub child_base_pis: Vec<Vec<AssignedNative<F>>>,
+    pub child_proofs: Vec<Value<Vec<u8>>>,
+    pub child_pi_accs: Vec<Value<Acc>>,
 }
 
 pub(crate) struct RpvOutput {
@@ -245,7 +249,14 @@ pub(crate) fn assign_pi_acc(
     acc: Value<Acc>,
 ) -> Result<AssignedAccumulator<S>, Error> {
     let mut a = AssignedAccumulator::assign(
-        layouter, &ctx.curve, &ctx.scalar, 1, 1, &[], fixed_base_names, acc,
+        layouter,
+        &ctx.curve,
+        &ctx.scalar,
+        1,
+        1,
+        &[],
+        fixed_base_names,
+        acc,
     )?;
     a.collapse(layouter, &ctx.curve, &ctx.scalar)?;
     Ok(a)
@@ -273,18 +284,24 @@ fn prepare_proof_acc(
     pi: &[AssignedNative<F>],
     proof: Value<Vec<u8>>,
 ) -> Result<AssignedAccumulator<S>, Error> {
-    let mut a = ctx.verifier.prepare(layouter, vk, &[("com_instance", id)], &[pi], proof)?;
+    let mut a = ctx
+        .verifier
+        .prepare(layouter, vk, &[("com_instance", id)], &[pi], proof)?;
     a.collapse(layouter, &ctx.curve, &ctx.scalar)?;
     Ok(a)
 }
 
-fn accumulate_four(
+fn accumulate_many(
     ctx: &IvcCtx,
     layouter: &mut impl Layouter<F>,
-    parts: [AssignedAccumulator<S>; 4],
+    parts: &[AssignedAccumulator<S>],
 ) -> Result<AssignedAccumulator<S>, Error> {
     let mut next = AssignedAccumulator::<S>::accumulate(
-        layouter, &ctx.verifier, &ctx.scalar, &ctx.poseidon, &parts,
+        layouter,
+        &ctx.verifier,
+        &ctx.scalar,
+        &ctx.poseidon,
+        parts,
     )?;
     next.collapse(layouter, &ctx.curve, &ctx.scalar)?;
     Ok(next)
@@ -301,33 +318,44 @@ pub(crate) fn recursive_partial_verify(
         assigned_vk,
         children_are_client_proofs,
         fixed_base_names,
-        left_base_pi,
-        right_base_pi,
-        left_proof,
-        right_proof,
-        left_pi_acc,
-        right_pi_acc,
+        child_base_pis,
+        child_proofs,
+        child_pi_accs,
     } = input;
 
-    let mut l_pi_acc = assign_pi_acc(ctx, layouter, fixed_base_names, left_pi_acc)?;
-    let mut r_pi_acc = assign_pi_acc(ctx, layouter, fixed_base_names, right_pi_acc)?;
-
-    neutralize_for_client_children(ctx, layouter, children_are_client_proofs, &mut l_pi_acc)?;
-    neutralize_for_client_children(ctx, layouter, children_are_client_proofs, &mut r_pi_acc)?;
-
-    let mut l_child_pi = left_base_pi;
-    let mut r_child_pi = right_base_pi;
-
-    if !children_are_client_proofs {
-        l_child_pi.extend(ctx.verifier.as_public_input(layouter, &l_pi_acc)?);
-        r_child_pi.extend(ctx.verifier.as_public_input(layouter, &r_pi_acc)?);
+    if child_base_pis.len() != child_proofs.len() || child_proofs.len() != child_pi_accs.len() {
+        return Err(Error::Synthesis("rpv arity mismatch".to_string()));
     }
 
     let id: super::IdPoint = ctx.curve.assign_fixed(layouter, C::identity())?;
-    let l_proof_acc = prepare_proof_acc(ctx, layouter, assigned_vk, id.clone(), &l_child_pi, left_proof)?;
-    let r_proof_acc = prepare_proof_acc(ctx, layouter, assigned_vk, id, &r_child_pi, right_proof)?;
 
-    let next_acc = accumulate_four(ctx, layouter, [l_proof_acc, l_pi_acc, r_proof_acc, r_pi_acc])?;
+    let mut to_fold = Vec::with_capacity(child_proofs.len() * 2);
+
+    for ((base_pi, proof), pi_acc) in child_base_pis
+        .into_iter()
+        .zip(child_proofs.into_iter())
+        .zip(child_pi_accs.into_iter())
+    {
+        let mut child_pi_acc = assign_pi_acc(ctx, layouter, fixed_base_names, pi_acc)?;
+        neutralize_for_client_children(
+            ctx,
+            layouter,
+            children_are_client_proofs,
+            &mut child_pi_acc,
+        )?;
+
+        let mut child_pi = base_pi;
+        if !children_are_client_proofs {
+            child_pi.extend(ctx.verifier.as_public_input(layouter, &child_pi_acc)?);
+        }
+
+        let proof_acc =
+            prepare_proof_acc(ctx, layouter, assigned_vk, id.clone(), &child_pi, proof)?;
+        to_fold.push(proof_acc);
+        to_fold.push(child_pi_acc);
+    }
+
+    let next_acc = accumulate_many(ctx, layouter, &to_fold)?;
 
     Ok(RpvOutput { next_acc })
 }

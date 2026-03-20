@@ -538,13 +538,7 @@ mod tests {
         // Ensure new_c1 != new_c2; if collision / accidental equality, tweak randomness
         if new_c2 == new_c1 {
             new2.randomness = F::random(&mut rng);
-            new_c2 = host_commit(
-                new2.asset_id,
-                new2.amount,
-                pk2x,
-                pk2y,
-                new2.randomness,
-            );
+            new_c2 = host_commit(new2.asset_id, new2.amount, pk2x, pk2y, new2.randomness);
         }
 
         let nf1 = host_nullify(old_c1, pk_sx, pk_sy);

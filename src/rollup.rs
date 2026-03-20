@@ -13,8 +13,8 @@ use midnight_proofs::circuit::{Layouter, Value};
 use midnight_proofs::plonk::Error;
 
 use crate::ivc::{
-    self, ClientProof, DeciderStep, F, FoldStep, HostLeafStep, HostState, IvcCtx, LeafStep,
-    Map, MapGadget, engine::AggregationError,
+    self, ClientProof, DeciderStep, F, FoldStep, HostLeafStep, HostState, IvcCtx, LeafStep, Map,
+    MapGadget, engine::AggregationError,
 };
 
 use midnight_circuits::instructions::map::MapCPU;
@@ -44,8 +44,10 @@ impl HostState for RollupAppState {
 
     fn to_fields(&self) -> Vec<F> {
         vec![
-            self.c_pre, self.c_post,
-            self.n_pre, self.n_post,
+            self.c_pre,
+            self.c_post,
+            self.n_pre,
+            self.n_post,
             self.commitment_roots_set_root,
             self.block_level,
         ]
@@ -53,8 +55,10 @@ impl HostState for RollupAppState {
 
     fn from_fields(f: &[F]) -> Self {
         Self {
-            c_pre: f[0], c_post: f[1],
-            n_pre: f[2], n_post: f[3],
+            c_pre: f[0],
+            c_post: f[1],
+            n_pre: f[2],
+            n_post: f[3],
             commitment_roots_set_root: f[4],
             block_level: f[5],
         }
@@ -81,12 +85,16 @@ unsafe impl Sync for SendableMap {}
 
 impl SendableMap {
     #[allow(dead_code)]
-    pub fn inner(&self) -> &Map { &self.0 }
-    pub fn into_inner(self) -> Map { self.0 }
+    pub fn inner(&self) -> &Map {
+        &self.0
+    }
+    pub fn into_inner(self) -> Map {
+        self.0
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Leaf step: processes two client transactions
+// Leaf step: processes four client transactions
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone)]
@@ -107,8 +115,10 @@ impl LeafStep for RollupLeafStep {
         &self,
         ctx: &IvcCtx,
         layouter: &mut L,
-        left_pi: &[AssignedNative<F>],
-        right_pi: &[AssignedNative<F>],
+        p0: &[AssignedNative<F>],
+        p1: &[AssignedNative<F>],
+        p2: &[AssignedNative<F>],
+        p3: &[AssignedNative<F>],
         witness: Value<Self::Witness>,
     ) -> Result<Vec<AssignedNative<F>>, Error> {
         let one = ctx.one(layouter)?;
@@ -116,25 +126,66 @@ impl LeafStep for RollupLeafStep {
         let blk = ctx.assign(layouter, witness.clone().map(|w| w.block_level))?;
 
         // Init rollup maps (unwrap SendableMap)
-        let mut commit_map = ctx.init_map(layouter, witness.clone().map(|w| w.pre_commitment_map.into_inner()))?;
+        let mut commit_map = ctx.init_map(
+            layouter,
+            witness.clone().map(|w| w.pre_commitment_map.into_inner()),
+        )?;
         let c_pre = commit_map.succinct_repr();
-        let mut null_map = ctx.init_map(layouter, witness.clone().map(|w| w.pre_nullifier_map.into_inner()))?;
+        let mut null_map = ctx.init_map(
+            layouter,
+            witness.clone().map(|w| w.pre_nullifier_map.into_inner()),
+        )?;
         let n_pre = null_map.succinct_repr();
 
         // Historic roots set (read-only at leaf level)
-        let roots_set = ctx.init_map(layouter, witness.map(|w| w.pre_commitment_roots_set_map.into_inner()))?;
+        let roots_set = ctx.init_map(
+            layouter,
+            witness.map(|w| w.pre_commitment_roots_set_map.into_inner()),
+        )?;
         let roots_set_root = roots_set.succinct_repr();
 
         // Check each tx root ∈ historic roots set
-        let left_root = &left_pi[0];
-        let right_root = &right_pi[0];
-        check_membership(ctx, layouter, &roots_set, left_root, &one)?;
-        check_membership(ctx, layouter, &roots_set, right_root, &one)?;
+        let roots = [&p0[0], &p1[0], &p2[0], &p3[0]];
+        for root in roots {
+            check_membership(ctx, layouter, &roots_set, root, &one)?;
+        }
 
-        // Apply left tx effects
-        apply_effects(ctx, layouter, &mut commit_map, &mut null_map, left_pi, &zero, &one)?;
-        // Apply right tx effects
-        apply_effects(ctx, layouter, &mut commit_map, &mut null_map, right_pi, &zero, &one)?;
+        apply_effects(
+            ctx,
+            layouter,
+            &mut commit_map,
+            &mut null_map,
+            p0,
+            &zero,
+            &one,
+        )?;
+        apply_effects(
+            ctx,
+            layouter,
+            &mut commit_map,
+            &mut null_map,
+            p1,
+            &zero,
+            &one,
+        )?;
+        apply_effects(
+            ctx,
+            layouter,
+            &mut commit_map,
+            &mut null_map,
+            p2,
+            &zero,
+            &one,
+        )?;
+        apply_effects(
+            ctx,
+            layouter,
+            &mut commit_map,
+            &mut null_map,
+            p3,
+            &zero,
+            &one,
+        )?;
 
         Ok(vec![
             c_pre,
@@ -171,12 +222,12 @@ impl FoldStep for RollupFoldStep {
         ctx.assert_eq(layouter, &left[5], &right[5])?;
 
         Ok(vec![
-            left[0].clone(),   // c_pre (from left)
-            right[1].clone(),  // c_post (from right)
-            left[2].clone(),   // n_pre (from left)
-            right[3].clone(),  // n_post (from right)
-            left[4].clone(),   // roots_set_root (shared)
-            left[5].clone(),   // block_level (shared)
+            left[0].clone(),  // c_pre (from left)
+            right[1].clone(), // c_post (from right)
+            left[2].clone(),  // n_pre (from left)
+            right[3].clone(), // n_post (from right)
+            left[4].clone(),  // roots_set_root (shared)
+            left[5].clone(),  // block_level (shared)
         ])
     }
 }
@@ -232,7 +283,12 @@ impl DeciderStep for RollupDeciderStep {
         ctx.assert_eq(layouter, &right_app[5], &blk_post)?;
 
         // Historic roots-set: bind, check c_pre ∈ set, check c_post ∉ set, insert c_post
-        let mut roots_set = ctx.init_map(layouter, witness.clone().map(|w| w.pre_commitment_roots_set_map.into_inner()))?;
+        let mut roots_set = ctx.init_map(
+            layouter,
+            witness
+                .clone()
+                .map(|w| w.pre_commitment_roots_set_map.into_inner()),
+        )?;
         let pre_roots_root = roots_set.succinct_repr();
         let zero = ctx.zero(layouter)?;
 
@@ -245,17 +301,22 @@ impl DeciderStep for RollupDeciderStep {
         ctx.assert_eq(layouter, &post_exists, &zero)?;
 
         roots_set.insert(layouter, c_post, &one)?;
-        let post_roots_root = ctx.assign(layouter, witness.map(|w| w.post_commitment_roots_set_root))?;
+        let post_roots_root =
+            ctx.assign(layouter, witness.map(|w| w.post_commitment_roots_set_root))?;
         ctx.assert_eq(layouter, &roots_set.succinct_repr(), &post_roots_root)?;
 
         // Public inputs: c_pre, c_post, n_pre, n_post, blk_pre, blk_post,
         //                merkle_root, pre_roots_root, post_roots_root
         Ok(vec![
-            c_pre.clone(), c_post.clone(),
-            n_pre.clone(), n_post.clone(),
-            blk_pre, blk_post,
+            c_pre.clone(),
+            c_post.clone(),
+            n_pre.clone(),
+            n_post.clone(),
+            blk_pre,
+            blk_post,
             merkle_root.clone(),
-            pre_roots_root, post_roots_root,
+            pre_roots_root,
+            post_roots_root,
         ])
     }
 }
@@ -282,10 +343,14 @@ impl HostLeafStep for RollupHostLeaf {
     ) -> Result<RollupAppState, AggregationError> {
         // Validate roots membership
         if self.pre_roots_set_map.get(&left.public_inputs[0]) == F::ZERO {
-            return Err(AggregationError::LeafValidation("left tx root not in roots set".into()));
+            return Err(AggregationError::LeafValidation(
+                "left tx root not in roots set".into(),
+            ));
         }
         if self.pre_roots_set_map.get(&right.public_inputs[0]) == F::ZERO {
-            return Err(AggregationError::LeafValidation("right tx root not in roots set".into()));
+            return Err(AggregationError::LeafValidation(
+                "right tx root not in roots set".into(),
+            ));
         }
 
         let c_pre = self.pre_commitment_map.succinct_repr();
@@ -317,12 +382,12 @@ impl HostLeafStep for RollupHostLeaf {
 pub fn rollup_host_merge(left: &[F], right: &[F]) -> Vec<F> {
     // left = [c_pre, c_post, n_pre, n_post, roots_set_root, blk]
     vec![
-        left[0],   // c_pre (from left)
-        right[1],  // c_post (from right)
-        left[2],   // n_pre (from left)
-        right[3],  // n_post (from right)
-        left[4],   // roots_set_root (shared)
-        left[5],   // block_level (shared)
+        left[0],  // c_pre (from left)
+        right[1], // c_post (from right)
+        left[2],  // n_pre (from left)
+        right[3], // n_post (from right)
+        left[4],  // roots_set_root (shared)
+        left[5],  // block_level (shared)
     ]
 }
 
@@ -334,7 +399,7 @@ use crate::ivc::engine::LeafPlan;
 
 /// Build leaf plans from a batch of client proofs.
 ///
-/// Each pair `(2i, 2i+1)` of client proofs becomes one leaf plan.
+/// Each quad `(4i..4i+3)` of client proofs becomes one leaf plan.
 /// The running commitment/nullifier maps are updated sequentially so
 /// that each leaf sees the correct pre-state.
 pub fn plan_rollup_leaves(
@@ -348,22 +413,15 @@ pub fn plan_rollup_leaves(
     let mut nmap = pre_nullifier_map;
     let roots_set_root = pre_roots_set_map.succinct_repr();
 
-    let mut plans = Vec::with_capacity(client_proofs.len() / 2);
+    let mut plans = Vec::with_capacity(client_proofs.len() / 4);
 
-    for (i, pair) in client_proofs.chunks_exact(2).enumerate() {
-        let left = &pair[0];
-        let right = &pair[1];
-
-        // Validate
-        if pre_roots_set_map.get(&left.public_inputs[0]) == F::ZERO {
-            return Err(AggregationError::LeafValidation(
-                format!("leaf {i} left tx root not in roots set"),
-            ));
-        }
-        if pre_roots_set_map.get(&right.public_inputs[0]) == F::ZERO {
-            return Err(AggregationError::LeafValidation(
-                format!("leaf {i} right tx root not in roots set"),
-            ));
+    for (i, quad) in client_proofs.chunks_exact(4).enumerate() {
+        for (j, cp) in quad.iter().enumerate() {
+            if pre_roots_set_map.get(&cp.public_inputs[0]) == F::ZERO {
+                return Err(AggregationError::LeafValidation(format!(
+                    "leaf {i} tx {j} root not in roots set"
+                )));
+            }
         }
 
         let c_pre = cmap.succinct_repr();
@@ -371,8 +429,9 @@ pub fn plan_rollup_leaves(
         let pre_cmap_for_witness = cmap.clone();
         let pre_nmap_for_witness = nmap.clone();
 
-        host_apply_effects(&mut cmap, &mut nmap, &left.public_inputs)?;
-        host_apply_effects(&mut cmap, &mut nmap, &right.public_inputs)?;
+        for cp in quad {
+            host_apply_effects(&mut cmap, &mut nmap, &cp.public_inputs)?;
+        }
 
         let app_state = vec![
             c_pre,
@@ -383,12 +442,18 @@ pub fn plan_rollup_leaves(
             block_level,
         ];
 
-        let merkle_digest = host_hash_pair(left.instance_hash, right.instance_hash);
+        let h01 = host_hash_pair(quad[0].instance_hash, quad[1].instance_hash);
+        let h23 = host_hash_pair(quad[2].instance_hash, quad[3].instance_hash);
+        let merkle_digest = host_hash_pair(h01, h23);
 
         plans.push(LeafPlan {
             index: i,
-            left: left.clone(),
-            right: right.clone(),
+            clients: [
+                quad[0].clone(),
+                quad[1].clone(),
+                quad[2].clone(),
+                quad[3].clone(),
+            ],
             app_state,
             merkle_digest,
             witness: LeafWitness {
@@ -458,19 +523,25 @@ fn apply_effects(
     Ok(())
 }
 
-fn host_apply_effects(
-    cmap: &mut Map,
-    nmap: &mut Map,
-    items: &[F],
-) -> Result<(), AggregationError> {
+fn host_apply_effects(cmap: &mut Map, nmap: &mut Map, items: &[F]) -> Result<(), AggregationError> {
     let [_root, _bx, _by, c1, c2, nf1, nf2] = items[..7] else {
-        return Err(AggregationError::LeafValidation("expected 7 public items".into()));
+        return Err(AggregationError::LeafValidation(
+            "expected 7 public items".into(),
+        ));
     };
 
-    if cmap.get(&c1) != F::ZERO { return Err(AggregationError::CommitmentAlreadyExists); }
-    if cmap.get(&c2) != F::ZERO { return Err(AggregationError::CommitmentAlreadyExists); }
-    if nmap.get(&nf1) != F::ZERO { return Err(AggregationError::NullifierAlreadySpent); }
-    if nmap.get(&nf2) != F::ZERO { return Err(AggregationError::NullifierAlreadySpent); }
+    if cmap.get(&c1) != F::ZERO {
+        return Err(AggregationError::CommitmentAlreadyExists);
+    }
+    if cmap.get(&c2) != F::ZERO {
+        return Err(AggregationError::CommitmentAlreadyExists);
+    }
+    if nmap.get(&nf1) != F::ZERO {
+        return Err(AggregationError::NullifierAlreadySpent);
+    }
+    if nmap.get(&nf2) != F::ZERO {
+        return Err(AggregationError::NullifierAlreadySpent);
+    }
 
     cmap.insert(&c1, &F::ONE);
     cmap.insert(&c2, &F::ONE);

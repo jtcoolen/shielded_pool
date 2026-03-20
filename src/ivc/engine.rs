@@ -19,19 +19,26 @@ use midnight_circuits::{
 use midnight_curves::Bls12;
 use midnight_proofs::{
     circuit::Value,
-    plonk::{Circuit, ConstraintSystem, ProvingKey, VerifyingKey, create_proof, keygen_pk, keygen_vk_with_k},
-    poly::{EvaluationDomain, kzg::{KZGCommitmentScheme, params::ParamsKZG}},
+    plonk::{
+        Circuit, ConstraintSystem, ProvingKey, VerifyingKey, create_proof, keygen_pk,
+        keygen_vk_with_k,
+    },
+    poly::{
+        EvaluationDomain,
+        kzg::{KZGCommitmentScheme, params::ParamsKZG},
+    },
     transcript::{CircuitTranscript, Transcript},
 };
 
 use midnight_circuits::hash::poseidon::PoseidonChip;
 
 use super::{
-    Acc, C, ClientProof, E, F, FoldStep,
-    LeafStep, NodeState, S, TreeNode, TreeResult, VkData,
+    Acc, C, ClientProof, E, F, FoldStep, LeafStep, NodeState, S, TreeNode, TreeResult, VkData,
     circuit::{FrameworkWitness, IvcLeafCircuit, IvcNodeCircuit},
     ctx::configure_ivc_circuit,
 };
+
+const LEAF_CLIENT_ARITY: usize = 4;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Errors
@@ -49,8 +56,8 @@ pub enum AggregationError {
     #[error("length mismatch: expected {expected}, got {got}")]
     LenMismatch { expected: usize, got: usize },
 
-    #[error("need at least 4 client proofs for merged final agg (got {0})")]
-    NeedAtLeastFour(usize),
+    #[error("need at least 8 client proofs for merged final agg (got {0})")]
+    NeedAtLeastEight(usize),
 
     #[error("host-side leaf validation failed: {0}")]
     LeafValidation(String),
@@ -115,7 +122,14 @@ impl AggLevelKeys {
             transcript_repr: vk.transcript_repr(),
         };
         let fixed_bases = compute_fixed_bases_for_vk(&name, &vk);
-        Self { level, name, vk: Arc::new(vk), pk: Arc::new(pk), vk_data, fixed_bases }
+        Self {
+            level,
+            name,
+            vk: Arc::new(vk),
+            pk: Arc::new(pk),
+            vk_data,
+            fixed_bases,
+        }
     }
 }
 
@@ -135,7 +149,10 @@ impl AggKeyStore {
     }
 
     pub fn get(&self, level: usize) -> &AggLevelKeys {
-        assert!((1..=self.levels.len()).contains(&level), "level {level} out of range");
+        assert!(
+            (1..=self.levels.len()).contains(&level),
+            "level {level} out of range"
+        );
         &self.levels[level - 1]
     }
 }
@@ -189,7 +206,7 @@ pub fn prepare_ivc_setup<L, Fo>(
     leaf_k: u32,
     k_leaf_agg: u32,
     k_internal: u32,
-    num_leaves: usize,
+    num_client_proofs: usize,
     app_state_width: usize,
     client_pi_width: usize,
 ) -> Result<IvcSetup, AggregationError>
@@ -197,12 +214,15 @@ where
     L: LeafStep,
     Fo: FoldStep,
 {
-    if num_leaves == 0 || !num_leaves.is_power_of_two() || num_leaves < 4 {
-        return Err(AggregationError::NeedAtLeastFour(num_leaves));
+    if num_client_proofs == 0
+        || !num_client_proofs.is_power_of_two()
+        || num_client_proofs < LEAF_CLIENT_ARITY * 2
+    {
+        return Err(AggregationError::NeedAtLeastEight(num_client_proofs));
     }
 
-    let max_level = (num_leaves as u32).trailing_zeros() as usize;
-    let max_agg_level = max_level - 1;
+    let num_leaves = num_client_proofs / LEAF_CLIENT_ARITY;
+    let max_agg_level = (num_leaves as u32).trailing_zeros() as usize;
 
     let leaf_vk_data = VkData {
         domain: EvaluationDomain::new(leaf_vk.cs().degree() as u32, leaf_k),
@@ -223,9 +243,8 @@ where
         .map(|l| format!("agg_vk_lvl{l}"))
         .collect();
 
-    let fixed_base_names = compute_all_fixed_base_names(
-        leaf_vk_name, &leaf_vk_data.cs, &agg_vk_names, &agg_cs,
-    );
+    let fixed_base_names =
+        compute_all_fixed_base_names(leaf_vk_name, &leaf_vk_data.cs, &agg_vk_names, &agg_cs);
 
     let mut levels = Vec::with_capacity(max_agg_level);
 
@@ -239,23 +258,39 @@ where
 
         let name = agg_vk_names[level - 1].clone();
         let k = if level == 1 { k_leaf_agg } else { k_internal };
-        let srs = if level == 1 { &agg_srs_leaf } else { &agg_srs_internal };
+        let srs = if level == 1 {
+            &agg_srs_leaf
+        } else {
+            &agg_srs_internal
+        };
 
         let start = Instant::now();
         let (vk, pk) = if level == 1 {
             let circuit = IvcLeafCircuit::<L, 19> {
                 step: leaf_step.clone(),
-                left_client_items: Value::unknown(),
-                right_client_items: Value::unknown(),
+                client_items: [
+                    Value::unknown(),
+                    Value::unknown(),
+                    Value::unknown(),
+                    Value::unknown(),
+                ],
                 witness: Value::unknown(),
                 client_pi_width,
                 fw: FrameworkWitness {
                     child_vk: child_vk_data,
                     child_vk_name,
-                    left_proof: Value::unknown(),
-                    right_proof: Value::unknown(),
-                    left_pi_acc: Value::unknown(),
-                    right_pi_acc: Value::unknown(),
+                    child_proofs: vec![
+                        Value::unknown(),
+                        Value::unknown(),
+                        Value::unknown(),
+                        Value::unknown(),
+                    ],
+                    child_pi_accs: vec![
+                        Value::unknown(),
+                        Value::unknown(),
+                        Value::unknown(),
+                        Value::unknown(),
+                    ],
                     fixed_base_names: fixed_base_names.clone(),
                 },
             };
@@ -270,10 +305,8 @@ where
                 fw: FrameworkWitness {
                     child_vk: child_vk_data,
                     child_vk_name,
-                    left_proof: Value::unknown(),
-                    right_proof: Value::unknown(),
-                    left_pi_acc: Value::unknown(),
-                    right_pi_acc: Value::unknown(),
+                    child_proofs: vec![Value::unknown(), Value::unknown()],
+                    child_pi_accs: vec![Value::unknown(), Value::unknown()],
                     fixed_base_names: fixed_base_names.clone(),
                 },
             };
@@ -312,11 +345,10 @@ where
 
 pub struct IvcProver;
 
-/// Plan for one leaf pair, produced by the host-side planning layer.
+/// Plan for one leaf aggregation node, produced by the host-side planning layer.
 pub struct LeafPlan<W> {
     pub index: usize,
-    pub left: ClientProof,
-    pub right: ClientProof,
+    pub clients: [ClientProof; LEAF_CLIENT_ARITY],
     pub app_state: Vec<F>,
     pub merkle_digest: F,
     pub witness: W,
@@ -341,9 +373,9 @@ impl IvcProver {
         L: LeafStep + 'static,
         Fo: FoldStep + 'static,
     {
-        if leaf_plans.len() != setup.num_leaves / 2 {
+        if leaf_plans.len() != setup.num_leaves {
             return Err(AggregationError::LenMismatch {
-                expected: setup.num_leaves / 2,
+                expected: setup.num_leaves,
                 got: leaf_plans.len(),
             });
         }
@@ -368,7 +400,11 @@ impl IvcProver {
             merkle_digest: root_digest,
         };
 
-        Ok(TreeResult { left_top: left, right_top: right, root_state })
+        Ok(TreeResult {
+            left_top: left,
+            right_top: right,
+            root_state,
+        })
     }
 }
 
@@ -388,33 +424,50 @@ fn prove_leaf<L: LeafStep>(
 
     let circuit = IvcLeafCircuit::<L, 19> {
         step: leaf_step.clone(),
-        left_client_items: Value::known(plan.left.public_inputs.clone()),
-        right_client_items: Value::known(plan.right.public_inputs.clone()),
+        client_items: [
+            Value::known(plan.clients[0].public_inputs.clone()),
+            Value::known(plan.clients[1].public_inputs.clone()),
+            Value::known(plan.clients[2].public_inputs.clone()),
+            Value::known(plan.clients[3].public_inputs.clone()),
+        ],
         witness: Value::known(plan.witness),
         client_pi_width: setup.client_pi_width,
         fw: FrameworkWitness {
             child_vk: setup.leaf_vk_data.clone(),
             child_vk_name: setup.leaf_vk_name.clone(),
-            left_proof: Value::known(plan.left.proof.clone()),
-            right_proof: Value::known(plan.right.proof.clone()),
-            left_pi_acc: Value::known(setup.trivial_combined.clone()),
-            right_pi_acc: Value::known(setup.trivial_combined.clone()),
+            child_proofs: plan
+                .clients
+                .iter()
+                .map(|cp| Value::known(cp.proof.clone()))
+                .collect(),
+            child_pi_accs: (0..LEAF_CLIENT_ARITY)
+                .map(|_| Value::known(setup.trivial_combined.clone()))
+                .collect(),
             fixed_base_names: setup.fixed_base_names.clone(),
         },
     };
 
     // Verify client proofs and extract accumulators
-    let (acc_l, acc_r) = rayon::join(
-        || verify_and_extract(client_srs, client_vk, &setup.leaf_fixed_bases, &plan.left.proof, &plan.left.public_inputs),
-        || verify_and_extract(client_srs, client_vk, &setup.leaf_fixed_bases, &plan.right.proof, &plan.right.public_inputs),
-    );
-    let acc_l = acc_l?;
-    let acc_r = acc_r?;
+    let proof_accs: Vec<Acc> = plan
+        .clients
+        .iter()
+        .map(|cp| {
+            verify_and_extract(
+                client_srs,
+                client_vk,
+                &setup.leaf_fixed_bases,
+                &cp.proof,
+                &cp.public_inputs,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let pi_acc = collapse(Accumulator::accumulate(&[
-        acc_l, setup.trivial_combined.clone(),
-        acc_r, setup.trivial_combined.clone(),
-    ]));
+    let mut fold_parts = Vec::with_capacity(LEAF_CLIENT_ARITY * 2);
+    for acc in proof_accs {
+        fold_parts.push(acc);
+        fold_parts.push(setup.trivial_combined.clone());
+    }
+    let pi_acc = collapse(Accumulator::accumulate(&fold_parts));
 
     let mut full_state = plan.app_state.clone();
     full_state.push(plan.merkle_digest);
@@ -429,7 +482,11 @@ fn prove_leaf<L: LeafStep>(
     println!("Leaf AGG {} in {:?}", plan.index, start.elapsed());
 
     let proof_acc = verify_and_extract(
-        srs, leaf_keys.vk.as_ref(), &leaf_keys.fixed_bases, &proof, &pi_fields,
+        srs,
+        leaf_keys.vk.as_ref(),
+        &leaf_keys.fixed_bases,
+        &proof,
+        &pi_fields,
     )?;
 
     Ok(TreeNode {
@@ -474,17 +531,23 @@ fn prove_node<Fo: FoldStep>(
         fw: FrameworkWitness {
             child_vk: child_keys.vk_data.clone(),
             child_vk_name: child_keys.name.clone(),
-            left_proof: Value::known(left.proof.clone()),
-            right_proof: Value::known(right.proof.clone()),
-            left_pi_acc: Value::known(left.pi_acc.clone()),
-            right_pi_acc: Value::known(right.pi_acc.clone()),
+            child_proofs: vec![
+                Value::known(left.proof.clone()),
+                Value::known(right.proof.clone()),
+            ],
+            child_pi_accs: vec![
+                Value::known(left.pi_acc.clone()),
+                Value::known(right.pi_acc.clone()),
+            ],
             fixed_base_names: setup.fixed_base_names.clone(),
         },
     };
 
     let pi_acc = collapse(Accumulator::accumulate(&[
-        left.proof_acc.clone(), left.pi_acc.clone(),
-        right.proof_acc.clone(), right.pi_acc.clone(),
+        left.proof_acc.clone(),
+        left.pi_acc.clone(),
+        right.proof_acc.clone(),
+        right.pi_acc.clone(),
     ]));
 
     let mut full_state = app_state.clone();
@@ -500,10 +563,20 @@ fn prove_node<Fo: FoldStep>(
     println!("Internal level {} in {:?}", parent_level, start.elapsed());
 
     let proof_acc = verify_and_extract(
-        srs, parent_keys.vk.as_ref(), &parent_keys.fixed_bases, &proof, &pi_fields,
+        srs,
+        parent_keys.vk.as_ref(),
+        &parent_keys.fixed_bases,
+        &proof,
+        &pi_fields,
     )?;
 
-    Ok(TreeNode { app_state, merkle_digest: digest, proof, proof_acc, pi_acc })
+    Ok(TreeNode {
+        app_state,
+        merkle_digest: digest,
+        proof,
+        proof_acc,
+        pi_acc,
+    })
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -521,7 +594,7 @@ fn build_to_top_pair<Fo: FoldStep>(
     loop {
         match nodes.len() {
             0 => return Err(AggregationError::Empty),
-            1 => return Err(AggregationError::NeedAtLeastFour(2)),
+            1 => return Err(AggregationError::NeedAtLeastEight(LEAF_CLIENT_ARITY)),
             2 => {
                 let right = nodes.pop().unwrap();
                 let left = nodes.pop().unwrap();
@@ -532,7 +605,17 @@ fn build_to_top_pair<Fo: FoldStep>(
                 let pairs: Vec<_> = nodes.chunks_exact(2).collect();
                 nodes = pairs
                     .par_iter()
-                    .map(|pair| prove_node(setup, fold_step, host_merge, parent_level, level, &pair[0], &pair[1]))
+                    .map(|pair| {
+                        prove_node(
+                            setup,
+                            fold_step,
+                            host_merge,
+                            parent_level,
+                            level,
+                            &pair[0],
+                            &pair[1],
+                        )
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 level = parent_level;
             }
@@ -569,9 +652,11 @@ fn verify_and_extract(
     let instances: &[&[&[F]]] = &[&[public_inputs]];
 
     let dual_msm = midnight_proofs::plonk::prepare::<
-        F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>,
+        F,
+        KZGCommitmentScheme<E>,
+        CircuitTranscript<PoseidonState<F>>,
     >(vk, committed, instances, &mut transcript)
-        .map_err(|_| AggregationError::PrepareFailed)?;
+    .map_err(|_| AggregationError::PrepareFailed)?;
 
     if !dual_msm.clone().check(&srs.verifier_params()) {
         return Err(AggregationError::DualMsmFailed);
@@ -596,7 +681,13 @@ fn create_agg_proof<Circ: Circuit<F>>(
 ) -> Result<Vec<u8>, AggregationError> {
     let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
     create_proof::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>, Circ>(
-        srs, pk, &[circuit], 1, &[&[&[], public_inputs]], OsRng, &mut transcript,
+        srs,
+        pk,
+        &[circuit],
+        1,
+        &[&[&[], public_inputs]],
+        OsRng,
+        &mut transcript,
     )
     .map_err(|_| AggregationError::InternalProofFailed)?;
     Ok(transcript.finalize())
@@ -609,8 +700,8 @@ fn keygen_pair<Circ: Circuit<F>>(
 ) -> Result<(Vk, Pk), AggregationError> {
     let vk = keygen_vk_with_k(srs, circuit, k)
         .map_err(|e| AggregationError::Setup(format!("vk: {e}")))?;
-    let pk = keygen_pk(vk.clone(), circuit)
-        .map_err(|e| AggregationError::Setup(format!("pk: {e}")))?;
+    let pk =
+        keygen_pk(vk.clone(), circuit).map_err(|e| AggregationError::Setup(format!("pk: {e}")))?;
     Ok((vk, pk))
 }
 

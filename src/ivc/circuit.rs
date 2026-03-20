@@ -11,12 +11,11 @@ use midnight_proofs::{
 };
 
 use super::{
-    Acc, DeciderStep, F, FoldStep, LeafStep, VkData,
+    Acc, AssignedNative, DeciderStep, F, FoldStep, LeafStep, VkData,
     ctx::{
-        AggCircuitConfig, IvcCtx, RpvInput,
-        configure_ivc_circuit, expose_node_outputs, recursive_partial_verify,
+        AggCircuitConfig, IvcCtx, RpvInput, configure_ivc_circuit, expose_node_outputs,
+        recursive_partial_verify,
     },
-    AssignedNative,
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -27,10 +26,8 @@ use super::{
 pub struct FrameworkWitness {
     pub child_vk: VkData,
     pub child_vk_name: String,
-    pub left_proof: Value<Vec<u8>>,
-    pub right_proof: Value<Vec<u8>>,
-    pub left_pi_acc: Value<Acc>,
-    pub right_pi_acc: Value<Acc>,
+    pub child_proofs: Vec<Value<Vec<u8>>>,
+    pub child_pi_accs: Vec<Value<Acc>>,
     pub fixed_base_names: Vec<String>,
 }
 
@@ -39,10 +36,12 @@ impl FrameworkWitness {
         Self {
             child_vk: self.child_vk.clone(),
             child_vk_name: self.child_vk_name.clone(),
-            left_proof: Value::unknown(),
-            right_proof: Value::unknown(),
-            left_pi_acc: Value::unknown(),
-            right_pi_acc: Value::unknown(),
+            child_proofs: self.child_proofs.iter().map(|_| Value::unknown()).collect(),
+            child_pi_accs: self
+                .child_pi_accs
+                .iter()
+                .map(|_| Value::unknown())
+                .collect(),
             fixed_base_names: self.fixed_base_names.clone(),
         }
     }
@@ -52,7 +51,7 @@ impl FrameworkWitness {
 // Shared synthesis core
 //
 // Every IVC circuit follows the same three-phase pattern:
-//   1. Run the application's step function  → (state, left_child_pi, right_child_pi)
+//   1. Run the application's step function  → (state, child_pis)
 //   2. Framework appends Merkle digest to the state
 //   3. Recursive partial verify + expose outputs
 ////////////////////////////////////////////////////////////////////////////////
@@ -60,8 +59,7 @@ impl FrameworkWitness {
 /// Output produced by the step-phase closure inside `synthesize_node`.
 struct StepPhaseOutput {
     full_state: Vec<AssignedNative<F>>,
-    left_child_pi: Vec<AssignedNative<F>>,
-    right_child_pi: Vec<AssignedNative<F>>,
+    child_pis: Vec<Vec<AssignedNative<F>>>,
 }
 
 fn synthesize_node<const K: u32, L: Layouter<F>>(
@@ -89,12 +87,9 @@ fn synthesize_node<const K: u32, L: Layouter<F>>(
             assigned_vk: &assigned_vk,
             children_are_client_proofs,
             fixed_base_names: &fw.fixed_base_names,
-            left_base_pi: out.left_child_pi,
-            right_base_pi: out.right_child_pi,
-            left_proof: fw.left_proof.clone(),
-            right_proof: fw.right_proof.clone(),
-            left_pi_acc: fw.left_pi_acc.clone(),
-            right_pi_acc: fw.right_pi_acc.clone(),
+            child_base_pis: out.child_pis,
+            child_proofs: fw.child_proofs.clone(),
+            child_pi_accs: fw.child_pi_accs.clone(),
         },
     )?;
 
@@ -105,16 +100,15 @@ fn synthesize_node<const K: u32, L: Layouter<F>>(
 ////////////////////////////////////////////////////////////////////////////////
 // IvcLeafCircuit<L, K>
 //
-// Subcircuit at the leaves of the binary tree.  Verifies two raw client
+// Subcircuit at the leaves of the binary tree.  Verifies four raw client
 // proofs, runs the application's LeafStep, and produces the base Merkle
-// digest H(h(x_left), h(x_right)).
+// digest H(H(h(x0), h(x1)), H(h(x2), h(x3))).
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone)]
 pub struct IvcLeafCircuit<L: LeafStep, const K: u32> {
     pub(crate) step: L,
-    pub(crate) left_client_items: Value<Vec<F>>,
-    pub(crate) right_client_items: Value<Vec<F>>,
+    pub(crate) client_items: [Value<Vec<F>>; 4],
     pub(crate) witness: Value<L::Witness>,
     pub(crate) client_pi_width: usize,
     pub(crate) fw: FrameworkWitness,
@@ -128,8 +122,12 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
     fn without_witnesses(&self) -> Self {
         Self {
             step: self.step.clone(),
-            left_client_items: Value::unknown(),
-            right_client_items: Value::unknown(),
+            client_items: [
+                Value::unknown(),
+                Value::unknown(),
+                Value::unknown(),
+                Value::unknown(),
+            ],
             witness: Value::unknown(),
             client_pi_width: self.client_pi_width,
             fw: self.fw.without_witnesses(),
@@ -146,8 +144,7 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let step = self.step.clone();
-        let left_items = self.left_client_items.clone();
-        let right_items = self.right_client_items.clone();
+        let items = self.client_items.clone();
         let witness = self.witness.clone();
         let width = self.client_pi_width;
 
@@ -158,16 +155,22 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
             true, // children ARE client proofs
             |ctx, layouter| {
                 // 1. Assign client PIs
-                let left_pi = assign_value_vec(ctx, layouter, &left_items, width)?;
-                let right_pi = assign_value_vec(ctx, layouter, &right_items, width)?;
+                let p0 = assign_value_vec(ctx, layouter, &items[0], width)?;
+                let p1 = assign_value_vec(ctx, layouter, &items[1], width)?;
+                let p2 = assign_value_vec(ctx, layouter, &items[2], width)?;
+                let p3 = assign_value_vec(ctx, layouter, &items[3], width)?;
 
                 // 2. Application step (only sees client PIs)
-                let app_state = step.synthesize(ctx, layouter, &left_pi, &right_pi, witness)?;
+                let app_state = step.synthesize(ctx, layouter, &p0, &p1, &p2, &p3, witness)?;
 
                 // 3. Framework: Merkle hashes
-                let left_hash = ctx.hash_many(layouter, &left_pi)?;
-                let right_hash = ctx.hash_many(layouter, &right_pi)?;
-                let digest = ctx.hash2(layouter, &left_hash, &right_hash)?;
+                let h0 = ctx.hash_many(layouter, &p0)?;
+                let h1 = ctx.hash_many(layouter, &p1)?;
+                let h2 = ctx.hash_many(layouter, &p2)?;
+                let h3 = ctx.hash_many(layouter, &p3)?;
+                let h01 = ctx.hash2(layouter, &h0, &h1)?;
+                let h23 = ctx.hash2(layouter, &h2, &h3)?;
+                let digest = ctx.hash2(layouter, &h01, &h23)?;
 
                 // 4. Full state = [app_state..., digest]
                 let mut full = app_state;
@@ -175,8 +178,7 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
 
                 Ok(StepPhaseOutput {
                     full_state: full,
-                    left_child_pi: left_pi,
-                    right_child_pi: right_pi,
+                    child_pis: vec![p0, p1, p2, p3],
                 })
             },
         )
@@ -255,8 +257,7 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
 
                 Ok(StepPhaseOutput {
                     full_state: full,
-                    left_child_pi: left_full,
-                    right_child_pi: right_full,
+                    child_pis: vec![left_full, right_full],
                 })
             },
         )
@@ -348,12 +349,9 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
                 assigned_vk: &assigned_vk,
                 children_are_client_proofs: false,
                 fixed_base_names: &self.fw.fixed_base_names,
-                left_base_pi: left_full,
-                right_base_pi: right_full,
-                left_proof: self.fw.left_proof.clone(),
-                right_proof: self.fw.right_proof.clone(),
-                left_pi_acc: self.fw.left_pi_acc.clone(),
-                right_pi_acc: self.fw.right_pi_acc.clone(),
+                child_base_pis: vec![left_full, right_full],
+                child_proofs: self.fw.child_proofs.clone(),
+                child_pi_accs: self.fw.child_pi_accs.clone(),
             },
         )?;
 

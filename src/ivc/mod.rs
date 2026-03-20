@@ -23,24 +23,20 @@
 //! 3. **Engine** ([`IvcSetup`], [`IvcProver`]) — one-shot key generation and
 //!    parallel tree proof construction.
 
-pub mod ctx;
 pub mod circuit;
+pub mod ctx;
 pub mod engine;
 
 // Re-export the public API.
-pub use ctx::IvcCtx;
 pub use circuit::IvcDeciderCircuit;
+pub use ctx::IvcCtx;
 pub use engine::IvcProver;
 
 use std::fmt::Debug;
 
 use midnight_circuits::{
     ecc::foreign::ForeignEccChip,
-    field::{
-        NativeGadget,
-        decomposition::chip::P2RDecompositionChip,
-        native::NativeChip,
-    },
+    field::{NativeGadget, decomposition::chip::P2RDecompositionChip, native::NativeChip},
     hash::poseidon::PoseidonChip,
     map::cpu::MapMt,
     types::{AssignedForeignPoint, AssignedNative},
@@ -151,7 +147,7 @@ pub trait HostState: Clone + Debug + Send + Sync {
 // Step function traits
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Leaf step: processes two client proof instances.
+/// Leaf step: processes four client proof instances.
 ///
 /// The framework assigns the client PIs, hashes them for the Merkle
 /// commitment, and handles recursive partial verification.  The step
@@ -170,8 +166,10 @@ pub trait LeafStep: Clone + Send + Sync {
         &self,
         ctx: &IvcCtx,
         layouter: &mut L,
-        left_pi: &[AssignedNative<F>],
-        right_pi: &[AssignedNative<F>],
+        p0: &[AssignedNative<F>],
+        p1: &[AssignedNative<F>],
+        p2: &[AssignedNative<F>],
+        p3: &[AssignedNative<F>],
         witness: Value<Self::Witness>,
     ) -> Result<Vec<AssignedNative<F>>, Error>;
 }

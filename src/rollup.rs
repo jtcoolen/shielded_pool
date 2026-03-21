@@ -413,6 +413,12 @@ pub fn plan_rollup_leaves(
     let mut nmap = pre_nullifier_map;
     let roots_set_root = pre_roots_set_map.succinct_repr();
 
+    if client_proofs.len() % 4 != 0 {
+        return Err(AggregationError::LeafValidation(
+            "client proofs length must be divisible by 4".into(),
+        ));
+    }
+
     let mut plans = Vec::with_capacity(client_proofs.len() / 4);
 
     for (i, quad) in client_proofs.chunks_exact(4).enumerate() {

@@ -188,17 +188,19 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
 ////////////////////////////////////////////////////////////////////////////////
 // IvcNodeCircuit<Fo, K>
 //
-// Subcircuit at internal nodes.  Verifies two child aggregation proofs,
+// Subcircuit at internal nodes.  Verifies four child aggregation proofs,
 // runs the application's FoldStep on the app-state portions, and computes
-// the parent Merkle digest H(left_digest, right_digest).
+// the parent Merkle digest H(H(d0, d1), H(d2, d3)).
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone)]
 pub struct IvcNodeCircuit<Fo: FoldStep, const K: u32> {
     pub(crate) step: Fo,
     pub(crate) app_state_width: usize,
-    pub(crate) left_child_state: Vec<Value<F>>,
-    pub(crate) right_child_state: Vec<Value<F>>,
+    pub(crate) child0_state: Vec<Value<F>>,
+    pub(crate) child1_state: Vec<Value<F>>,
+    pub(crate) child2_state: Vec<Value<F>>,
+    pub(crate) child3_state: Vec<Value<F>>,
     pub(crate) fw: FrameworkWitness,
 }
 
@@ -212,8 +214,10 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
         Self {
             step: self.step.clone(),
             app_state_width: self.app_state_width,
-            left_child_state: vec![Value::unknown(); full_width],
-            right_child_state: vec![Value::unknown(); full_width],
+            child0_state: vec![Value::unknown(); full_width],
+            child1_state: vec![Value::unknown(); full_width],
+            child2_state: vec![Value::unknown(); full_width],
+            child3_state: vec![Value::unknown(); full_width],
             fw: self.fw.without_witnesses(),
         }
     }
@@ -228,8 +232,10 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let step = self.step.clone();
-        let left_vals = self.left_child_state.clone();
-        let right_vals = self.right_child_state.clone();
+        let child0_vals = self.child0_state.clone();
+        let child1_vals = self.child1_state.clone();
+        let child2_vals = self.child2_state.clone();
+        let child3_vals = self.child3_state.clone();
         let w = self.app_state_width;
 
         synthesize_node::<K, _>(
@@ -239,25 +245,33 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
             false, // children are NOT client proofs
             |ctx, layouter| {
                 // 1. Assign full child states [app..., digest]
-                let left_full = assign_values(ctx, layouter, &left_vals)?;
-                let right_full = assign_values(ctx, layouter, &right_vals)?;
+                let child0_full = assign_values(ctx, layouter, &child0_vals)?;
+                let child1_full = assign_values(ctx, layouter, &child1_vals)?;
+                let child2_full = assign_values(ctx, layouter, &child2_vals)?;
+                let child3_full = assign_values(ctx, layouter, &child3_vals)?;
 
                 // 2. Split into app state and Merkle digest
-                let (left_app, left_digest) = left_full.split_at(w);
-                let (right_app, right_digest) = right_full.split_at(w);
+                let (child0_app, child0_digest) = child0_full.split_at(w);
+                let (child1_app, child1_digest) = child1_full.split_at(w);
+                let (child2_app, child2_digest) = child2_full.split_at(w);
+                let (child3_app, child3_digest) = child3_full.split_at(w);
 
                 // 3. Application fold (only sees app states)
-                let app_state = step.synthesize(ctx, layouter, left_app, right_app)?;
+                let app01 = step.synthesize(ctx, layouter, child0_app, child1_app)?;
+                let app012 = step.synthesize(ctx, layouter, &app01, child2_app)?;
+                let app_state = step.synthesize(ctx, layouter, &app012, child3_app)?;
 
                 // 4. Framework: parent Merkle digest
-                let digest = ctx.hash2(layouter, &left_digest[0], &right_digest[0])?;
+                let d01 = ctx.hash2(layouter, &child0_digest[0], &child1_digest[0])?;
+                let d23 = ctx.hash2(layouter, &child2_digest[0], &child3_digest[0])?;
+                let digest = ctx.hash2(layouter, &d01, &d23)?;
 
                 let mut full = app_state;
                 full.push(digest);
 
                 Ok(StepPhaseOutput {
                     full_state: full,
-                    child_pis: vec![left_full, right_full],
+                    child_pis: vec![child0_full, child1_full, child2_full, child3_full],
                 })
             },
         )

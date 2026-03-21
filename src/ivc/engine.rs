@@ -50,8 +50,11 @@ pub enum AggregationError {
     #[error("need at least one client proof")]
     Empty,
 
-    #[error("client proofs length must be a power of two (got {0})")]
+    #[error("number of leaf aggregation nodes must be of the form 2*4^k (got {0})")]
     NotPowerOfTwo(usize),
+
+    #[error("client proofs length must be divisible by leaf arity {arity} (got {got})")]
+    InvalidLeafArity { arity: usize, got: usize },
 
     #[error("length mismatch: expected {expected}, got {got}")]
     LenMismatch { expected: usize, got: usize },
@@ -214,15 +217,28 @@ where
     L: LeafStep,
     Fo: FoldStep,
 {
-    if num_client_proofs == 0
-        || !num_client_proofs.is_power_of_two()
-        || num_client_proofs < LEAF_CLIENT_ARITY * 2
-    {
-        return Err(AggregationError::NeedAtLeastEight(num_client_proofs));
+    if num_client_proofs == 0 || num_client_proofs % LEAF_CLIENT_ARITY != 0 {
+        return Err(AggregationError::InvalidLeafArity {
+            arity: LEAF_CLIENT_ARITY,
+            got: num_client_proofs,
+        });
     }
 
     let num_leaves = num_client_proofs / LEAF_CLIENT_ARITY;
-    let max_agg_level = (num_leaves as u32).trailing_zeros() as usize;
+    if num_leaves < 2 {
+        return Err(AggregationError::NeedAtLeastEight(num_client_proofs));
+    }
+
+    let mut n = num_leaves;
+    let mut internal_levels = 0usize;
+    while n > 2 {
+        if n % 4 != 0 {
+            return Err(AggregationError::NotPowerOfTwo(num_leaves));
+        }
+        n /= 4;
+        internal_levels += 1;
+    }
+    let max_agg_level = 1 + internal_levels;
 
     let leaf_vk_data = VkData {
         domain: EvaluationDomain::new(leaf_vk.cs().degree() as u32, leaf_k),
@@ -300,13 +316,25 @@ where
             let circuit = IvcNodeCircuit::<Fo, 19> {
                 step: fold_step.clone(),
                 app_state_width,
-                left_child_state: vec![Value::unknown(); full_width],
-                right_child_state: vec![Value::unknown(); full_width],
+                child0_state: vec![Value::unknown(); full_width],
+                child1_state: vec![Value::unknown(); full_width],
+                child2_state: vec![Value::unknown(); full_width],
+                child3_state: vec![Value::unknown(); full_width],
                 fw: FrameworkWitness {
                     child_vk: child_vk_data,
                     child_vk_name,
-                    child_proofs: vec![Value::unknown(), Value::unknown()],
-                    child_pi_accs: vec![Value::unknown(), Value::unknown()],
+                    child_proofs: vec![
+                        Value::unknown(),
+                        Value::unknown(),
+                        Value::unknown(),
+                        Value::unknown(),
+                    ],
+                    child_pi_accs: vec![
+                        Value::unknown(),
+                        Value::unknown(),
+                        Value::unknown(),
+                        Value::unknown(),
+                    ],
                     fixed_base_names: fixed_base_names.clone(),
                 },
             };
@@ -508,46 +536,67 @@ fn prove_node<Fo: FoldStep>(
     host_merge: &(impl Fn(&[F], &[F]) -> Vec<F> + Send + Sync),
     parent_level: usize,
     child_level: usize,
-    left: &TreeNode<Vec<F>>,
-    right: &TreeNode<Vec<F>>,
+    child0: &TreeNode<Vec<F>>,
+    child1: &TreeNode<Vec<F>>,
+    child2: &TreeNode<Vec<F>>,
+    child3: &TreeNode<Vec<F>>,
 ) -> Result<TreeNode<Vec<F>>, AggregationError> {
     let child_keys = setup.agg_store.get(child_level);
     let parent_keys = setup.agg_store.get(parent_level);
     let srs = &setup.agg_srs_internal;
 
-    let app_state = host_merge(&left.app_state, &right.app_state);
-    let digest = host_hash_pair(left.merkle_digest, right.merkle_digest);
+    let app01 = host_merge(&child0.app_state, &child1.app_state);
+    let app012 = host_merge(&app01, &child2.app_state);
+    let app_state = host_merge(&app012, &child3.app_state);
 
-    let mut left_full: Vec<F> = left.app_state.clone();
-    left_full.push(left.merkle_digest);
-    let mut right_full: Vec<F> = right.app_state.clone();
-    right_full.push(right.merkle_digest);
+    let d01 = host_hash_pair(child0.merkle_digest, child1.merkle_digest);
+    let d23 = host_hash_pair(child2.merkle_digest, child3.merkle_digest);
+    let digest = host_hash_pair(d01, d23);
+
+    let mut child0_full: Vec<F> = child0.app_state.clone();
+    child0_full.push(child0.merkle_digest);
+    let mut child1_full: Vec<F> = child1.app_state.clone();
+    child1_full.push(child1.merkle_digest);
+    let mut child2_full: Vec<F> = child2.app_state.clone();
+    child2_full.push(child2.merkle_digest);
+    let mut child3_full: Vec<F> = child3.app_state.clone();
+    child3_full.push(child3.merkle_digest);
 
     let circuit = IvcNodeCircuit::<Fo, 19> {
         step: fold_step.clone(),
         app_state_width: setup.app_state_width,
-        left_child_state: left_full.iter().map(|f| Value::known(*f)).collect(),
-        right_child_state: right_full.iter().map(|f| Value::known(*f)).collect(),
+        child0_state: child0_full.iter().map(|f| Value::known(*f)).collect(),
+        child1_state: child1_full.iter().map(|f| Value::known(*f)).collect(),
+        child2_state: child2_full.iter().map(|f| Value::known(*f)).collect(),
+        child3_state: child3_full.iter().map(|f| Value::known(*f)).collect(),
         fw: FrameworkWitness {
             child_vk: child_keys.vk_data.clone(),
             child_vk_name: child_keys.name.clone(),
             child_proofs: vec![
-                Value::known(left.proof.clone()),
-                Value::known(right.proof.clone()),
+                Value::known(child0.proof.clone()),
+                Value::known(child1.proof.clone()),
+                Value::known(child2.proof.clone()),
+                Value::known(child3.proof.clone()),
             ],
             child_pi_accs: vec![
-                Value::known(left.pi_acc.clone()),
-                Value::known(right.pi_acc.clone()),
+                Value::known(child0.pi_acc.clone()),
+                Value::known(child1.pi_acc.clone()),
+                Value::known(child2.pi_acc.clone()),
+                Value::known(child3.pi_acc.clone()),
             ],
             fixed_base_names: setup.fixed_base_names.clone(),
         },
     };
 
     let pi_acc = collapse(Accumulator::accumulate(&[
-        left.proof_acc.clone(),
-        left.pi_acc.clone(),
-        right.proof_acc.clone(),
-        right.pi_acc.clone(),
+        child0.proof_acc.clone(),
+        child0.pi_acc.clone(),
+        child1.proof_acc.clone(),
+        child1.pi_acc.clone(),
+        child2.proof_acc.clone(),
+        child2.pi_acc.clone(),
+        child3.proof_acc.clone(),
+        child3.pi_acc.clone(),
     ]));
 
     let mut full_state = app_state.clone();
@@ -594,26 +643,34 @@ fn build_to_top_pair<Fo: FoldStep>(
     loop {
         match nodes.len() {
             0 => return Err(AggregationError::Empty),
-            1 => return Err(AggregationError::NeedAtLeastEight(LEAF_CLIENT_ARITY)),
+            1 => return Err(AggregationError::NeedAtLeastEight(LEAF_CLIENT_ARITY * 2)),
             2 => {
                 let right = nodes.pop().unwrap();
                 let left = nodes.pop().unwrap();
                 return Ok((level, (left, right)));
             }
             _ => {
+                if nodes.len() % 4 != 0 {
+                    return Err(AggregationError::FoldValidation(format!(
+                        "internal level {level} requires node count divisible by 4, got {}",
+                        nodes.len()
+                    )));
+                }
                 let parent_level = level + 1;
-                let pairs: Vec<_> = nodes.chunks_exact(2).collect();
-                nodes = pairs
+                let quads: Vec<_> = nodes.chunks_exact(4).collect();
+                nodes = quads
                     .par_iter()
-                    .map(|pair| {
+                    .map(|quad| {
                         prove_node(
                             setup,
                             fold_step,
                             host_merge,
                             parent_level,
                             level,
-                            &pair[0],
-                            &pair[1],
+                            &quad[0],
+                            &quad[1],
+                            &quad[2],
+                            &quad[3],
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;

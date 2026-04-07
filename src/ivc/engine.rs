@@ -482,6 +482,7 @@ fn prove_leaf<L: LeafStep>(
         .map(|cp| {
             verify_and_extract(
                 client_srs,
+                &setup.leaf_vk_name,
                 client_vk,
                 &setup.leaf_fixed_bases,
                 &cp.proof,
@@ -511,6 +512,7 @@ fn prove_leaf<L: LeafStep>(
 
     let proof_acc = verify_and_extract(
         srs,
+        &leaf_keys.name,
         leaf_keys.vk.as_ref(),
         &leaf_keys.fixed_bases,
         &proof,
@@ -613,6 +615,7 @@ fn prove_node<Fo: FoldStep>(
 
     let proof_acc = verify_and_extract(
         srs,
+        &parent_keys.name,
         parent_keys.vk.as_ref(),
         &parent_keys.fixed_bases,
         &proof,
@@ -699,6 +702,7 @@ fn collapse(mut acc: Acc) -> Acc {
 
 fn verify_and_extract(
     srs: &ParamsKZG<Bls12>,
+    vk_name: &str,
     vk: &Vk,
     fixed_bases: &BTreeMap<String, C>,
     proof: &[u8],
@@ -719,11 +723,10 @@ fn verify_and_extract(
         return Err(AggregationError::DualMsmFailed);
     }
 
-    let mut acc: Acc = dual_msm.into();
-    acc.extract_fixed_bases(fixed_bases);
+    let mut acc = Accumulator::from_dual_msm(dual_msm, vk_name, fixed_bases);
     acc.collapse();
 
-    if !acc.check(&srs.s_g2().into(), fixed_bases) {
+    if !acc.check(&srs.verifier_params(), fixed_bases) {
         return Err(AggregationError::AccumulatorFailed);
     }
 

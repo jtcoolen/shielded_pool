@@ -194,6 +194,7 @@ impl Relation for Spend2Output2 {
             secp256k1: false,
             bls12_381: false,
             base64: false,
+            nb_arith_cols: 5,
             nr_pow2range_cols: 1,
             automaton: false,
         }
@@ -328,6 +329,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     use std::ops::Not;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::OnceLock;
 
     // --- If your project already has a helper for SRS, use it here.
@@ -385,29 +387,29 @@ mod tests {
     ) -> bool {
         let e = env();
         let mut prover_rng = ChaCha8Rng::seed_from_u64(seed ^ 0xA5A5_A5A5_A5A5_A5A5);
+        catch_unwind(AssertUnwindSafe(|| {
+            let proof = match midnight_zk_stdlib::prove::<Spend2Output2, PoseidonState<F>>(
+                &e.srs,
+                &e.pk,
+                &e.relation,
+                instance,
+                witness,
+                &mut prover_rng,
+            ) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
 
-        let proof = match midnight_zk_stdlib::prove::<Spend2Output2, PoseidonState<F>>(
-            &e.srs,
-            &e.pk,
-            &e.relation,
-            instance,
-            witness,
-            &mut prover_rng,
-        ) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
-        // This matches the verify API shape shown in docs.rs for midnight_zk_stdlib.
-        // midnight_zk_stdlib in your codebase typically mirrors it; if not, swap for your verifier.
-        midnight_zk_stdlib::verify::<Spend2Output2, PoseidonState<F>>(
-            &e.srs.verifier_params(),
-            &e.vk,
-            instance,
-            None,
-            &proof,
-        )
-        .is_ok()
+            midnight_zk_stdlib::verify::<Spend2Output2, PoseidonState<F>>(
+                &e.srs.verifier_params(),
+                &e.vk,
+                instance,
+                None,
+                &proof,
+            )
+            .is_ok()
+        }))
+        .unwrap_or(false)
     }
 
     fn rejects(

@@ -70,7 +70,7 @@ fn synthesize_node<const K: u32, L: Layouter<F>>(
     step_phase: impl FnOnce(&IvcCtx, &mut L) -> Result<StepPhaseOutput, Error>,
 ) -> Result<(), Error> {
     let ctx = IvcCtx::new(&config, (K as usize).saturating_sub(1));
-    let assigned_vk = ctx.verifier.assign_vk_to_fixed(
+    let assigned_vk = ctx.verifier.assign_fixed_vk(
         layouter,
         &fw.child_vk_name,
         &fw.child_vk.domain,
@@ -323,7 +323,7 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let ctx = IvcCtx::new(&config, (K as usize).saturating_sub(1));
-        let assigned_vk = ctx.verifier.assign_vk_to_fixed(
+        let assigned_vk = ctx.verifier.assign_fixed_vk(
             &mut layouter,
             &self.fw.child_vk_name,
             &self.fw.child_vk.domain,

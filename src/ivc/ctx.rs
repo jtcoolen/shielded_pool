@@ -16,7 +16,7 @@ use midnight_circuits::{
             pow2range::Pow2RangeChip,
         },
         foreign::FieldChip,
-        native::{NB_ARITH_COLS, NativeChip, NativeConfig},
+        native::{MIN_NB_ARITH_COLS, NB_EXTRA_ARITH_FIXED_COLS, NativeChip, NativeConfig},
     },
     hash::poseidon::{
         NB_POSEIDON_ADVICE_COLS, NB_POSEIDON_FIXED_COLS, PoseidonChip, PoseidonConfig,
@@ -59,8 +59,12 @@ fn first<const N: usize, T: Copy>(xs: &[T], what: &'static str) -> [T; N] {
 }
 
 pub fn configure_ivc_circuit(meta: &mut ConstraintSystem<F>) -> AggCircuitConfig {
+    const NB_ARITH_COLS: usize = MIN_NB_ARITH_COLS;
+    const NB_PARALLEL_RANGE_CHECKS: usize = NB_ARITH_COLS - 1;
+    const MAX_BIT_LEN: u32 = 8;
+
     let nb_advice = nb_foreign_ecc_chip_columns::<F, C, C, NG>().max(NB_POSEIDON_ADVICE_COLS);
-    let nb_fixed = (NB_ARITH_COLS + 4).max(NB_POSEIDON_FIXED_COLS);
+    let nb_fixed = (NB_ARITH_COLS + NB_EXTRA_ARITH_FIXED_COLS).max(NB_POSEIDON_FIXED_COLS);
 
     let advice = alloc(nb_advice, || meta.advice_column());
     let fixed = alloc(nb_fixed, || meta.fixed_column());
@@ -69,8 +73,8 @@ pub fn configure_ivc_circuit(meta: &mut ConstraintSystem<F>) -> AggCircuitConfig
     let native = NativeChip::configure(
         meta,
         &(
-            first::<NB_ARITH_COLS, _>(&advice, "native advice"),
-            first::<{ NB_ARITH_COLS + 4 }, _>(&fixed, "native fixed"),
+            advice[..NB_ARITH_COLS].to_vec(),
+            fixed[..(NB_ARITH_COLS + NB_EXTRA_ARITH_FIXED_COLS)].to_vec(),
             instance,
         ),
     );
@@ -81,8 +85,19 @@ pub fn configure_ivc_circuit(meta: &mut ConstraintSystem<F>) -> AggCircuitConfig
     };
 
     type CBase = <C as midnight_circuits::ecc::curves::CircuitCurve>::Base;
-    let base = FieldChip::<F, CBase, C, NG>::configure(meta, &advice);
-    let curve = ForeignEccChip::<F, C, C, NG, NG>::configure(meta, &base, &advice);
+    let base = FieldChip::<F, CBase, C, NG>::configure(
+        meta,
+        &advice,
+        NB_PARALLEL_RANGE_CHECKS,
+        MAX_BIT_LEN,
+    );
+    let curve = ForeignEccChip::<F, C, C, NG, NG>::configure(
+        meta,
+        &base,
+        &advice,
+        NB_PARALLEL_RANGE_CHECKS,
+        MAX_BIT_LEN,
+    );
 
     let poseidon = PoseidonChip::configure(
         meta,
@@ -286,7 +301,7 @@ fn prepare_proof_acc(
 ) -> Result<AssignedAccumulator<S>, Error> {
     let mut a = ctx
         .verifier
-        .prepare(layouter, vk, &[("com_instance", id)], &[pi], proof)?;
+        .prepare(layouter, vk, &[id], &[pi], proof)?;
     a.collapse(layouter, &ctx.curve, &ctx.scalar)?;
     Ok(a)
 }

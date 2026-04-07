@@ -523,7 +523,7 @@ fn run() -> Result<(), AppError> {
         "Initial commitment root: {:?}",
         chain.commitment_root_history[0]
     );
-    let client_stats = cost_model(&transfer_circuit::Spend2Output2);
+    let client_stats = cost_model(&transfer_circuit::Spend2Output2, None);
     println!("client circuit stats: {:?}", client_stats);
 
     // --- Rollup batching loop ---
@@ -737,7 +737,7 @@ fn run() -> Result<(), AppError> {
 
             assert!(
                 final_acc.check(
-                    &ivc_setup.agg_srs_leaf.s_g2().into(),
+                    &ivc_setup.agg_srs_leaf.verifier_params(),
                     &ivc_setup.fixed_bases
                 ),
                 "Final acc must verify"

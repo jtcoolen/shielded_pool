@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-midnight-circuits = { git = "https://github.com/EYBlockchain/midfall", rev = "20b048568ec30749338710cb842d7932efa75b1d" }
-midnight-aggregator = { git = "https://github.com/EYBlockchain/midfall", rev = "20b048568ec30749338710cb842d7932efa75b1d", optional = true }
-midnight-curves = { git = "https://github.com/EYBlockchain/midfall", rev = "20b048568ec30749338710cb842d7932efa75b1d" }
-midnight-proofs = { git = "https://github.com/EYBlockchain/midfall", rev = "20b048568ec30749338710cb842d7932efa75b1d" }
-midnight-zk-stdlib = { git = "https://github.com/EYBlockchain/midfall", rev = "20b048568ec30749338710cb842d7932efa75b1d" }
+midnight-circuits = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
+midnight-aggregator = { package = "midnight-aggregation", git = "https://github.com/midnightntwrk/midnight-zk", branch = "main", optional = true }
+midnight-curves = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
+midnight-proofs = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
+midnight-zk-stdlib = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
 sha2 = "0.10.9"
 rand = "0.8"
 rand_chacha = "0.3"
@@ -38,7 +38,7 @@ truncated-challenges = [
 aggregation = ["midnight-aggregator"]
 
 [patch.crates-io]
-midnight-circuits = { git = "https://github.com/EYBlockchain/midfall", rev = "20b048568ec30749338710cb842d7932efa75b1d" }
-midnight-curves = { git = "https://github.com/EYBlockchain/midfall", rev = "20b048568ec30749338710cb842d7932efa75b1d" }
-midnight-proofs = { git = "https://github.com/EYBlockchain/midfall", rev = "20b048568ec30749338710cb842d7932efa75b1d" }
-midnight-zk-stdlib = { git = "https://github.com/EYBlockchain/midfall", rev = "20b048568ec30749338710cb842d7932efa75b1d" }
+midnight-circuits = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
+midnight-curves = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
+midnight-proofs = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
+midnight-zk-stdlib = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }

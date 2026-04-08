@@ -469,6 +469,8 @@ fn run() -> Result<(), AppError> {
     const NUM_SEED_DEPOSITS: usize = 50;
     const NUM_TRANSFERS: usize = 120;
 
+    ivc::numa::configure_global_rayon_pool();
+
     // --- Setup leaf circuit keys ---
     let srs =
         trusted_setup::filecoin_srs_agg(K).map_err(|e| AppError::TrustedSetup(err_string(e)))?;

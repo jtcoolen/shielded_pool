@@ -26,6 +26,7 @@
 pub mod circuit;
 pub mod ctx;
 pub mod engine;
+pub mod numa;
 
 // Re-export the public API.
 pub use circuit::IvcDeciderCircuit;

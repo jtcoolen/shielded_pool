@@ -39,6 +39,7 @@ use super::{
 };
 
 const LEAF_CLIENT_ARITY: usize = 4;
+const ENV_LEAF_CONCURRENCY: &str = "SHIELDED_POOL_LEAF_CONCURRENCY";
 
 ////////////////////////////////////////////////////////////////////////////////
 // Errors
@@ -408,11 +409,22 @@ impl IvcProver {
             });
         }
 
-        // 1. Prove leaves in parallel
-        let leaf_nodes: Vec<TreeNode<Vec<F>>> = leaf_plans
-            .into_par_iter()
-            .map(|plan| prove_leaf(setup, client_srs, client_vk, leaf_step, plan))
-            .collect::<Result<Vec<_>, _>>()?;
+        // 1. Prove leaves in parallel (optionally throttled by env)
+        let leaf_parallelism = leaf_concurrency_limit(leaf_plans.len());
+        let mut plans_iter = leaf_plans.into_iter();
+        let mut leaf_nodes: Vec<TreeNode<Vec<F>>> = Vec::with_capacity(setup.num_leaves);
+
+        loop {
+            let batch: Vec<_> = plans_iter.by_ref().take(leaf_parallelism).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let mut batch_nodes = batch
+                .into_par_iter()
+                .map(|plan| prove_leaf(setup, client_srs, client_vk, leaf_step, plan))
+                .collect::<Result<Vec<_>, _>>()?;
+            leaf_nodes.append(&mut batch_nodes);
+        }
 
         // 2. Build internal levels up to the top pair
         let (_child_level, top_pair) =
@@ -434,6 +446,16 @@ impl IvcProver {
             root_state,
         })
     }
+}
+
+fn leaf_concurrency_limit(total_leaves: usize) -> usize {
+    let default = rayon::current_num_threads().max(1);
+    let requested = std::env::var(ENV_LEAF_CONCURRENCY)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default);
+    requested.min(total_leaves.max(1))
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -653,34 +675,151 @@ fn build_to_top_pair<Fo: FoldStep>(
                 return Ok((level, (left, right)));
             }
             _ => {
-                if nodes.len() % 4 != 0 {
-                    return Err(AggregationError::FoldValidation(format!(
-                        "internal level {level} requires node count divisible by 4, got {}",
-                        nodes.len()
-                    )));
+                if nodes.len() >= 32 && nodes.len() % 16 == 0 {
+                    nodes =
+                        reduce_two_levels_pipelined(setup, fold_step, host_merge, level, nodes)?;
+                    level += 2;
+                } else {
+                    let parent_level = level + 1;
+                    nodes =
+                        reduce_one_level(setup, fold_step, host_merge, parent_level, level, nodes)?;
+                    level = parent_level;
                 }
-                let parent_level = level + 1;
-                let quads: Vec<_> = nodes.chunks_exact(4).collect();
-                nodes = quads
-                    .par_iter()
-                    .map(|quad| {
-                        prove_node(
-                            setup,
-                            fold_step,
-                            host_merge,
-                            parent_level,
-                            level,
-                            &quad[0],
-                            &quad[1],
-                            &quad[2],
-                            &quad[3],
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                level = parent_level;
             }
         }
     }
+}
+
+fn reduce_one_level<Fo: FoldStep>(
+    setup: &IvcSetup,
+    fold_step: &Fo,
+    host_merge: &(impl Fn(&[F], &[F]) -> Vec<F> + Send + Sync),
+    parent_level: usize,
+    child_level: usize,
+    nodes: Vec<TreeNode<Vec<F>>>,
+) -> Result<Vec<TreeNode<Vec<F>>>, AggregationError> {
+    if nodes.len() % 4 != 0 {
+        return Err(AggregationError::FoldValidation(format!(
+            "internal level {child_level} requires node count divisible by 4, got {}",
+            nodes.len()
+        )));
+    }
+
+    let quads: Vec<_> = nodes.chunks_exact(4).collect();
+    quads
+        .par_iter()
+        .map(|quad| {
+            prove_node(
+                setup,
+                fold_step,
+                host_merge,
+                parent_level,
+                child_level,
+                &quad[0],
+                &quad[1],
+                &quad[2],
+                &quad[3],
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn reduce_two_levels_pipelined<Fo: FoldStep>(
+    setup: &IvcSetup,
+    fold_step: &Fo,
+    host_merge: &(impl Fn(&[F], &[F]) -> Vec<F> + Send + Sync),
+    child_level: usize,
+    nodes: Vec<TreeNode<Vec<F>>>,
+) -> Result<Vec<TreeNode<Vec<F>>>, AggregationError> {
+    if nodes.len() % 16 != 0 {
+        return Err(AggregationError::FoldValidation(format!(
+            "pipelined internal level {child_level} requires node count divisible by 16, got {}",
+            nodes.len()
+        )));
+    }
+
+    let parent_level = child_level + 1;
+    let grandparent_level = child_level + 2;
+    let groups: Vec<_> = nodes.chunks_exact(16).collect();
+
+    groups
+        .par_iter()
+        .map(|group| {
+            let (p0, p1) = rayon::join(
+                || {
+                    prove_node(
+                        setup,
+                        fold_step,
+                        host_merge,
+                        parent_level,
+                        child_level,
+                        &group[0],
+                        &group[1],
+                        &group[2],
+                        &group[3],
+                    )
+                },
+                || {
+                    prove_node(
+                        setup,
+                        fold_step,
+                        host_merge,
+                        parent_level,
+                        child_level,
+                        &group[4],
+                        &group[5],
+                        &group[6],
+                        &group[7],
+                    )
+                },
+            );
+            let (p2, p3) = rayon::join(
+                || {
+                    prove_node(
+                        setup,
+                        fold_step,
+                        host_merge,
+                        parent_level,
+                        child_level,
+                        &group[8],
+                        &group[9],
+                        &group[10],
+                        &group[11],
+                    )
+                },
+                || {
+                    prove_node(
+                        setup,
+                        fold_step,
+                        host_merge,
+                        parent_level,
+                        child_level,
+                        &group[12],
+                        &group[13],
+                        &group[14],
+                        &group[15],
+                    )
+                },
+            );
+
+            let p0 = p0?;
+            let p1 = p1?;
+            let p2 = p2?;
+            let p3 = p3?;
+
+            prove_node(
+                setup,
+                fold_step,
+                host_merge,
+                grandparent_level,
+                parent_level,
+                &p0,
+                &p1,
+                &p2,
+                &p3,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 ////////////////////////////////////////////////////////////////////////////////

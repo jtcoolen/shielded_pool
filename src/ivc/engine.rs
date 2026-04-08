@@ -19,6 +19,7 @@ use midnight_circuits::{
 use midnight_curves::Bls12;
 use midnight_proofs::{
     circuit::Value,
+    dev::MockProver,
     plonk::{
         Circuit, ConstraintSystem, ProvingKey, VerifyingKey, create_proof, keygen_pk,
         keygen_vk_with_k,
@@ -39,6 +40,24 @@ use super::{
 };
 
 const LEAF_CLIENT_ARITY: usize = 4;
+
+fn neutralize_acc_for_client_children(acc: &Acc) -> Acc {
+    fn neutralized_msm(msm: Msm<S>) -> Msm<S> {
+        let bases = msm.bases();
+        let scalars = vec![F::ZERO; bases.len()];
+        let fixed: BTreeMap<String, F> = msm
+            .fixed_base_scalars()
+            .keys()
+            .cloned()
+            .map(|k| (k, F::ZERO))
+            .collect();
+        Msm::new(&bases, &scalars, &fixed)
+    }
+
+    let mut out = Accumulator::new(neutralized_msm(acc.lhs()), neutralized_msm(acc.rhs()));
+    out.collapse();
+    out
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Errors
@@ -282,7 +301,7 @@ where
 
         let start = Instant::now();
         let (vk, pk) = if level == 1 {
-            let circuit = IvcLeafCircuit::<L, 19> {
+            let circuit = IvcLeafCircuit::<L, 20> {
                 step: leaf_step.clone(),
                 client_items: [
                     Value::unknown(),
@@ -450,7 +469,7 @@ fn prove_leaf<L: LeafStep>(
     let leaf_keys = setup.agg_store.get(1);
     let srs = &setup.agg_srs_leaf;
 
-    let circuit = IvcLeafCircuit::<L, 19> {
+    let circuit = IvcLeafCircuit::<L, 20> {
         step: leaf_step.clone(),
         client_items: [
             Value::known(plan.clients[0].public_inputs.clone()),
@@ -491,20 +510,52 @@ fn prove_leaf<L: LeafStep>(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    if plan.index == 0 {
+        for (i, acc) in proof_accs.iter().enumerate() {
+            eprintln!(
+                "client proof_acc[{i}] rhs_fixed_keys={}",
+                acc.rhs().fixed_base_scalars().len()
+            );
+        }
+    }
+
+    let neutral_trivial = neutralize_acc_for_client_children(&setup.trivial_combined);
     let mut fold_parts = Vec::with_capacity(LEAF_CLIENT_ARITY * 2);
     for acc in proof_accs {
         fold_parts.push(acc);
-        fold_parts.push(setup.trivial_combined.clone());
+        fold_parts.push(neutral_trivial.clone());
     }
     let pi_acc = collapse(Accumulator::accumulate(&fold_parts));
 
     let mut full_state = plan.app_state.clone();
     full_state.push(plan.merkle_digest);
-    let pi_fields: Vec<F> = full_state
-        .iter()
-        .copied()
-        .chain(AssignedAccumulator::as_public_input(&pi_acc))
-        .collect();
+    let pi_acc_fields = AssignedAccumulator::as_public_input(&pi_acc);
+    if plan.index == 0 {
+        eprintln!(
+            "leaf debug: fixed_base_names={}, trivial_combined_rhs_fixed={}, pi_acc_rhs_fixed={}, pi_acc_fields={}, total_pi={}",
+            setup.fixed_base_names.len(),
+            setup.trivial_combined.rhs().fixed_base_scalars().len(),
+            pi_acc.rhs().fixed_base_scalars().len(),
+            pi_acc_fields.len(),
+            full_state.len() + pi_acc_fields.len()
+        );
+    }
+    let pi_fields: Vec<F> = full_state.iter().copied().chain(pi_acc_fields).collect();
+
+    if plan.index == 0 {
+        match MockProver::run(20, &circuit, vec![vec![], pi_fields.clone()]) {
+            Ok(prover) => {
+                if let Err(errs) = prover.verify() {
+                    eprintln!("leaf mock prover unsatisfied: {:?}", errs);
+                } else {
+                    eprintln!("leaf mock prover satisfied");
+                }
+            }
+            Err(e) => {
+                eprintln!("leaf mock prover failed to run: {:?}", e);
+            }
+        }
+    }
 
     let start = Instant::now();
     let proof = create_agg_proof(srs, leaf_keys.pk.as_ref(), circuit, &pi_fields)?;
@@ -518,6 +569,7 @@ fn prove_leaf<L: LeafStep>(
         &proof,
         &pi_fields,
     )?;
+    println!("hello");
 
     Ok(TreeNode {
         app_state: plan.app_state,
@@ -708,18 +760,48 @@ fn verify_and_extract(
     proof: &[u8],
     public_inputs: &[F],
 ) -> Result<Acc, AggregationError> {
-    let mut transcript = CircuitTranscript::<PoseidonState<F>>::init_from_bytes(proof);
+    let run_prepare = |committed: &[&[C]], instances: &[&[&[F]]]| {
+        let mut transcript = CircuitTranscript::<PoseidonState<F>>::init_from_bytes(proof);
+        midnight_proofs::plonk::prepare::<
+            F,
+            KZGCommitmentScheme<E>,
+            CircuitTranscript<PoseidonState<F>>,
+        >(vk, committed, instances, &mut transcript)
+    };
+
     let committed: &[&[C]] = &[&[C::identity()]];
     let instances: &[&[&[F]]] = &[&[public_inputs]];
 
-    let dual_msm = midnight_proofs::plonk::prepare::<
-        F,
-        KZGCommitmentScheme<E>,
-        CircuitTranscript<PoseidonState<F>>,
-    >(vk, committed, instances, &mut transcript)
-    .map_err(|_| AggregationError::PrepareFailed)?;
+    let dual_msm =
+        run_prepare(committed, instances).map_err(|_| AggregationError::PrepareFailed)?;
 
     if !dual_msm.clone().check(&srs.verifier_params()) {
+        let empty_committed: &[&[C]] = &[&[]];
+        let empty_instances: &[&[&[F]]] = &[&[]];
+        let two_instance_cols: &[&[&[F]]] = &[&[&[], public_inputs]];
+
+        let alt_empty_committed = run_prepare(empty_committed, instances)
+            .map(|m| m.check(&srs.verifier_params()))
+            .unwrap_or(false);
+        let alt_no_instances = run_prepare(committed, empty_instances)
+            .map(|m| m.check(&srs.verifier_params()))
+            .unwrap_or(false);
+        let alt_two_instance_cols = run_prepare(committed, two_instance_cols)
+            .map(|m| m.check(&srs.verifier_params()))
+            .unwrap_or(false);
+        let alt_empty_committed_two_instances = run_prepare(empty_committed, two_instance_cols)
+            .map(|m| m.check(&srs.verifier_params()))
+            .unwrap_or(false);
+
+        eprintln!(
+            "dual_msm check failed for {vk_name}: proof_len={}, pi_len={}, alt(empty_committed+1inst)={}, alt(committed+0inst)={}, alt(committed+2inst)={}, alt(empty_committed+2inst)={}",
+            proof.len(),
+            public_inputs.len(),
+            alt_empty_committed,
+            alt_no_instances,
+            alt_two_instance_cols,
+            alt_empty_committed_two_instances
+        );
         return Err(AggregationError::DualMsmFailed);
     }
 
@@ -775,20 +857,15 @@ fn load_srs(k: u32) -> Result<ParamsKZG<Bls12>, AggregationError> {
 ////////////////////////////////////////////////////////////////////////////////
 
 fn compute_fixed_base_names_for_vk(name: &str, cs: &ConstraintSystem<F>) -> Vec<String> {
-    let mut names = vec!["com_instance".to_string(), "~G".to_string()];
-    names.extend(midnight_circuits::verifier::fixed_base_names::<S>(
+    midnight_circuits::verifier::fixed_base_names::<S>(
         name,
         cs.num_fixed_columns() + cs.num_selectors(),
         cs.permutation().columns.len(),
-    ));
-    names
+    )
 }
 
 fn compute_fixed_bases_for_vk(name: &str, vk: &Vk) -> BTreeMap<String, C> {
-    let mut fb = BTreeMap::new();
-    fb.insert("com_instance".to_string(), C::identity());
-    fb.extend(midnight_circuits::verifier::fixed_bases::<S>(name, vk));
-    fb
+    midnight_circuits::verifier::fixed_bases::<S>(name, vk)
 }
 
 fn compute_all_fixed_base_names(

@@ -299,9 +299,7 @@ fn prepare_proof_acc(
     pi: &[AssignedNative<F>],
     proof: Value<Vec<u8>>,
 ) -> Result<AssignedAccumulator<S>, Error> {
-    let mut a = ctx
-        .verifier
-        .prepare(layouter, vk, &[id], &[pi], proof)?;
+    let mut a = ctx.verifier.prepare(layouter, vk, &[id], &[pi], proof)?;
     a.collapse(layouter, &ctx.curve, &ctx.scalar)?;
     Ok(a)
 }

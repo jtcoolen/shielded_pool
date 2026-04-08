@@ -5,6 +5,7 @@ use rayon::ThreadPoolBuilder;
 
 const ENV_RAYON_THREADS: &str = "SHIELDED_POOL_RAYON_THREADS";
 const ENV_NUMA_NODE: &str = "SHIELDED_POOL_NUMA_NODE";
+const ENV_NUMA_NODES: &str = "SHIELDED_POOL_NUMA_NODES";
 
 #[derive(Clone, Copy, Debug)]
 struct NumaConfig {
@@ -24,30 +25,51 @@ impl NumaConfig {
                 .and_then(|v| v.parse::<usize>().ok()),
         }
     }
+
+    fn target_nodes(self) -> Option<Vec<usize>> {
+        let multi = std::env::var(ENV_NUMA_NODES)
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|x| x.trim().parse::<usize>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|nodes| !nodes.is_empty());
+
+        multi.or_else(|| self.target_node.map(|n| vec![n]))
+    }
 }
 
-pub fn configure_global_rayon_pool() {
+pub fn configure_global_rayon_pool(max_threads_hint: Option<usize>) {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         let cfg = NumaConfig::from_env();
-        let mut candidate_cores = candidate_cores(cfg.target_node);
-        let default_threads = if candidate_cores.is_empty() {
-            available_parallelism()
-        } else {
-            candidate_cores.len()
-        };
-        let num_threads = cfg.requested_threads.unwrap_or(default_threads).max(1);
+        let target_nodes = cfg.target_nodes();
+        let max_threads_hint = max_threads_hint.filter(|&n| n > 0);
+        let mut candidate_cores = target_nodes.as_deref().and_then(candidate_cores_for_nodes);
+        let default_threads = candidate_cores
+            .as_ref()
+            .map(|cores| cores.len())
+            .unwrap_or_else(available_parallelism);
+        let mut num_threads = cfg.requested_threads.unwrap_or(default_threads).max(1);
+        if cfg.requested_threads.is_none() {
+            if let Some(hint) = max_threads_hint {
+                num_threads = num_threads.min(hint.max(1));
+            }
+        }
+        if let Some(cores) = candidate_cores.as_ref() {
+            num_threads = num_threads.min(cores.len().max(1));
+        }
 
-        if !candidate_cores.is_empty() {
-            candidate_cores = expand_core_plan(candidate_cores, num_threads);
+        if let Some(cores) = candidate_cores.as_mut() {
+            *cores = expand_core_plan(cores.clone(), num_threads);
         }
 
         let mut builder = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("ivc-rayon-{i}"));
 
-        if !candidate_cores.is_empty() {
-            let pin_plan = candidate_cores;
+        if let Some(pin_plan) = candidate_cores {
             builder = builder.start_handler(move |idx| {
                 let core = pin_plan[idx % pin_plan.len()];
                 let _ = core_affinity::set_for_current(core);
@@ -64,26 +86,59 @@ fn available_parallelism() -> usize {
         .unwrap_or(1)
 }
 
-fn candidate_cores(target_node: Option<usize>) -> Vec<core_affinity::CoreId> {
+fn candidate_cores_for_nodes(target_nodes: &[usize]) -> Option<Vec<core_affinity::CoreId>> {
+    if target_nodes.is_empty() {
+        return None;
+    }
+
     let all_cores = core_affinity::get_core_ids().unwrap_or_default();
     if all_cores.is_empty() {
-        return all_cores;
+        return None;
     }
 
     #[cfg(target_os = "linux")]
     {
         if let Some(groups) = linux_numa_core_groups(&all_cores) {
-            if let Some(node) = target_node {
-                if let Some((_, cores)) = groups.iter().find(|(id, _)| *id == node) {
-                    return cores.clone();
+            let mut per_node = Vec::new();
+            for target in target_nodes {
+                if let Some((_, cores)) = groups.iter().find(|(id, _)| id == target) {
+                    per_node.push(cores.clone());
                 }
             }
-            return groups.into_iter().flat_map(|(_, cores)| cores).collect();
+            return interleave_cores(per_node);
         }
+        return None;
     }
 
-    let _ = target_node;
-    all_cores
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = target_nodes;
+        Some(all_cores)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn interleave_cores(
+    per_node: Vec<Vec<core_affinity::CoreId>>,
+) -> Option<Vec<core_affinity::CoreId>> {
+    if per_node.is_empty() {
+        return None;
+    }
+
+    let max_len = per_node.iter().map(Vec::len).max().unwrap_or(0);
+    if max_len == 0 {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    for i in 0..max_len {
+        for cores in &per_node {
+            if let Some(core) = cores.get(i) {
+                out.push(*core);
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn expand_core_plan(

@@ -469,7 +469,7 @@ fn run() -> Result<(), AppError> {
     const NUM_SEED_DEPOSITS: usize = 50;
     const NUM_TRANSFERS: usize = 120;
 
-    ivc::numa::configure_global_rayon_pool();
+    ivc::numa::configure_global_rayon_pool(Some(BATCH_SIZE / 4));
 
     // --- Setup leaf circuit keys ---
     let srs =

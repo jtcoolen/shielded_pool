@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-midnight-circuits = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
-midnight-aggregator = { package = "midnight-aggregation", git = "https://github.com/midnightntwrk/midnight-zk", branch = "main", optional = true }
-midnight-curves = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
-midnight-proofs = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
-midnight-zk-stdlib = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
+midnight-circuits = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-aggregator = { package = "midnight-aggregation", git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion", optional = true }
+midnight-curves = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-proofs = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-zk-stdlib = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
 sha2 = "0.10.9"
 rand = "0.8"
 rand_chacha = "0.3"
@@ -42,7 +42,14 @@ fewer-point-sets = [
 aggregation = ["midnight-aggregator"]
 
 [patch.crates-io]
-midnight-circuits = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
-midnight-curves = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
-midnight-proofs = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
-midnight-zk-stdlib = { git = "https://github.com/midnightntwrk/midnight-zk", branch = "main" }
+midnight-circuits = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-curves = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-proofs = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-zk-stdlib = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+
+[patch."https://github.com/midnightntwrk/midnight-zk"]
+midnight-aggregation = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-circuits = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-curves = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-proofs = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }
+midnight-zk-stdlib = { git = "https://github.com/jtcoolen/midnight-zk", branch = "fix/fixed-vk-selector-conversion" }

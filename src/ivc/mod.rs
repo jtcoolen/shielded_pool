@@ -68,6 +68,7 @@ pub type IdPoint = AssignedForeignPoint<
 
 pub type Map = MapMt<F, PoseidonChip<F>>;
 pub type Acc = Accumulator<S>;
+pub const LEAF_CLIENT_ARITY: usize = 6;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Core types
@@ -147,7 +148,7 @@ pub trait HostState: Clone + Debug + Send + Sync {
 // Step function traits
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Leaf step: processes four client proof instances.
+/// Leaf step: processes six client proof instances.
 ///
 /// The framework assigns the client PIs, hashes them for the Merkle
 /// commitment, and handles recursive partial verification.  The step
@@ -170,6 +171,8 @@ pub trait LeafStep: Clone + Send + Sync {
         p1: &[AssignedNative<F>],
         p2: &[AssignedNative<F>],
         p3: &[AssignedNative<F>],
+        p4: &[AssignedNative<F>],
+        p5: &[AssignedNative<F>],
         witness: Value<Self::Witness>,
     ) -> Result<Vec<AssignedNative<F>>, Error>;
 }

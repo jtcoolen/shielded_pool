@@ -31,12 +31,11 @@ use midnight_proofs::{
 use midnight_circuits::hash::poseidon::PoseidonChip;
 
 use super::{
-    Acc, C, ClientProof, E, F, FoldStep, LeafStep, NodeState, S, TreeNode, TreeResult, VkData,
+    Acc, C, ClientProof, E, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep, NodeState, S, TreeNode,
+    TreeResult, VkData,
     circuit::{FrameworkWitness, IvcLeafCircuit, IvcNodeCircuit},
     ctx::configure_ivc_circuit,
 };
-
-const LEAF_CLIENT_ARITY: usize = 4;
 
 fn neutralize_acc_for_client_children(acc: &Acc) -> Acc {
     fn neutralized_msm(msm: Msm<S>) -> Msm<S> {
@@ -75,8 +74,8 @@ pub enum AggregationError {
     #[error("length mismatch: expected {expected}, got {got}")]
     LenMismatch { expected: usize, got: usize },
 
-    #[error("need at least 8 client proofs for merged final agg (got {0})")]
-    NeedAtLeastEight(usize),
+    #[error("need at least {min} client proofs for two leaves (got {got})")]
+    NeedAtLeastForTwoLeaves { min: usize, got: usize },
 
     #[error("host-side leaf validation failed: {0}")]
     LeafValidation(String),
@@ -242,7 +241,10 @@ where
 
     let num_leaves = num_client_proofs / LEAF_CLIENT_ARITY;
     if num_leaves < 2 {
-        return Err(AggregationError::NeedAtLeastEight(num_client_proofs));
+        return Err(AggregationError::NeedAtLeastForTwoLeaves {
+            min: LEAF_CLIENT_ARITY * 2,
+            got: num_client_proofs,
+        });
     }
 
     let mut n = num_leaves;
@@ -307,24 +309,16 @@ where
                     Value::unknown(),
                     Value::unknown(),
                     Value::unknown(),
+                    Value::unknown(),
+                    Value::unknown(),
                 ],
                 witness: Value::unknown(),
                 client_pi_width,
                 fw: FrameworkWitness {
                     child_vk: child_vk_data,
                     child_vk_name,
-                    child_proofs: vec![
-                        Value::unknown(),
-                        Value::unknown(),
-                        Value::unknown(),
-                        Value::unknown(),
-                    ],
-                    child_pi_accs: vec![
-                        Value::unknown(),
-                        Value::unknown(),
-                        Value::unknown(),
-                        Value::unknown(),
-                    ],
+                    child_proofs: vec![Value::unknown(); LEAF_CLIENT_ARITY],
+                    child_pi_accs: vec![Value::unknown(); LEAF_CLIENT_ARITY],
                     fixed_base_names: fixed_base_names.clone(),
                 },
             };
@@ -474,6 +468,8 @@ fn prove_leaf<L: LeafStep>(
             Value::known(plan.clients[1].public_inputs.clone()),
             Value::known(plan.clients[2].public_inputs.clone()),
             Value::known(plan.clients[3].public_inputs.clone()),
+            Value::known(plan.clients[4].public_inputs.clone()),
+            Value::known(plan.clients[5].public_inputs.clone()),
         ],
         witness: Value::known(plan.witness),
         client_pi_width: setup.client_pi_width,
@@ -510,7 +506,12 @@ fn prove_leaf<L: LeafStep>(
 
     if plan.index == 0 {
         for (i, acc) in proof_accs.iter().enumerate() {
-            let keys = acc.rhs().fixed_base_scalars().keys().cloned().collect::<Vec<_>>();
+            let keys = acc
+                .rhs()
+                .fixed_base_scalars()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
             let overlap = keys
                 .iter()
                 .filter(|k| setup.fixed_base_names.contains(*k))
@@ -709,7 +710,12 @@ fn build_to_top_pair<Fo: FoldStep>(
     loop {
         match nodes.len() {
             0 => return Err(AggregationError::Empty),
-            1 => return Err(AggregationError::NeedAtLeastEight(LEAF_CLIENT_ARITY * 2)),
+            1 => {
+                return Err(AggregationError::NeedAtLeastForTwoLeaves {
+                    min: LEAF_CLIENT_ARITY * 2,
+                    got: LEAF_CLIENT_ARITY,
+                });
+            }
             2 => {
                 let right = nodes.pop().unwrap();
                 let left = nodes.pop().unwrap();
@@ -916,10 +922,7 @@ fn merge_all_fixed_bases(
     fb
 }
 
-fn build_trivial_combined(
-    leaf_names: &[String],
-    store: &AggKeyStore,
-) -> Acc {
+fn build_trivial_combined(leaf_names: &[String], store: &AggKeyStore) -> Acc {
     fn trivial(names: &[String]) -> Acc {
         let fixed: BTreeMap<String, F> = names.iter().map(|n| (n.clone(), F::ZERO)).collect();
         Accumulator::<S>::new(

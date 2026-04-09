@@ -11,7 +11,7 @@ use midnight_proofs::{
 };
 
 use super::{
-    Acc, AssignedNative, DeciderStep, F, FoldStep, LeafStep, VkData,
+    Acc, AssignedNative, DeciderStep, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep, VkData,
     ctx::{
         AggCircuitConfig, IvcCtx, RpvInput, configure_ivc_circuit, expose_node_outputs,
         recursive_partial_verify,
@@ -100,15 +100,15 @@ fn synthesize_node<const K: u32, L: Layouter<F>>(
 ////////////////////////////////////////////////////////////////////////////////
 // IvcLeafCircuit<L, K>
 //
-// Subcircuit at the leaves of the binary tree.  Verifies four raw client
+// Subcircuit at the leaves of the binary tree.  Verifies six raw client
 // proofs, runs the application's LeafStep, and produces the base Merkle
-// digest H(H(h(x0), h(x1)), H(h(x2), h(x3))).
+// digest H(H(H(h(x0), h(x1)), H(h(x2), h(x3))), H(h(x4), h(x5))).
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone)]
 pub struct IvcLeafCircuit<L: LeafStep, const K: u32> {
     pub(crate) step: L,
-    pub(crate) client_items: [Value<Vec<F>>; 4],
+    pub(crate) client_items: [Value<Vec<F>>; LEAF_CLIENT_ARITY],
     pub(crate) witness: Value<L::Witness>,
     pub(crate) client_pi_width: usize,
     pub(crate) fw: FrameworkWitness,
@@ -123,6 +123,8 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
         Self {
             step: self.step.clone(),
             client_items: [
+                Value::unknown(),
+                Value::unknown(),
                 Value::unknown(),
                 Value::unknown(),
                 Value::unknown(),
@@ -159,18 +161,25 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
                 let p1 = assign_value_vec(ctx, layouter, &items[1], width)?;
                 let p2 = assign_value_vec(ctx, layouter, &items[2], width)?;
                 let p3 = assign_value_vec(ctx, layouter, &items[3], width)?;
+                let p4 = assign_value_vec(ctx, layouter, &items[4], width)?;
+                let p5 = assign_value_vec(ctx, layouter, &items[5], width)?;
 
                 // 2. Application step (only sees client PIs)
-                let app_state = step.synthesize(ctx, layouter, &p0, &p1, &p2, &p3, witness)?;
+                let app_state =
+                    step.synthesize(ctx, layouter, &p0, &p1, &p2, &p3, &p4, &p5, witness)?;
 
                 // 3. Framework: Merkle hashes
                 let h0 = ctx.hash_many(layouter, &p0)?;
                 let h1 = ctx.hash_many(layouter, &p1)?;
                 let h2 = ctx.hash_many(layouter, &p2)?;
                 let h3 = ctx.hash_many(layouter, &p3)?;
+                let h4 = ctx.hash_many(layouter, &p4)?;
+                let h5 = ctx.hash_many(layouter, &p5)?;
                 let h01 = ctx.hash2(layouter, &h0, &h1)?;
                 let h23 = ctx.hash2(layouter, &h2, &h3)?;
-                let digest = ctx.hash2(layouter, &h01, &h23)?;
+                let h45 = ctx.hash2(layouter, &h4, &h5)?;
+                let h0123 = ctx.hash2(layouter, &h01, &h23)?;
+                let digest = ctx.hash2(layouter, &h0123, &h45)?;
 
                 // 4. Full state = [app_state..., digest]
                 let mut full = app_state;
@@ -178,7 +187,7 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
 
                 Ok(StepPhaseOutput {
                     full_state: full,
-                    child_pis: vec![p0, p1, p2, p3],
+                    child_pis: vec![p0, p1, p2, p3, p4, p5],
                 })
             },
         )

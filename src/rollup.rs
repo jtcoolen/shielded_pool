@@ -13,8 +13,8 @@ use midnight_proofs::circuit::{Layouter, Value};
 use midnight_proofs::plonk::Error;
 
 use crate::ivc::{
-    self, ClientProof, DeciderStep, F, FoldStep, HostLeafStep, HostState, IvcCtx, LeafStep, Map,
-    MapGadget, engine::AggregationError,
+    self, ClientProof, DeciderStep, F, FoldStep, HostLeafStep, HostState, IvcCtx,
+    LEAF_CLIENT_ARITY, LeafStep, Map, MapGadget, engine::AggregationError,
 };
 
 use midnight_circuits::instructions::map::MapCPU;
@@ -94,7 +94,7 @@ impl SendableMap {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Leaf step: processes four client transactions
+// Leaf step: processes six client transactions
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone)]
@@ -119,6 +119,8 @@ impl LeafStep for RollupLeafStep {
         p1: &[AssignedNative<F>],
         p2: &[AssignedNative<F>],
         p3: &[AssignedNative<F>],
+        p4: &[AssignedNative<F>],
+        p5: &[AssignedNative<F>],
         witness: Value<Self::Witness>,
     ) -> Result<Vec<AssignedNative<F>>, Error> {
         let one = ctx.one(layouter)?;
@@ -145,7 +147,7 @@ impl LeafStep for RollupLeafStep {
         let roots_set_root = roots_set.succinct_repr();
 
         // Check each tx root ∈ historic roots set
-        let roots = [&p0[0], &p1[0], &p2[0], &p3[0]];
+        let roots = [&p0[0], &p1[0], &p2[0], &p3[0], &p4[0], &p5[0]];
         for root in roots {
             check_membership(ctx, layouter, &roots_set, root, &one)?;
         }
@@ -183,6 +185,24 @@ impl LeafStep for RollupLeafStep {
             &mut commit_map,
             &mut null_map,
             p3,
+            &zero,
+            &one,
+        )?;
+        apply_effects(
+            ctx,
+            layouter,
+            &mut commit_map,
+            &mut null_map,
+            p4,
+            &zero,
+            &one,
+        )?;
+        apply_effects(
+            ctx,
+            layouter,
+            &mut commit_map,
+            &mut null_map,
+            p5,
             &zero,
             &one,
         )?;
@@ -399,7 +419,7 @@ use crate::ivc::engine::LeafPlan;
 
 /// Build leaf plans from a batch of client proofs.
 ///
-/// Each quad `(4i..4i+3)` of client proofs becomes one leaf plan.
+/// Each chunk of 6 client proofs becomes one leaf plan.
 /// The running commitment/nullifier maps are updated sequentially so
 /// that each leaf sees the correct pre-state.
 pub fn plan_rollup_leaves(
@@ -413,16 +433,16 @@ pub fn plan_rollup_leaves(
     let mut nmap = pre_nullifier_map;
     let roots_set_root = pre_roots_set_map.succinct_repr();
 
-    if client_proofs.len() % 4 != 0 {
-        return Err(AggregationError::LeafValidation(
-            "client proofs length must be divisible by 4".into(),
-        ));
+    if client_proofs.len() % LEAF_CLIENT_ARITY != 0 {
+        return Err(AggregationError::LeafValidation(format!(
+            "client proofs length must be divisible by {LEAF_CLIENT_ARITY}"
+        )));
     }
 
-    let mut plans = Vec::with_capacity(client_proofs.len() / 4);
+    let mut plans = Vec::with_capacity(client_proofs.len() / LEAF_CLIENT_ARITY);
 
-    for (i, quad) in client_proofs.chunks_exact(4).enumerate() {
-        for (j, cp) in quad.iter().enumerate() {
+    for (i, chunk) in client_proofs.chunks_exact(LEAF_CLIENT_ARITY).enumerate() {
+        for (j, cp) in chunk.iter().enumerate() {
             if pre_roots_set_map.get(&cp.public_inputs[0]) == F::ZERO {
                 return Err(AggregationError::LeafValidation(format!(
                     "leaf {i} tx {j} root not in roots set"
@@ -435,7 +455,7 @@ pub fn plan_rollup_leaves(
         let pre_cmap_for_witness = cmap.clone();
         let pre_nmap_for_witness = nmap.clone();
 
-        for cp in quad {
+        for cp in chunk {
             host_apply_effects(&mut cmap, &mut nmap, &cp.public_inputs)?;
         }
 
@@ -448,17 +468,21 @@ pub fn plan_rollup_leaves(
             block_level,
         ];
 
-        let h01 = host_hash_pair(quad[0].instance_hash, quad[1].instance_hash);
-        let h23 = host_hash_pair(quad[2].instance_hash, quad[3].instance_hash);
-        let merkle_digest = host_hash_pair(h01, h23);
+        let h01 = host_hash_pair(chunk[0].instance_hash, chunk[1].instance_hash);
+        let h23 = host_hash_pair(chunk[2].instance_hash, chunk[3].instance_hash);
+        let h45 = host_hash_pair(chunk[4].instance_hash, chunk[5].instance_hash);
+        let h0123 = host_hash_pair(h01, h23);
+        let merkle_digest = host_hash_pair(h0123, h45);
 
         plans.push(LeafPlan {
             index: i,
             clients: [
-                quad[0].clone(),
-                quad[1].clone(),
-                quad[2].clone(),
-                quad[3].clone(),
+                chunk[0].clone(),
+                chunk[1].clone(),
+                chunk[2].clone(),
+                chunk[3].clone(),
+                chunk[4].clone(),
+                chunk[5].clone(),
             ],
             app_state,
             merkle_digest,

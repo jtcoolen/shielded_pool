@@ -42,6 +42,19 @@ pub fn configure_rayon_global() {
     });
 }
 
+pub fn static_block_size(len: usize) -> usize {
+    static_block_size_with_threads(len, rayon::current_num_threads())
+}
+
+fn static_block_size_with_threads(len: usize, threads: usize) -> usize {
+    if len == 0 {
+        return 1;
+    }
+    let threads = threads.max(1);
+    let workers = len.min(threads);
+    len.div_ceil(workers)
+}
+
 fn rayon_thread_count(max_threads: usize) -> usize {
     std::env::var("SHIELDED_POOL_RAYON_THREADS")
         .ok()
@@ -148,6 +161,22 @@ fn parse_linux_cpu_list(raw: &str) -> Option<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn static_block_size_balances_even_work() {
+        assert_eq!(super::static_block_size_with_threads(120, 12), 10);
+    }
+
+    #[test]
+    fn static_block_size_balances_uneven_work() {
+        assert_eq!(super::static_block_size_with_threads(121, 12), 11);
+    }
+
+    #[test]
+    fn static_block_size_avoids_zero() {
+        assert_eq!(super::static_block_size_with_threads(0, 12), 1);
+        assert_eq!(super::static_block_size_with_threads(1, 144), 1);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_linux_cpu_list() {

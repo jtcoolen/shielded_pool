@@ -422,8 +422,10 @@ impl IvcProver {
         }
 
         // 1. Prove leaves in parallel
+        let leaf_block = crate::parallel::static_block_size(leaf_plans.len());
         let leaf_nodes: Vec<TreeNode<Vec<F>>> = leaf_plans
             .into_par_iter()
+            .by_uniform_blocks(leaf_block)
             .map(|plan| prove_leaf(setup, client_srs, client_vk, leaf_step, plan))
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -731,8 +733,10 @@ fn build_to_top_pair<Fo: FoldStep>(
                 }
                 let parent_level = level + 1;
                 let quads: Vec<_> = nodes.chunks_exact(4).collect();
+                let quad_block = crate::parallel::static_block_size(quads.len());
                 nodes = quads
                     .par_iter()
+                    .by_uniform_blocks(quad_block)
                     .map(|quad| {
                         prove_node(
                             setup,

@@ -658,8 +658,10 @@ fn run() -> Result<(), AppError> {
             )));
         }
 
+        let proof_block = parallel::static_block_size(proof_jobs.len());
         let mut indexed_client_proofs = proof_jobs
             .into_par_iter()
+            .by_uniform_blocks(proof_block)
             .map(|job| prove_prepared_tx(&srs, &pk, &relation, batch_idx, job))
             .collect::<Result<Vec<_>, _>>()?;
         indexed_client_proofs.sort_by_key(|(tx_idx, _)| *tx_idx);

@@ -31,8 +31,8 @@ use midnight_proofs::{
 use midnight_circuits::hash::poseidon::PoseidonChip;
 
 use super::{
-    Acc, C, ClientProof, E, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep, NODE_CHILD_ARITY, NodeState,
-    S, TreeNode, TreeResult, VkData,
+    Acc, C, ClientProof, DECIDER_CHILD_ARITY, E, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep,
+    NODE_CHILD_ARITY, NodeState, S, TreeNode, TreeResult, VkData,
     circuit::{FrameworkWitness, IvcLeafCircuit, IvcNodeCircuit},
     ctx::configure_ivc_circuit,
 };
@@ -66,7 +66,7 @@ pub enum AggregationError {
     Empty,
 
     #[error(
-        "number of leaf aggregation nodes must be of the form NODE_CHILD_ARITY^k (k>=1, got {0})"
+        "number of leaf aggregation nodes must be of the form DECIDER_CHILD_ARITY*NODE_CHILD_ARITY^k (k>=0, got {0})"
     )]
     NotPowerOfTwo(usize),
 
@@ -242,23 +242,23 @@ where
     }
 
     let num_leaves = num_client_proofs / LEAF_CLIENT_ARITY;
-    if num_leaves < NODE_CHILD_ARITY {
+    if num_leaves < DECIDER_CHILD_ARITY {
         return Err(AggregationError::NeedAtLeastForTwoLeaves {
-            min: LEAF_CLIENT_ARITY * NODE_CHILD_ARITY,
+            min: LEAF_CLIENT_ARITY * DECIDER_CHILD_ARITY,
             got: num_client_proofs,
         });
     }
 
     let mut n = num_leaves;
     let mut internal_levels = 0usize;
-    while n > NODE_CHILD_ARITY {
+    while n > DECIDER_CHILD_ARITY {
         if n % NODE_CHILD_ARITY != 0 {
             return Err(AggregationError::NotPowerOfTwo(num_leaves));
         }
         n /= NODE_CHILD_ARITY;
         internal_levels += 1;
     }
-    if n != NODE_CHILD_ARITY {
+    if n != DECIDER_CHILD_ARITY {
         return Err(AggregationError::NotPowerOfTwo(num_leaves));
     }
     let max_agg_level = 1 + internal_levels;
@@ -687,13 +687,13 @@ fn build_to_decider_children<Fo: FoldStep>(
     loop {
         match nodes.len() {
             0 => return Err(AggregationError::Empty),
-            n if n < NODE_CHILD_ARITY => {
+            n if n < DECIDER_CHILD_ARITY => {
                 return Err(AggregationError::NeedAtLeastForTwoLeaves {
-                    min: LEAF_CLIENT_ARITY * NODE_CHILD_ARITY,
+                    min: LEAF_CLIENT_ARITY * DECIDER_CHILD_ARITY,
                     got: n * LEAF_CLIENT_ARITY,
                 });
             }
-            n if n == NODE_CHILD_ARITY => {
+            n if n == DECIDER_CHILD_ARITY => {
                 return Ok((level, nodes));
             }
             _ => {
@@ -722,16 +722,21 @@ fn build_to_decider_children<Fo: FoldStep>(
 ////////////////////////////////////////////////////////////////////////////////
 
 fn host_merkle_root(items: &[F]) -> Result<F, AggregationError> {
-    if !items.len().is_power_of_two() {
+    if items.is_empty() {
         return Err(AggregationError::FoldValidation(
-            "node arity must be a power of two".into(),
+            "node arity must be > 0".into(),
         ));
     }
     let mut layer = items.to_vec();
     while layer.len() > 1 {
-        let mut next = Vec::with_capacity(layer.len() / 2);
-        for pair in layer.chunks_exact(2) {
-            next.push(host_hash_pair(pair[0], pair[1]));
+        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+        let mut i = 0usize;
+        while i + 1 < layer.len() {
+            next.push(host_hash_pair(layer[i], layer[i + 1]));
+            i += 2;
+        }
+        if i < layer.len() {
+            next.push(layer[i]);
         }
         layer = next;
     }

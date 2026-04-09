@@ -13,8 +13,8 @@ use midnight_proofs::{
 };
 
 use super::{
-    Acc, AssignedNative, C, DeciderStep, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep,
-    NODE_CHILD_ARITY, VkData,
+    Acc, AssignedNative, C, DECIDER_CHILD_ARITY, DeciderStep, F, FoldStep, LEAF_CLIENT_ARITY,
+    LeafStep, NODE_CHILD_ARITY, VkData,
     ctx::{
         AggCircuitConfig, IvcCtx, RpvInput, configure_ivc_circuit, expose_node_outputs,
         recursive_partial_verify,
@@ -162,19 +162,22 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
                 let app_state = step.synthesize(ctx, layouter, &client_pis, witness)?;
 
                 // 3. Framework: Merkle hashes
-                if !client_pis.len().is_power_of_two() {
-                    return Err(Error::Synthesis(
-                        "leaf arity must be a power of two".to_string(),
-                    ));
+                if client_pis.is_empty() {
+                    return Err(Error::Synthesis("leaf arity must be > 0".to_string()));
                 }
                 let mut layer = client_pis
                     .iter()
                     .map(|pi| ctx.hash_many(layouter, pi))
                     .collect::<Result<Vec<_>, _>>()?;
                 while layer.len() > 1 {
-                    let mut next = Vec::with_capacity(layer.len() / 2);
-                    for pair in layer.chunks_exact(2) {
-                        next.push(ctx.hash2(layouter, &pair[0], &pair[1])?);
+                    let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+                    let mut i = 0usize;
+                    while i + 1 < layer.len() {
+                        next.push(ctx.hash2(layouter, &layer[i], &layer[i + 1])?);
+                        i += 2;
+                    }
+                    if i < layer.len() {
+                        next.push(layer[i].clone());
                     }
                     layer = next;
                 }
@@ -321,7 +324,7 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
         Self {
             step: self.step.clone(),
             app_state_width: self.app_state_width,
-            child_states: vec![vec![Value::unknown(); full_width]; NODE_CHILD_ARITY],
+            child_states: vec![vec![Value::unknown(); full_width]; DECIDER_CHILD_ARITY],
             witness: Value::unknown(),
             fixed_bases: self.fixed_bases.clone(),
             fw: self.fw.without_witnesses(),
@@ -348,7 +351,7 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
 
         let w = self.app_state_width;
 
-        if self.child_states.len() != NODE_CHILD_ARITY {
+        if self.child_states.len() != DECIDER_CHILD_ARITY {
             return Err(Error::Synthesis("decider arity mismatch".to_string()));
         }
         // Assign full child states
@@ -364,9 +367,14 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
             .map(|full| full[w].clone())
             .collect();
         while layer.len() > 1 {
-            let mut next = Vec::with_capacity(layer.len() / 2);
-            for pair in layer.chunks_exact(2) {
-                next.push(ctx.hash2(&mut layouter, &pair[0], &pair[1])?);
+            let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+            let mut i = 0usize;
+            while i + 1 < layer.len() {
+                next.push(ctx.hash2(&mut layouter, &layer[i], &layer[i + 1])?);
+                i += 2;
+            }
+            if i < layer.len() {
+                next.push(layer[i].clone());
             }
             layer = next;
         }

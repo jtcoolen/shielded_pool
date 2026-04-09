@@ -30,7 +30,7 @@ mod trusted_setup;
 
 use ivc::circuit::FrameworkWitness;
 use ivc::engine::{host_instance_hash, prepare_ivc_setup};
-use ivc::{ClientProof, E, F, IvcDeciderCircuit, IvcProver, NODE_CHILD_ARITY};
+use ivc::{ClientProof, DECIDER_CHILD_ARITY, E, F, IvcDeciderCircuit, IvcProver};
 use rollup::{
     APP_STATE_WIDTH, DeciderWitness, RollupDeciderStep, RollupFoldStep, RollupLeafStep,
     SendableMap, plan_rollup_leaves, rollup_host_merge,
@@ -38,10 +38,10 @@ use rollup::{
 
 type CommitmentMap = ivc::Map;
 
-const BATCH_SIZE: usize = 64;
+const BATCH_SIZE: usize = 48;
 const LAG_TX_PROB: f64 = 0.35;
-pub(crate) const K_LEAF: u32 = 21;
-pub(crate) const K_AGG: u32 = 21;
+pub(crate) const K_LEAF: u32 = 20;
+pub(crate) const K_AGG: u32 = 20;
 pub(crate) const K_DEC: u32 = 21;
 
 #[derive(Debug, Error)]
@@ -527,7 +527,7 @@ fn run() -> Result<(), AppError> {
     const K: u32 = 14;
     const NUM_ACCOUNTS: usize = 4;
     const NUM_SEED_DEPOSITS: usize = 50;
-    const NUM_TRANSFERS: usize = 128;
+    const NUM_TRANSFERS: usize = 96;
 
     // --- Setup leaf circuit keys ---
     let srs =
@@ -559,14 +559,14 @@ fn run() -> Result<(), AppError> {
     let default_decider = IvcDeciderCircuit::<RollupDeciderStep, K_DEC> {
         step: RollupDeciderStep,
         app_state_width: APP_STATE_WIDTH,
-        child_states: vec![vec![Value::unknown(); full_width]; NODE_CHILD_ARITY],
+        child_states: vec![vec![Value::unknown(); full_width]; DECIDER_CHILD_ARITY],
         witness: Value::unknown(),
         fixed_bases: ivc_setup.fixed_bases.clone(),
         fw: FrameworkWitness {
             child_vk: ivc_setup.child_vk(),
             child_vk_name: ivc_setup.child_vk_name().to_string(),
-            child_proofs: vec![Value::unknown(); NODE_CHILD_ARITY],
-            child_pi_accs: vec![Value::unknown(); NODE_CHILD_ARITY],
+            child_proofs: vec![Value::unknown(); DECIDER_CHILD_ARITY],
+            child_pi_accs: vec![Value::unknown(); DECIDER_CHILD_ARITY],
             fixed_base_names: ivc_setup.fixed_base_names().to_vec(),
         },
     };
@@ -701,7 +701,7 @@ fn run() -> Result<(), AppError> {
         {
             use midnight_proofs::transcript::CircuitTranscript;
 
-            let mut final_acc_parts = Vec::with_capacity(NODE_CHILD_ARITY * 2);
+            let mut final_acc_parts = Vec::with_capacity(DECIDER_CHILD_ARITY * 2);
             for child in &tree.top_children {
                 final_acc_parts.push(child.proof_acc.clone());
                 final_acc_parts.push(child.pi_acc.clone());

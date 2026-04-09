@@ -68,8 +68,9 @@ pub type IdPoint = AssignedForeignPoint<
 
 pub type Map = MapMt<F, PoseidonChip<F>>;
 pub type Acc = Accumulator<S>;
-pub const LEAF_CLIENT_ARITY: usize = 8;
+pub const LEAF_CLIENT_ARITY: usize = 6;
 pub const NODE_CHILD_ARITY: usize = 8;
+pub const DECIDER_CHILD_ARITY: usize = 8;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Core types

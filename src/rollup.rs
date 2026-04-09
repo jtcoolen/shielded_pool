@@ -13,8 +13,8 @@ use midnight_proofs::circuit::{Layouter, Value};
 use midnight_proofs::plonk::Error;
 
 use crate::ivc::{
-    self, ClientProof, DeciderStep, F, FoldStep, HostLeafStep, HostState, IvcCtx,
-    LEAF_CLIENT_ARITY, LeafStep, Map, MapGadget, NODE_CHILD_ARITY, engine::AggregationError,
+    self, ClientProof, DECIDER_CHILD_ARITY, DeciderStep, F, FoldStep, HostLeafStep, HostState,
+    IvcCtx, LEAF_CLIENT_ARITY, LeafStep, Map, MapGadget, engine::AggregationError,
 };
 
 use midnight_circuits::instructions::map::MapCPU;
@@ -232,7 +232,7 @@ impl DeciderStep for RollupDeciderStep {
         merkle_root: &AssignedNative<F>,
         witness: Value<Self::Witness>,
     ) -> Result<Vec<AssignedNative<F>>, Error> {
-        if child_full_states.len() != NODE_CHILD_ARITY {
+        if child_full_states.len() != DECIDER_CHILD_ARITY {
             return Err(Error::Synthesis("decider arity mismatch".to_string()));
         }
         let w = APP_STATE_WIDTH;
@@ -250,7 +250,7 @@ impl DeciderStep for RollupDeciderStep {
         }
 
         let first = child_apps[0];
-        let last = child_apps[NODE_CHILD_ARITY - 1];
+        let last = child_apps[DECIDER_CHILD_ARITY - 1];
         let c_pre = &first[0];
         let c_post = &last[1];
         let n_pre = &first[2];
@@ -432,16 +432,21 @@ pub fn plan_rollup_leaves(
             block_level,
         ];
 
-        if !chunk.len().is_power_of_two() {
+        if chunk.is_empty() {
             return Err(AggregationError::LeafValidation(
-                "leaf arity must be a power of two".into(),
+                "leaf arity must be > 0".into(),
             ));
         }
         let mut layer: Vec<F> = chunk.iter().map(|cp| cp.instance_hash).collect();
         while layer.len() > 1 {
-            let mut next = Vec::with_capacity(layer.len() / 2);
-            for pair in layer.chunks_exact(2) {
-                next.push(host_hash_pair(pair[0], pair[1]));
+            let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+            let mut i = 0usize;
+            while i + 1 < layer.len() {
+                next.push(host_hash_pair(layer[i], layer[i + 1]));
+                i += 2;
+            }
+            if i < layer.len() {
+                next.push(layer[i]);
             }
             layer = next;
         }

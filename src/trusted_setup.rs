@@ -9,7 +9,7 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-const MAX_K: u32 = 20;
+const MAX_K: u32 = 27;
 const DEFAULT_SRS_DIR: &str = "./assets";
 
 #[derive(Error, Debug)]

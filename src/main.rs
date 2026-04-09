@@ -42,6 +42,7 @@ const BATCH_SIZE: usize = 12;
 const LAG_TX_PROB: f64 = 0.35;
 const K_LEAF: u32 = 20;
 const K_AGG: u32 = 20;
+const K_DEC: u32 = 21;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -552,10 +553,10 @@ fn run() -> Result<(), AppError> {
     .map_err(|e| AppError::TrustedSetup(err_string(e)))?;
 
     // --- Setup decider circuit keys ---
-    let final_srs = trusted_setup::filecoin_srs_agg(K_AGG)
+    let final_srs = trusted_setup::filecoin_srs_agg(K_DEC)
         .map_err(|e| AppError::TrustedSetup(err_string(e)))?;
     let full_width = APP_STATE_WIDTH + 1;
-    let default_decider = IvcDeciderCircuit::<RollupDeciderStep, K_AGG> {
+    let default_decider = IvcDeciderCircuit::<RollupDeciderStep, K_DEC> {
         step: RollupDeciderStep,
         app_state_width: APP_STATE_WIDTH,
         left_child_state: vec![Value::unknown(); full_width],
@@ -570,7 +571,7 @@ fn run() -> Result<(), AppError> {
             fixed_base_names: ivc_setup.fixed_base_names().to_vec(),
         },
     };
-    let final_vk = keygen_vk_with_k(&final_srs, &default_decider, K_AGG)
+    let final_vk = keygen_vk_with_k(&final_srs, &default_decider, K_DEC)
         .map_err(|e| AppError::Keygen(err_string(e)))?;
     let final_pk = keygen_pk(final_vk.clone(), &default_decider)
         .map_err(|e| AppError::Keygen(err_string(e)))?;
@@ -711,17 +712,13 @@ fn run() -> Result<(), AppError> {
             final_acc.resolve_fixed_bases(&ivc_setup.fixed_bases);
             final_acc.collapse();
             let final_acc_pi = AssignedAccumulator::as_public_input(&final_acc);
-            println!(
-                "final accumulator size (public inputs): {}",
-                final_acc_pi.len()
-            );
 
             let mut left_full = tree.left_top.app_state.clone();
             left_full.push(tree.left_top.merkle_digest);
             let mut right_full = tree.right_top.app_state.clone();
             right_full.push(tree.right_top.merkle_digest);
 
-            let final_circuit = IvcDeciderCircuit::<RollupDeciderStep, K_AGG> {
+            let final_circuit = IvcDeciderCircuit::<RollupDeciderStep, K_DEC> {
                 step: RollupDeciderStep,
                 app_state_width: APP_STATE_WIDTH,
                 left_child_state: left_full.iter().map(|f| Value::known(*f)).collect(),
@@ -766,6 +763,11 @@ fn run() -> Result<(), AppError> {
                 post_roots_set_root,
             ];
             final_pi.extend(final_acc_pi.clone());
+            let decider_acc_pi_len = final_pi.len().saturating_sub(9);
+            println!(
+                "final accumulator size (decider circuit PI fields): {}",
+                decider_acc_pi_len
+            );
 
             let final_proof_bytes = {
                 let mut transcript =
@@ -774,7 +776,7 @@ fn run() -> Result<(), AppError> {
                     F,
                     KZGCommitmentScheme<E>,
                     CircuitTranscript<keccak_transcript::KeccakTranscript>,
-                    IvcDeciderCircuit<RollupDeciderStep, K_AGG>,
+                    IvcDeciderCircuit<RollupDeciderStep, K_DEC>,
                 >(
                     &final_srs,
                     &final_pk,

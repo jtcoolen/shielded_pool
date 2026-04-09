@@ -115,14 +115,12 @@ impl LeafStep for RollupLeafStep {
         &self,
         ctx: &IvcCtx,
         layouter: &mut L,
-        p0: &[AssignedNative<F>],
-        p1: &[AssignedNative<F>],
-        p2: &[AssignedNative<F>],
-        p3: &[AssignedNative<F>],
-        p4: &[AssignedNative<F>],
-        p5: &[AssignedNative<F>],
+        client_pis: &[Vec<AssignedNative<F>>],
         witness: Value<Self::Witness>,
     ) -> Result<Vec<AssignedNative<F>>, Error> {
+        if client_pis.len() != LEAF_CLIENT_ARITY {
+            return Err(Error::Synthesis("leaf arity mismatch".to_string()));
+        }
         let one = ctx.one(layouter)?;
         let zero = ctx.zero(layouter)?;
         let blk = ctx.assign(layouter, witness.clone().map(|w| w.block_level))?;
@@ -147,65 +145,21 @@ impl LeafStep for RollupLeafStep {
         let roots_set_root = roots_set.succinct_repr();
 
         // Check each tx root ∈ historic roots set
-        let roots = [&p0[0], &p1[0], &p2[0], &p3[0], &p4[0], &p5[0]];
-        for root in roots {
-            check_membership(ctx, layouter, &roots_set, root, &one)?;
+        for pi in client_pis {
+            check_membership(ctx, layouter, &roots_set, &pi[0], &one)?;
         }
 
-        apply_effects(
-            ctx,
-            layouter,
-            &mut commit_map,
-            &mut null_map,
-            p0,
-            &zero,
-            &one,
-        )?;
-        apply_effects(
-            ctx,
-            layouter,
-            &mut commit_map,
-            &mut null_map,
-            p1,
-            &zero,
-            &one,
-        )?;
-        apply_effects(
-            ctx,
-            layouter,
-            &mut commit_map,
-            &mut null_map,
-            p2,
-            &zero,
-            &one,
-        )?;
-        apply_effects(
-            ctx,
-            layouter,
-            &mut commit_map,
-            &mut null_map,
-            p3,
-            &zero,
-            &one,
-        )?;
-        apply_effects(
-            ctx,
-            layouter,
-            &mut commit_map,
-            &mut null_map,
-            p4,
-            &zero,
-            &one,
-        )?;
-        apply_effects(
-            ctx,
-            layouter,
-            &mut commit_map,
-            &mut null_map,
-            p5,
-            &zero,
-            &one,
-        )?;
+        for pi in client_pis {
+            apply_effects(
+                ctx,
+                layouter,
+                &mut commit_map,
+                &mut null_map,
+                pi,
+                &zero,
+                &one,
+            )?;
+        }
 
         Ok(vec![
             c_pre,
@@ -468,22 +422,27 @@ pub fn plan_rollup_leaves(
             block_level,
         ];
 
-        let h01 = host_hash_pair(chunk[0].instance_hash, chunk[1].instance_hash);
-        let h23 = host_hash_pair(chunk[2].instance_hash, chunk[3].instance_hash);
-        let h45 = host_hash_pair(chunk[4].instance_hash, chunk[5].instance_hash);
-        let h0123 = host_hash_pair(h01, h23);
-        let merkle_digest = host_hash_pair(h0123, h45);
+        if !chunk.len().is_power_of_two() {
+            return Err(AggregationError::LeafValidation(
+                "leaf arity must be a power of two".into(),
+            ));
+        }
+        let mut layer: Vec<F> = chunk.iter().map(|cp| cp.instance_hash).collect();
+        while layer.len() > 1 {
+            let mut next = Vec::with_capacity(layer.len() / 2);
+            for pair in layer.chunks_exact(2) {
+                next.push(host_hash_pair(pair[0], pair[1]));
+            }
+            layer = next;
+        }
+        let merkle_digest = layer[0];
+
+        let clients: [ivc::ClientProof; LEAF_CLIENT_ARITY] =
+            std::array::from_fn(|j| chunk[j].clone());
 
         plans.push(LeafPlan {
             index: i,
-            clients: [
-                chunk[0].clone(),
-                chunk[1].clone(),
-                chunk[2].clone(),
-                chunk[3].clone(),
-                chunk[4].clone(),
-                chunk[5].clone(),
-            ],
+            clients,
             app_state,
             merkle_digest,
             witness: LeafWitness {

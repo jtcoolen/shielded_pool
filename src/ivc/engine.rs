@@ -31,8 +31,8 @@ use midnight_proofs::{
 use midnight_circuits::hash::poseidon::PoseidonChip;
 
 use super::{
-    Acc, C, ClientProof, E, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep, NodeState, S, TreeNode,
-    TreeResult, VkData,
+    Acc, C, ClientProof, E, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep, NODE_CHILD_ARITY, NodeState,
+    S, TreeNode, TreeResult, VkData,
     circuit::{FrameworkWitness, IvcLeafCircuit, IvcNodeCircuit},
     ctx::configure_ivc_circuit,
 };
@@ -65,7 +65,7 @@ pub enum AggregationError {
     #[error("need at least one client proof")]
     Empty,
 
-    #[error("number of leaf aggregation nodes must be of the form 2*4^k (got {0})")]
+    #[error("number of leaf aggregation nodes must be of the form 2*NODE_CHILD_ARITY^k (got {0})")]
     NotPowerOfTwo(usize),
 
     #[error("client proofs length must be divisible by leaf arity {arity} (got {got})")]
@@ -250,10 +250,10 @@ where
     let mut n = num_leaves;
     let mut internal_levels = 0usize;
     while n > 2 {
-        if n % 4 != 0 {
+        if n % NODE_CHILD_ARITY != 0 {
             return Err(AggregationError::NotPowerOfTwo(num_leaves));
         }
-        n /= 4;
+        n /= NODE_CHILD_ARITY;
         internal_levels += 1;
     }
     let max_agg_level = 1 + internal_levels;
@@ -304,14 +304,7 @@ where
         let (vk, pk) = if level == 1 {
             let circuit = IvcLeafCircuit::<L, { crate::K_LEAF }> {
                 step: leaf_step.clone(),
-                client_items: [
-                    Value::unknown(),
-                    Value::unknown(),
-                    Value::unknown(),
-                    Value::unknown(),
-                    Value::unknown(),
-                    Value::unknown(),
-                ],
+                client_items: std::array::from_fn(|_| Value::unknown()),
                 witness: Value::unknown(),
                 client_pi_width,
                 fw: FrameworkWitness {
@@ -328,25 +321,12 @@ where
             let circuit = IvcNodeCircuit::<Fo, { crate::K_AGG }> {
                 step: fold_step.clone(),
                 app_state_width,
-                child0_state: vec![Value::unknown(); full_width],
-                child1_state: vec![Value::unknown(); full_width],
-                child2_state: vec![Value::unknown(); full_width],
-                child3_state: vec![Value::unknown(); full_width],
+                child_states: vec![vec![Value::unknown(); full_width]; NODE_CHILD_ARITY],
                 fw: FrameworkWitness {
                     child_vk: child_vk_data,
                     child_vk_name,
-                    child_proofs: vec![
-                        Value::unknown(),
-                        Value::unknown(),
-                        Value::unknown(),
-                        Value::unknown(),
-                    ],
-                    child_pi_accs: vec![
-                        Value::unknown(),
-                        Value::unknown(),
-                        Value::unknown(),
-                        Value::unknown(),
-                    ],
+                    child_proofs: vec![Value::unknown(); NODE_CHILD_ARITY],
+                    child_pi_accs: vec![Value::unknown(); NODE_CHILD_ARITY],
                     fixed_base_names: fixed_base_names.clone(),
                 },
             };
@@ -463,14 +443,7 @@ fn prove_leaf<L: LeafStep>(
 
     let circuit = IvcLeafCircuit::<L, { crate::K_LEAF }> {
         step: leaf_step.clone(),
-        client_items: [
-            Value::known(plan.clients[0].public_inputs.clone()),
-            Value::known(plan.clients[1].public_inputs.clone()),
-            Value::known(plan.clients[2].public_inputs.clone()),
-            Value::known(plan.clients[3].public_inputs.clone()),
-            Value::known(plan.clients[4].public_inputs.clone()),
-            Value::known(plan.clients[5].public_inputs.clone()),
-        ],
+        client_items: std::array::from_fn(|i| Value::known(plan.clients[i].public_inputs.clone())),
         witness: Value::known(plan.witness),
         client_pi_width: setup.client_pi_width,
         fw: FrameworkWitness {
@@ -555,7 +528,7 @@ fn prove_leaf<L: LeafStep>(
     let pi_fields: Vec<F> = full_state.iter().copied().chain(pi_acc_fields).collect();
 
     if plan.index == 0 {
-        match MockProver::run(20, &circuit, vec![vec![], pi_fields.clone()]) {
+        match MockProver::run(crate::K_LEAF, &circuit, vec![vec![], pi_fields.clone()]) {
             Ok(prover) => {
                 if let Err(errs) = prover.verify() {
                     eprintln!("leaf mock prover unsatisfied: {:?}", errs);
@@ -601,68 +574,63 @@ fn prove_node<Fo: FoldStep>(
     host_merge: &(impl Fn(&[F], &[F]) -> Vec<F> + Send + Sync),
     parent_level: usize,
     child_level: usize,
-    child0: &TreeNode<Vec<F>>,
-    child1: &TreeNode<Vec<F>>,
-    child2: &TreeNode<Vec<F>>,
-    child3: &TreeNode<Vec<F>>,
+    children: &[TreeNode<Vec<F>>],
 ) -> Result<TreeNode<Vec<F>>, AggregationError> {
+    if children.len() != NODE_CHILD_ARITY {
+        return Err(AggregationError::FoldValidation(format!(
+            "node arity mismatch: expected {NODE_CHILD_ARITY}, got {}",
+            children.len()
+        )));
+    }
     let child_keys = setup.agg_store.get(child_level);
     let parent_keys = setup.agg_store.get(parent_level);
     let srs = &setup.agg_srs_internal;
 
-    let app01 = host_merge(&child0.app_state, &child1.app_state);
-    let app012 = host_merge(&app01, &child2.app_state);
-    let app_state = host_merge(&app012, &child3.app_state);
+    let mut app_state = children[0].app_state.clone();
+    for child in children.iter().skip(1) {
+        app_state = host_merge(&app_state, &child.app_state);
+    }
 
-    let d01 = host_hash_pair(child0.merkle_digest, child1.merkle_digest);
-    let d23 = host_hash_pair(child2.merkle_digest, child3.merkle_digest);
-    let digest = host_hash_pair(d01, d23);
+    let digests: Vec<F> = children.iter().map(|c| c.merkle_digest).collect();
+    let digest = host_merkle_root(&digests)?;
 
-    let mut child0_full: Vec<F> = child0.app_state.clone();
-    child0_full.push(child0.merkle_digest);
-    let mut child1_full: Vec<F> = child1.app_state.clone();
-    child1_full.push(child1.merkle_digest);
-    let mut child2_full: Vec<F> = child2.app_state.clone();
-    child2_full.push(child2.merkle_digest);
-    let mut child3_full: Vec<F> = child3.app_state.clone();
-    child3_full.push(child3.merkle_digest);
+    let child_full_states: Vec<Vec<F>> = children
+        .iter()
+        .map(|child| {
+            let mut full = child.app_state.clone();
+            full.push(child.merkle_digest);
+            full
+        })
+        .collect();
 
     let circuit = IvcNodeCircuit::<Fo, { crate::K_AGG }> {
         step: fold_step.clone(),
         app_state_width: setup.app_state_width,
-        child0_state: child0_full.iter().map(|f| Value::known(*f)).collect(),
-        child1_state: child1_full.iter().map(|f| Value::known(*f)).collect(),
-        child2_state: child2_full.iter().map(|f| Value::known(*f)).collect(),
-        child3_state: child3_full.iter().map(|f| Value::known(*f)).collect(),
+        child_states: child_full_states
+            .iter()
+            .map(|full| full.iter().map(|f| Value::known(*f)).collect())
+            .collect(),
         fw: FrameworkWitness {
             child_vk: child_keys.vk_data.clone(),
             child_vk_name: child_keys.name.clone(),
-            child_proofs: vec![
-                Value::known(child0.proof.clone()),
-                Value::known(child1.proof.clone()),
-                Value::known(child2.proof.clone()),
-                Value::known(child3.proof.clone()),
-            ],
-            child_pi_accs: vec![
-                Value::known(child0.pi_acc.clone()),
-                Value::known(child1.pi_acc.clone()),
-                Value::known(child2.pi_acc.clone()),
-                Value::known(child3.pi_acc.clone()),
-            ],
+            child_proofs: children
+                .iter()
+                .map(|child| Value::known(child.proof.clone()))
+                .collect(),
+            child_pi_accs: children
+                .iter()
+                .map(|child| Value::known(child.pi_acc.clone()))
+                .collect(),
             fixed_base_names: setup.fixed_base_names.clone(),
         },
     };
 
-    let pi_acc = collapse(Accumulator::accumulate(&[
-        child0.proof_acc.clone(),
-        child0.pi_acc.clone(),
-        child1.proof_acc.clone(),
-        child1.pi_acc.clone(),
-        child2.proof_acc.clone(),
-        child2.pi_acc.clone(),
-        child3.proof_acc.clone(),
-        child3.pi_acc.clone(),
-    ]));
+    let mut to_fold = Vec::with_capacity(NODE_CHILD_ARITY * 2);
+    for child in children {
+        to_fold.push(child.proof_acc.clone());
+        to_fold.push(child.pi_acc.clone());
+    }
+    let pi_acc = collapse(Accumulator::accumulate(&to_fold));
 
     let mut full_state = app_state.clone();
     full_state.push(digest);
@@ -721,28 +689,18 @@ fn build_to_top_pair<Fo: FoldStep>(
                 return Ok((level, (left, right)));
             }
             _ => {
-                if nodes.len() % 4 != 0 {
+                if nodes.len() % NODE_CHILD_ARITY != 0 {
                     return Err(AggregationError::FoldValidation(format!(
-                        "internal level {level} requires node count divisible by 4, got {}",
+                        "internal level {level} requires node count divisible by {NODE_CHILD_ARITY}, got {}",
                         nodes.len()
                     )));
                 }
                 let parent_level = level + 1;
-                let quads: Vec<_> = nodes.chunks_exact(4).collect();
-                nodes = quads
+                let groups: Vec<_> = nodes.chunks_exact(NODE_CHILD_ARITY).collect();
+                nodes = groups
                     .par_iter()
-                    .map(|quad| {
-                        prove_node(
-                            setup,
-                            fold_step,
-                            host_merge,
-                            parent_level,
-                            level,
-                            &quad[0],
-                            &quad[1],
-                            &quad[2],
-                            &quad[3],
-                        )
+                    .map(|group| {
+                        prove_node(setup, fold_step, host_merge, parent_level, level, group)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 level = parent_level;
@@ -754,6 +712,23 @@ fn build_to_top_pair<Fo: FoldStep>(
 ////////////////////////////////////////////////////////////////////////////////
 // Crypto helpers
 ////////////////////////////////////////////////////////////////////////////////
+
+fn host_merkle_root(items: &[F]) -> Result<F, AggregationError> {
+    if !items.len().is_power_of_two() {
+        return Err(AggregationError::FoldValidation(
+            "node arity must be a power of two".into(),
+        ));
+    }
+    let mut layer = items.to_vec();
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity(layer.len() / 2);
+        for pair in layer.chunks_exact(2) {
+            next.push(host_hash_pair(pair[0], pair[1]));
+        }
+        layer = next;
+    }
+    Ok(layer[0])
+}
 
 fn host_hash_pair(a: F, b: F) -> F {
     <PoseidonChip<F> as HashCPU<F, F>>::hash(&[a, b])

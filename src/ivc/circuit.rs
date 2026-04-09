@@ -13,7 +13,8 @@ use midnight_proofs::{
 };
 
 use super::{
-    Acc, AssignedNative, C, DeciderStep, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep, VkData,
+    Acc, AssignedNative, C, DeciderStep, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep,
+    NODE_CHILD_ARITY, VkData,
     ctx::{
         AggCircuitConfig, IvcCtx, RpvInput, configure_ivc_circuit, expose_node_outputs,
         recursive_partial_verify,
@@ -124,14 +125,7 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
     fn without_witnesses(&self) -> Self {
         Self {
             step: self.step.clone(),
-            client_items: [
-                Value::unknown(),
-                Value::unknown(),
-                Value::unknown(),
-                Value::unknown(),
-                Value::unknown(),
-                Value::unknown(),
-            ],
+            client_items: std::array::from_fn(|_| Value::unknown()),
             witness: Value::unknown(),
             client_pi_width: self.client_pi_width,
             fw: self.fw.without_witnesses(),
@@ -159,29 +153,34 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
             true, // children ARE client proofs
             |ctx, layouter| {
                 // 1. Assign client PIs
-                let p0 = assign_value_vec(ctx, layouter, &items[0], width)?;
-                let p1 = assign_value_vec(ctx, layouter, &items[1], width)?;
-                let p2 = assign_value_vec(ctx, layouter, &items[2], width)?;
-                let p3 = assign_value_vec(ctx, layouter, &items[3], width)?;
-                let p4 = assign_value_vec(ctx, layouter, &items[4], width)?;
-                let p5 = assign_value_vec(ctx, layouter, &items[5], width)?;
+                let client_pis = items
+                    .iter()
+                    .map(|item| assign_value_vec(ctx, layouter, item, width))
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 // 2. Application step (only sees client PIs)
-                let app_state =
-                    step.synthesize(ctx, layouter, &p0, &p1, &p2, &p3, &p4, &p5, witness)?;
+                let app_state = step.synthesize(ctx, layouter, &client_pis, witness)?;
 
                 // 3. Framework: Merkle hashes
-                let h0 = ctx.hash_many(layouter, &p0)?;
-                let h1 = ctx.hash_many(layouter, &p1)?;
-                let h2 = ctx.hash_many(layouter, &p2)?;
-                let h3 = ctx.hash_many(layouter, &p3)?;
-                let h4 = ctx.hash_many(layouter, &p4)?;
-                let h5 = ctx.hash_many(layouter, &p5)?;
-                let h01 = ctx.hash2(layouter, &h0, &h1)?;
-                let h23 = ctx.hash2(layouter, &h2, &h3)?;
-                let h45 = ctx.hash2(layouter, &h4, &h5)?;
-                let h0123 = ctx.hash2(layouter, &h01, &h23)?;
-                let digest = ctx.hash2(layouter, &h0123, &h45)?;
+                if !client_pis.len().is_power_of_two() {
+                    return Err(Error::Synthesis(
+                        "leaf arity must be a power of two".to_string(),
+                    ));
+                }
+                let mut layer = client_pis
+                    .iter()
+                    .map(|pi| ctx.hash_many(layouter, pi))
+                    .collect::<Result<Vec<_>, _>>()?;
+                while layer.len() > 1 {
+                    let mut next = Vec::with_capacity(layer.len() / 2);
+                    for pair in layer.chunks_exact(2) {
+                        next.push(ctx.hash2(layouter, &pair[0], &pair[1])?);
+                    }
+                    layer = next;
+                }
+                let digest = layer
+                    .pop()
+                    .ok_or_else(|| Error::Synthesis("missing leaf digest".to_string()))?;
 
                 // 4. Full state = [app_state..., digest]
                 let mut full = app_state;
@@ -189,7 +188,7 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
 
                 Ok(StepPhaseOutput {
                     full_state: full,
-                    child_pis: vec![p0, p1, p2, p3, p4, p5],
+                    child_pis: client_pis,
                 })
             },
         )
@@ -208,10 +207,7 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
 pub struct IvcNodeCircuit<Fo: FoldStep, const K: u32> {
     pub(crate) step: Fo,
     pub(crate) app_state_width: usize,
-    pub(crate) child0_state: Vec<Value<F>>,
-    pub(crate) child1_state: Vec<Value<F>>,
-    pub(crate) child2_state: Vec<Value<F>>,
-    pub(crate) child3_state: Vec<Value<F>>,
+    pub(crate) child_states: Vec<Vec<Value<F>>>,
     pub(crate) fw: FrameworkWitness,
 }
 
@@ -225,10 +221,7 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
         Self {
             step: self.step.clone(),
             app_state_width: self.app_state_width,
-            child0_state: vec![Value::unknown(); full_width],
-            child1_state: vec![Value::unknown(); full_width],
-            child2_state: vec![Value::unknown(); full_width],
-            child3_state: vec![Value::unknown(); full_width],
+            child_states: vec![vec![Value::unknown(); full_width]; NODE_CHILD_ARITY],
             fw: self.fw.without_witnesses(),
         }
     }
@@ -243,10 +236,7 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let step = self.step.clone();
-        let child0_vals = self.child0_state.clone();
-        let child1_vals = self.child1_state.clone();
-        let child2_vals = self.child2_state.clone();
-        let child3_vals = self.child3_state.clone();
+        let child_vals = self.child_states.clone();
         let w = self.app_state_width;
 
         synthesize_node::<K, _>(
@@ -256,33 +246,47 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
             false, // children are NOT client proofs
             |ctx, layouter| {
                 // 1. Assign full child states [app..., digest]
-                let child0_full = assign_values(ctx, layouter, &child0_vals)?;
-                let child1_full = assign_values(ctx, layouter, &child1_vals)?;
-                let child2_full = assign_values(ctx, layouter, &child2_vals)?;
-                let child3_full = assign_values(ctx, layouter, &child3_vals)?;
+                if child_vals.len() != NODE_CHILD_ARITY {
+                    return Err(Error::Synthesis("node arity mismatch".to_string()));
+                }
+                let child_full_states = child_vals
+                    .iter()
+                    .map(|vals| assign_values(ctx, layouter, vals))
+                    .collect::<Result<Vec<_>, _>>()?;
 
-                // 2. Split into app state and Merkle digest
-                let (child0_app, child0_digest) = child0_full.split_at(w);
-                let (child1_app, child1_digest) = child1_full.split_at(w);
-                let (child2_app, child2_digest) = child2_full.split_at(w);
-                let (child3_app, child3_digest) = child3_full.split_at(w);
+                // 2. Application fold over all child app states
+                let mut app_state = child_full_states[0][..w].to_vec();
+                for child in child_full_states.iter().skip(1) {
+                    app_state = step.synthesize(ctx, layouter, &app_state, &child[..w])?;
+                }
 
-                // 3. Application fold (only sees app states)
-                let app01 = step.synthesize(ctx, layouter, child0_app, child1_app)?;
-                let app012 = step.synthesize(ctx, layouter, &app01, child2_app)?;
-                let app_state = step.synthesize(ctx, layouter, &app012, child3_app)?;
-
-                // 4. Framework: parent Merkle digest
-                let d01 = ctx.hash2(layouter, &child0_digest[0], &child1_digest[0])?;
-                let d23 = ctx.hash2(layouter, &child2_digest[0], &child3_digest[0])?;
-                let digest = ctx.hash2(layouter, &d01, &d23)?;
+                // 3. Framework: parent Merkle digest
+                if !child_full_states.len().is_power_of_two() {
+                    return Err(Error::Synthesis(
+                        "node arity must be a power of two".to_string(),
+                    ));
+                }
+                let mut layer: Vec<AssignedNative<F>> = child_full_states
+                    .iter()
+                    .map(|full| full[w].clone())
+                    .collect();
+                while layer.len() > 1 {
+                    let mut next = Vec::with_capacity(layer.len() / 2);
+                    for pair in layer.chunks_exact(2) {
+                        next.push(ctx.hash2(layouter, &pair[0], &pair[1])?);
+                    }
+                    layer = next;
+                }
+                let digest = layer
+                    .pop()
+                    .ok_or_else(|| Error::Synthesis("missing node digest".to_string()))?;
 
                 let mut full = app_state;
                 full.push(digest);
 
                 Ok(StepPhaseOutput {
                     full_state: full,
-                    child_pis: vec![child0_full, child1_full, child2_full, child3_full],
+                    child_pis: child_full_states,
                 })
             },
         )

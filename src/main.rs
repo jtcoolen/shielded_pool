@@ -38,11 +38,11 @@ use rollup::{
 
 type CommitmentMap = ivc::Map;
 
-const BATCH_SIZE: usize = 12;
+const BATCH_SIZE: usize = 16;
 const LAG_TX_PROB: f64 = 0.35;
-const K_LEAF: u32 = 20;
-const K_AGG: u32 = 20;
-const K_DEC: u32 = 20;
+pub(crate) const K_LEAF: u32 = 21;
+pub(crate) const K_AGG: u32 = 21;
+pub(crate) const K_DEC: u32 = 21;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -527,7 +527,7 @@ fn run() -> Result<(), AppError> {
     const K: u32 = 14;
     const NUM_ACCOUNTS: usize = 4;
     const NUM_SEED_DEPOSITS: usize = 50;
-    const NUM_TRANSFERS: usize = 120;
+    const NUM_TRANSFERS: usize = 128;
 
     // --- Setup leaf circuit keys ---
     let srs =

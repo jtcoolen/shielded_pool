@@ -68,7 +68,8 @@ pub type IdPoint = AssignedForeignPoint<
 
 pub type Map = MapMt<F, PoseidonChip<F>>;
 pub type Acc = Accumulator<S>;
-pub const LEAF_CLIENT_ARITY: usize = 6;
+pub const LEAF_CLIENT_ARITY: usize = 8;
+pub const NODE_CHILD_ARITY: usize = 8;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Core types
@@ -167,12 +168,7 @@ pub trait LeafStep: Clone + Send + Sync {
         &self,
         ctx: &IvcCtx,
         layouter: &mut L,
-        p0: &[AssignedNative<F>],
-        p1: &[AssignedNative<F>],
-        p2: &[AssignedNative<F>],
-        p3: &[AssignedNative<F>],
-        p4: &[AssignedNative<F>],
-        p5: &[AssignedNative<F>],
+        client_pis: &[Vec<AssignedNative<F>>],
         witness: Value<Self::Witness>,
     ) -> Result<Vec<AssignedNative<F>>, Error>;
 }

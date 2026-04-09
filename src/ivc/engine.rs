@@ -302,7 +302,7 @@ where
 
         let start = Instant::now();
         let (vk, pk) = if level == 1 {
-            let circuit = IvcLeafCircuit::<L, 20> {
+            let circuit = IvcLeafCircuit::<L, { crate::K_LEAF }> {
                 step: leaf_step.clone(),
                 client_items: [
                     Value::unknown(),
@@ -325,7 +325,7 @@ where
             keygen_pair(srs, &circuit, k)?
         } else {
             let full_width = app_state_width + 1;
-            let circuit = IvcNodeCircuit::<Fo, 19> {
+            let circuit = IvcNodeCircuit::<Fo, { crate::K_AGG }> {
                 step: fold_step.clone(),
                 app_state_width,
                 child0_state: vec![Value::unknown(); full_width],
@@ -461,7 +461,7 @@ fn prove_leaf<L: LeafStep>(
     let leaf_keys = setup.agg_store.get(1);
     let srs = &setup.agg_srs_leaf;
 
-    let circuit = IvcLeafCircuit::<L, 20> {
+    let circuit = IvcLeafCircuit::<L, { crate::K_LEAF }> {
         step: leaf_step.clone(),
         client_items: [
             Value::known(plan.clients[0].public_inputs.clone()),
@@ -581,7 +581,6 @@ fn prove_leaf<L: LeafStep>(
         &proof,
         &pi_fields,
     )?;
-    println!("hello");
 
     Ok(TreeNode {
         app_state: plan.app_state,
@@ -628,7 +627,7 @@ fn prove_node<Fo: FoldStep>(
     let mut child3_full: Vec<F> = child3.app_state.clone();
     child3_full.push(child3.merkle_digest);
 
-    let circuit = IvcNodeCircuit::<Fo, 19> {
+    let circuit = IvcNodeCircuit::<Fo, { crate::K_AGG }> {
         step: fold_step.clone(),
         app_state_width: setup.app_state_width,
         child0_state: child0_full.iter().map(|f| Value::known(*f)).collect(),

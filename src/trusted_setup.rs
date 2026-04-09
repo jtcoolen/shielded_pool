@@ -143,7 +143,5 @@ pub fn filecoin_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>> {
     }
 
     let rng = StdRng::seed_from_u64(0xDEAD_BEEF);
-    let mut params = ParamsKZG::<Bls12>::unsafe_setup(MAX_K, rng);
-    params.downsize(k);
-    Ok(params)
+    Ok(ParamsKZG::<Bls12>::unsafe_setup(k, rng))
 }

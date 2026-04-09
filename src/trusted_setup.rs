@@ -127,7 +127,8 @@ pub fn filecoin_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>> {
     }
 
     let srs_dir = get_srs_dir();
-    let (specific_path, fetching_path) = get_srs_paths(&srs_dir, "bls_filecoin", k);
+    let specific_path = PathBuf::from(format!("{srs_dir}/bls_filecoin_2p{k}"));
+    let fetching_path = PathBuf::from(format!("{srs_dir}/bls_filecoin_2p{MAX_K}"));
 
     load_and_cache_params(k, &specific_path, &fetching_path)
 }

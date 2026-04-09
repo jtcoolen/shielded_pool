@@ -24,10 +24,7 @@ use midnight_proofs::{
         Circuit, ConstraintSystem, ProvingKey, VerifyingKey, create_proof, keygen_pk,
         keygen_vk_with_k,
     },
-    poly::{
-        EvaluationDomain,
-        kzg::{KZGCommitmentScheme, params::ParamsKZG},
-    },
+    poly::kzg::{KZGCommitmentScheme, params::ParamsKZG},
     transcript::{CircuitTranscript, Transcript},
 };
 
@@ -137,9 +134,9 @@ pub(crate) struct AggLevelKeys {
 }
 
 impl AggLevelKeys {
-    fn new(level: usize, name: String, vk: Vk, pk: Pk, k: u32) -> Self {
+    fn new(level: usize, name: String, vk: Vk, pk: Pk, _k: u32) -> Self {
         let vk_data = VkData {
-            domain: EvaluationDomain::new(vk.cs().degree() as u32, k),
+            domain: vk.get_domain().clone(),
             cs: vk.cs().clone(),
             transcript_repr: vk.transcript_repr(),
         };
@@ -225,7 +222,7 @@ pub fn prepare_ivc_setup<L, Fo>(
     _leaf_srs: &ParamsKZG<Bls12>,
     leaf_vk: &Vk,
     leaf_vk_name: &str,
-    leaf_k: u32,
+    _leaf_k: u32,
     k_leaf_agg: u32,
     k_internal: u32,
     num_client_proofs: usize,
@@ -260,7 +257,7 @@ where
     let max_agg_level = 1 + internal_levels;
 
     let leaf_vk_data = VkData {
-        domain: EvaluationDomain::new(leaf_vk.cs().degree() as u32, leaf_k),
+        domain: leaf_vk.get_domain().clone(),
         cs: leaf_vk.cs().clone(),
         transcript_repr: leaf_vk.transcript_repr(),
     };
@@ -273,13 +270,15 @@ where
 
     let agg_srs_leaf = load_srs(k_leaf_agg)?;
     let agg_srs_internal = load_srs(k_internal)?;
+    let leaf_fixed_bases = compute_fixed_bases_for_vk(leaf_vk_name, leaf_vk);
+    let leaf_fixed_base_names = compute_fixed_base_names_for_vk_from_vk(leaf_vk_name, leaf_vk);
 
     let agg_vk_names: Vec<String> = (1..=max_agg_level)
         .map(|l| format!("agg_vk_lvl{l}"))
         .collect();
 
     let fixed_base_names =
-        compute_all_fixed_base_names(leaf_vk_name, &leaf_vk_data.cs, &agg_vk_names, &agg_cs);
+        compute_all_fixed_base_names(&leaf_fixed_base_names, &agg_vk_names, &agg_cs);
 
     let mut levels = Vec::with_capacity(max_agg_level);
 
@@ -365,9 +364,8 @@ where
     }
 
     let agg_store = AggKeyStore::new(levels);
-    let leaf_fixed_bases = compute_fixed_bases_for_vk(leaf_vk_name, leaf_vk);
     let fixed_bases = merge_all_fixed_bases(&leaf_fixed_bases, &agg_store);
-    let trivial_combined = build_trivial_combined(leaf_vk_name, &leaf_vk_data.cs, &agg_store);
+    let trivial_combined = build_trivial_combined(&leaf_fixed_base_names, &agg_store);
 
     Ok(IvcSetup {
         leaf_vk_name: leaf_vk_name.to_string(),
@@ -512,9 +510,22 @@ fn prove_leaf<L: LeafStep>(
 
     if plan.index == 0 {
         for (i, acc) in proof_accs.iter().enumerate() {
+            let keys = acc.rhs().fixed_base_scalars().keys().cloned().collect::<Vec<_>>();
+            let overlap = keys
+                .iter()
+                .filter(|k| setup.fixed_base_names.contains(*k))
+                .count();
+            let missing = keys
+                .iter()
+                .filter(|k| !setup.fixed_base_names.contains(*k))
+                .cloned()
+                .collect::<Vec<_>>();
             eprintln!(
-                "client proof_acc[{i}] rhs_fixed_keys={}",
-                acc.rhs().fixed_base_scalars().len()
+                "client proof_acc[{i}] rhs_fixed_keys={}, overlap_with_fixed_names={}, missing={:?}, keys_head={:?}",
+                acc.rhs().fixed_base_scalars().len(),
+                overlap,
+                missing,
+                &keys[..keys.len().min(8)]
             );
         }
     }
@@ -864,24 +875,31 @@ fn compute_fixed_base_names_for_vk(name: &str, cs: &ConstraintSystem<F>) -> Vec<
     )
 }
 
+fn compute_fixed_base_names_for_vk_from_vk(name: &str, vk: &Vk) -> Vec<String> {
+    midnight_circuits::verifier::fixed_base_names::<S>(
+        name,
+        vk.fixed_commitments().len(),
+        vk.permutation().commitments().len(),
+    )
+}
+
 fn compute_fixed_bases_for_vk(name: &str, vk: &Vk) -> BTreeMap<String, C> {
     midnight_circuits::verifier::fixed_bases::<S>(name, vk)
 }
 
 fn compute_all_fixed_base_names(
-    leaf_vk_name: &str,
-    leaf_cs: &ConstraintSystem<F>,
+    leaf_names: &[String],
     agg_vk_names: &[String],
     agg_cs: &ConstraintSystem<F>,
 ) -> Vec<String> {
     let mut seen = BTreeSet::new();
-    let leaf_names = compute_fixed_base_names_for_vk(leaf_vk_name, leaf_cs);
     let agg_names: Vec<_> = agg_vk_names
         .iter()
         .flat_map(|n| compute_fixed_base_names_for_vk(n, agg_cs))
         .collect();
     leaf_names
-        .into_iter()
+        .iter()
+        .cloned()
         .chain(agg_names)
         .filter(|n| seen.insert(n.clone()))
         .collect()
@@ -899,8 +917,7 @@ fn merge_all_fixed_bases(
 }
 
 fn build_trivial_combined(
-    leaf_vk_name: &str,
-    leaf_cs: &ConstraintSystem<F>,
+    leaf_names: &[String],
     store: &AggKeyStore,
 ) -> Acc {
     fn trivial(names: &[String]) -> Acc {
@@ -911,11 +928,11 @@ fn build_trivial_combined(
         )
     }
 
-    let leaf_names = compute_fixed_base_names_for_vk(leaf_vk_name, leaf_cs);
-    let all: Vec<_> = std::iter::once(trivial(&leaf_names))
+    let all: Vec<_> = std::iter::once(trivial(leaf_names))
         .chain((1..=store.max_level()).map(|l| {
             let lvl = store.get(l);
-            trivial(&compute_fixed_base_names_for_vk(&lvl.name, lvl.vk.cs()))
+            let names = lvl.fixed_bases.keys().cloned().collect::<Vec<_>>();
+            trivial(&names)
         }))
         .collect();
 

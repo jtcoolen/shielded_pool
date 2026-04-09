@@ -412,6 +412,8 @@ impl IvcProver {
         L: LeafStep + 'static,
         Fo: FoldStep + 'static,
     {
+        crate::parallel::configure_rayon_global();
+
         if leaf_plans.len() != setup.num_leaves {
             return Err(AggregationError::LenMismatch {
                 expected: setup.num_leaves,

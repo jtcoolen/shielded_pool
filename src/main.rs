@@ -24,6 +24,7 @@ use midnight_circuits::verifier::{Accumulator, AssignedAccumulator};
 
 mod ivc;
 mod keccak_transcript;
+mod parallel;
 mod rollup;
 mod transfer_circuit;
 mod trusted_setup;
@@ -523,6 +524,8 @@ fn main() {
 }
 
 fn run() -> Result<(), AppError> {
+    parallel::configure_rayon_global();
+
     const LEAF_VK_NAME: &str = "spend2output2_vk";
     const K: u32 = 14;
     const NUM_ACCOUNTS: usize = 4;

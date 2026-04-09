@@ -193,9 +193,10 @@ pub struct IvcSetup {
     pub(crate) agg_srs_internal: ParamsKZG<Bls12>,
     pub(crate) agg_store: AggKeyStore,
     pub(crate) leaf_fixed_bases: BTreeMap<String, C>,
+    pub(crate) leaf_fixed_base_names: Vec<String>,
     pub(crate) fixed_base_names: Vec<String>,
     pub fixed_bases: BTreeMap<String, C>,
-    pub(crate) trivial_combined: Acc,
+    pub(crate) trivial_leaf: Acc,
 }
 
 impl IvcSetup {
@@ -312,12 +313,13 @@ where
                 client_items: std::array::from_fn(|_| Value::unknown()),
                 witness: Value::unknown(),
                 client_pi_width,
+                fixed_bases: leaf_fixed_bases.clone(),
                 fw: FrameworkWitness {
                     child_vk: child_vk_data,
                     child_vk_name,
                     child_proofs: vec![Value::unknown(); LEAF_CLIENT_ARITY],
                     child_pi_accs: vec![Value::unknown(); LEAF_CLIENT_ARITY],
-                    fixed_base_names: fixed_base_names.clone(),
+                    fixed_base_names: leaf_fixed_base_names.clone(),
                 },
             };
             keygen_pair(srs, &circuit, k)?
@@ -344,7 +346,7 @@ where
 
     let agg_store = AggKeyStore::new(levels);
     let fixed_bases = merge_all_fixed_bases(&leaf_fixed_bases, &agg_store);
-    let trivial_combined = build_trivial_combined(&leaf_fixed_base_names, &agg_store);
+    let trivial_leaf = build_trivial(&leaf_fixed_base_names);
 
     Ok(IvcSetup {
         leaf_vk_name: leaf_vk_name.to_string(),
@@ -357,9 +359,10 @@ where
         agg_srs_internal,
         agg_store,
         leaf_fixed_bases,
+        leaf_fixed_base_names,
         fixed_base_names,
         fixed_bases,
-        trivial_combined,
+        trivial_leaf,
     })
 }
 
@@ -456,6 +459,7 @@ fn prove_leaf<L: LeafStep>(
         client_items: std::array::from_fn(|i| Value::known(plan.clients[i].public_inputs.clone())),
         witness: Value::known(plan.witness),
         client_pi_width: setup.client_pi_width,
+        fixed_bases: setup.leaf_fixed_bases.clone(),
         fw: FrameworkWitness {
             child_vk: setup.leaf_vk_data.clone(),
             child_vk_name: setup.leaf_vk_name.clone(),
@@ -465,9 +469,9 @@ fn prove_leaf<L: LeafStep>(
                 .map(|cp| Value::known(cp.proof.clone()))
                 .collect(),
             child_pi_accs: (0..LEAF_CLIENT_ARITY)
-                .map(|_| Value::known(setup.trivial_combined.clone()))
+                .map(|_| Value::known(setup.trivial_leaf.clone()))
                 .collect(),
-            fixed_base_names: setup.fixed_base_names.clone(),
+            fixed_base_names: setup.leaf_fixed_base_names.clone(),
         },
     };
 
@@ -497,11 +501,11 @@ fn prove_leaf<L: LeafStep>(
                 .collect::<Vec<_>>();
             let overlap = keys
                 .iter()
-                .filter(|k| setup.fixed_base_names.contains(*k))
+                .filter(|k| setup.leaf_fixed_base_names.contains(*k))
                 .count();
             let missing = keys
                 .iter()
-                .filter(|k| !setup.fixed_base_names.contains(*k))
+                .filter(|k| !setup.leaf_fixed_base_names.contains(*k))
                 .cloned()
                 .collect::<Vec<_>>();
             eprintln!(
@@ -514,22 +518,24 @@ fn prove_leaf<L: LeafStep>(
         }
     }
 
-    let neutral_trivial = neutralize_acc_for_client_children(&setup.trivial_combined);
+    let neutral_trivial = neutralize_acc_for_client_children(&setup.trivial_leaf);
     let mut fold_parts = Vec::with_capacity(LEAF_CLIENT_ARITY * 2);
     for acc in proof_accs {
         fold_parts.push(acc);
         fold_parts.push(neutral_trivial.clone());
     }
-    let pi_acc = collapse(Accumulator::accumulate(&fold_parts));
+    let mut pi_acc = collapse(Accumulator::accumulate(&fold_parts));
+    pi_acc.resolve_fixed_bases(&setup.leaf_fixed_bases);
+    pi_acc.collapse();
 
     let mut full_state = plan.app_state.clone();
     full_state.push(plan.merkle_digest);
     let pi_acc_fields = AssignedAccumulator::as_public_input(&pi_acc);
     if plan.index == 0 {
         eprintln!(
-            "leaf debug: fixed_base_names={}, trivial_combined_rhs_fixed={}, pi_acc_rhs_fixed={}, pi_acc_fields={}, total_pi={}",
-            setup.fixed_base_names.len(),
-            setup.trivial_combined.rhs().fixed_base_scalars().len(),
+            "leaf debug: fixed_base_names={}, trivial_leaf_rhs_fixed={}, pi_acc_rhs_fixed={}, pi_acc_fields={}, total_pi={}",
+            setup.leaf_fixed_base_names.len(),
+            setup.trivial_leaf.rhs().fixed_base_scalars().len(),
             pi_acc.rhs().fixed_base_scalars().len(),
             pi_acc_fields.len(),
             full_state.len() + pi_acc_fields.len()
@@ -909,24 +915,12 @@ fn merge_all_fixed_bases(
     fb
 }
 
-fn build_trivial_combined(leaf_names: &[String], store: &AggKeyStore) -> Acc {
-    fn trivial(names: &[String]) -> Acc {
-        let fixed: BTreeMap<String, F> = names.iter().map(|n| (n.clone(), F::ZERO)).collect();
-        Accumulator::<S>::new(
-            Msm::new(&[C::default()], &[F::ONE], &BTreeMap::new()),
-            Msm::new(&[C::default()], &[F::ONE], &fixed),
-        )
-    }
-
-    let all: Vec<_> = std::iter::once(trivial(leaf_names))
-        .chain((1..=store.max_level()).map(|l| {
-            let lvl = store.get(l);
-            let names = lvl.fixed_bases.keys().cloned().collect::<Vec<_>>();
-            trivial(&names)
-        }))
-        .collect();
-
-    let mut combined = Accumulator::accumulate(&all);
-    combined.collapse();
-    combined
+fn build_trivial(names: &[String]) -> Acc {
+    let fixed: BTreeMap<String, F> = names.iter().map(|n| (n.clone(), F::ZERO)).collect();
+    let mut out = Accumulator::<S>::new(
+        Msm::new(&[C::default()], &[F::ONE], &BTreeMap::new()),
+        Msm::new(&[C::default()], &[F::ONE], &fixed),
+    );
+    out.collapse();
+    out
 }

@@ -40,7 +40,7 @@ type CommitmentMap = ivc::Map;
 
 const BATCH_SIZE: usize = 48;
 const LAG_TX_PROB: f64 = 0.35;
-pub(crate) const K_LEAF: u32 = 20;
+pub(crate) const K_LEAF: u32 = 21;
 pub(crate) const K_AGG: u32 = 20;
 pub(crate) const K_DEC: u32 = 21;
 

@@ -70,6 +70,7 @@ fn synthesize_node<const K: u32, L: Layouter<F>>(
     layouter: &mut L,
     fw: &FrameworkWitness,
     children_are_client_proofs: bool,
+    fixed_bases: Option<&BTreeMap<String, C>>,
     step_phase: impl FnOnce(&IvcCtx, &mut L) -> Result<StepPhaseOutput, Error>,
 ) -> Result<(), Error> {
     let ctx = IvcCtx::new(&config, (K as usize).saturating_sub(1));
@@ -96,7 +97,20 @@ fn synthesize_node<const K: u32, L: Layouter<F>>(
         },
     )?;
 
-    expose_node_outputs(&ctx, layouter, out.full_state, &rpv.next_acc)?;
+    let mut next_acc = rpv.next_acc;
+    if let Some(fixed_bases) = fixed_bases {
+        let assigned_fixed_bases: BTreeMap<_, _> = fixed_bases
+            .iter()
+            .map(|(name, base)| {
+                let assigned = ctx.curve.assign_fixed(layouter, *base)?;
+                Ok((name.clone(), assigned))
+            })
+            .collect::<Result<_, Error>>()?;
+        next_acc.resolve_fixed_bases(&assigned_fixed_bases);
+        next_acc.collapse(layouter, &ctx.curve, &ctx.scalar)?;
+    }
+
+    expose_node_outputs(&ctx, layouter, out.full_state, &next_acc)?;
     ctx.load(layouter)
 }
 
@@ -114,6 +128,7 @@ pub struct IvcLeafCircuit<L: LeafStep, const K: u32> {
     pub(crate) client_items: [Value<Vec<F>>; LEAF_CLIENT_ARITY],
     pub(crate) witness: Value<L::Witness>,
     pub(crate) client_pi_width: usize,
+    pub(crate) fixed_bases: BTreeMap<String, C>,
     pub(crate) fw: FrameworkWitness,
 }
 
@@ -128,6 +143,7 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
             client_items: std::array::from_fn(|_| Value::unknown()),
             witness: Value::unknown(),
             client_pi_width: self.client_pi_width,
+            fixed_bases: self.fixed_bases.clone(),
             fw: self.fw.without_witnesses(),
         }
     }
@@ -151,6 +167,7 @@ impl<L: LeafStep, const K: u32> Circuit<F> for IvcLeafCircuit<L, K> {
             &mut layouter,
             &self.fw,
             true, // children ARE client proofs
+            Some(&self.fixed_bases),
             |ctx, layouter| {
                 // 1. Assign client PIs
                 let client_pis = items
@@ -247,6 +264,7 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
             &mut layouter,
             &self.fw,
             false, // children are NOT client proofs
+            None,
             |ctx, layouter| {
                 // 1. Assign full child states [app..., digest]
                 if child_vals.len() != NODE_CHILD_ARITY {

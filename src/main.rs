@@ -18,6 +18,7 @@ use midnight_proofs::{
 use midnight_zk_stdlib::{self, MidnightPK, cost_model};
 use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
 
 use midnight_circuits::verifier::{Accumulator, AssignedAccumulator};
 
@@ -280,6 +281,26 @@ struct TxEffects {
     recipient2_idx: usize,
 }
 
+type ClientProofWitness = (
+    SendableMap,
+    JubjubScalar,
+    F,
+    transfer_circuit::Utxo,
+    transfer_circuit::Utxo,
+    transfer_circuit::Utxo,
+    transfer_circuit::Utxo,
+    JubjubSubgroup,
+    JubjubSubgroup,
+);
+
+struct TxProofJob {
+    tx_idx: usize,
+    public_items: [F; 7],
+    instance_hash: F,
+    instance: transfer_circuit::Spend2Output2PublicInputs,
+    witness: ClientProofWitness,
+}
+
 fn plan_transaction(
     rng: &mut ChaCha8Rng,
     accounts: &[transfer_circuit::Account],
@@ -304,18 +325,15 @@ fn plan_transaction(
     })
 }
 
-fn build_and_prove_tx(
+fn prepare_tx_for_proof(
     rng: &mut ChaCha8Rng,
-    srs: &ParamsKZG<E>,
-    pk: &MidnightPK<transfer_circuit::Spend2Output2>,
-    relation: &transfer_circuit::Spend2Output2,
     chain: &ChainState,
     accounts: &[transfer_circuit::Account],
     plan: &PlannedTx,
     batch_idx: usize,
     tx_idx: usize,
     latest_confirmed_root_idx: usize,
-) -> Result<(ClientProof, TxEffects), AppError> {
+) -> Result<(TxProofJob, TxEffects), AppError> {
     let sender = accounts[plan.sender_idx].clone();
     let old1 = accounts[plan.sender_idx].wallet[plan.old1_idx].clone();
     let old2 = accounts[plan.sender_idx].wallet[plan.old2_idx].clone();
@@ -378,7 +396,7 @@ fn build_and_prove_tx(
         nf2,
     };
     let witness = (
-        historic_map,
+        SendableMap(historic_map),
         sender.sk,
         alpha_f,
         old1.utxo.clone(),
@@ -388,19 +406,12 @@ fn build_and_prove_tx(
         accounts[r1].pk_point,
         accounts[r2].pk_point,
     );
-
-    let now = Instant::now();
-    let proof_bytes =
-        midnight_zk_stdlib::prove::<transfer_circuit::Spend2Output2, PoseidonState<F>>(
-            srs, pk, relation, &instance, witness, OsRng,
-        )
-        .map_err(|e| AppError::Proof(err_string(e)))?;
-    println!("proof gen: {:?}", now.elapsed());
-
-    let client_proof = ClientProof {
-        proof: proof_bytes,
-        public_inputs: public_items.to_vec(),
+    let job = TxProofJob {
+        tx_idx,
+        public_items,
         instance_hash,
+        instance,
+        witness,
     };
 
     let effects = TxEffects {
@@ -417,7 +428,55 @@ fn build_and_prove_tx(
         recipient2_idx: plan.recipient2_idx,
     };
 
-    Ok((client_proof, effects))
+    Ok((job, effects))
+}
+
+fn prove_prepared_tx(
+    srs: &ParamsKZG<E>,
+    pk: &MidnightPK<transfer_circuit::Spend2Output2>,
+    relation: &transfer_circuit::Spend2Output2,
+    batch_idx: usize,
+    job: TxProofJob,
+) -> Result<(usize, ClientProof), AppError> {
+    let (historic_map, sender_sk, alpha_f, old1, old2, new1, new2, recipient1_pk, recipient2_pk) =
+        job.witness;
+    let witness = (
+        historic_map.into_inner(),
+        sender_sk,
+        alpha_f,
+        old1,
+        old2,
+        new1,
+        new2,
+        recipient1_pk,
+        recipient2_pk,
+    );
+
+    let now = Instant::now();
+    let proof_bytes =
+        midnight_zk_stdlib::prove::<transfer_circuit::Spend2Output2, PoseidonState<F>>(
+            srs,
+            pk,
+            relation,
+            &job.instance,
+            witness,
+            OsRng,
+        )
+        .map_err(|e| AppError::Proof(err_string(e)))?;
+    println!(
+        "[batch {batch_idx}, tx {}] proof gen: {:?}",
+        job.tx_idx,
+        now.elapsed()
+    );
+
+    Ok((
+        job.tx_idx,
+        ClientProof {
+            proof: proof_bytes,
+            public_inputs: job.public_items.to_vec(),
+            instance_hash: job.instance_hash,
+        },
+    ))
 }
 
 fn apply_tx_effects(
@@ -545,7 +604,7 @@ fn run() -> Result<(), AppError> {
             shadow_cmap.succinct_repr()
         );
 
-        let mut client_proofs: Vec<ClientProof> = Vec::with_capacity(BATCH_SIZE);
+        let mut proof_jobs: Vec<TxProofJob> = Vec::with_capacity(BATCH_SIZE);
         let mut batch_failed = false;
 
         for _ in 0..BATCH_SIZE {
@@ -563,11 +622,8 @@ fn run() -> Result<(), AppError> {
                     }
                 };
 
-            let (proof, effects) = build_and_prove_tx(
+            let (job, effects) = prepare_tx_for_proof(
                 &mut rng,
-                &srs,
-                &pk,
-                &relation,
                 &chain,
                 &shadow_accounts,
                 &plan,
@@ -575,7 +631,6 @@ fn run() -> Result<(), AppError> {
                 total_done,
                 pre.latest_confirmed_root_idx,
             )?;
-            client_proofs.push(proof);
 
             apply_tx_effects(
                 &mut shadow_accounts,
@@ -584,18 +639,29 @@ fn run() -> Result<(), AppError> {
                 chain.commitment_root_history.len(),
                 &effects,
             );
+            proof_jobs.push(job);
             total_done += 1;
         }
 
-        if batch_failed || client_proofs.is_empty() {
+        if batch_failed || proof_jobs.is_empty() {
             break;
         }
-        if client_proofs.len() != BATCH_SIZE {
+        if proof_jobs.len() != BATCH_SIZE {
             return Err(AppError::ReplayGuard(format!(
                 "batch incomplete: {}/{BATCH_SIZE}",
-                client_proofs.len()
+                proof_jobs.len()
             )));
         }
+
+        let mut indexed_client_proofs = proof_jobs
+            .into_par_iter()
+            .map(|job| prove_prepared_tx(&srs, &pk, &relation, batch_idx, job))
+            .collect::<Result<Vec<_>, _>>()?;
+        indexed_client_proofs.sort_by_key(|(tx_idx, _)| *tx_idx);
+        let client_proofs: Vec<ClientProof> = indexed_client_proofs
+            .into_iter()
+            .map(|(_, proof)| proof)
+            .collect();
 
         // --- Plan leaves and prove tree via IVC framework ---
         let leaf_plans = plan_rollup_leaves(

@@ -1,10 +1,16 @@
 use std::sync::{Arc, OnceLock};
 
 use core_affinity::CoreId;
+use rayon::prelude::*;
 #[cfg(target_os = "linux")]
 use std::collections::{HashMap, HashSet};
 
 static RAYON_CONFIG: OnceLock<()> = OnceLock::new();
+static NUMA_POOLS: OnceLock<Option<Vec<NumaPool>>> = OnceLock::new();
+
+struct NumaPool {
+    pool: rayon::ThreadPool,
+}
 
 pub fn configure_rayon_global() {
     RAYON_CONFIG.get_or_init(|| {
@@ -46,6 +52,141 @@ pub fn static_block_size(len: usize) -> usize {
     static_block_size_with_threads(len, rayon::current_num_threads())
 }
 
+pub fn numa_parallel_map<T, R, E, F>(items: Vec<T>, f: F) -> Result<Vec<R>, E>
+where
+    T: Send,
+    R: Send,
+    E: Send,
+    F: Fn(T) -> Result<R, E> + Sync + Send,
+{
+    if items.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let Some(pools) = numa_pools() else {
+        return fallback_parallel_map(items, f);
+    };
+
+    let chunk_size = items.len().div_ceil(pools.len().max(1));
+    let mut chunked: Vec<(usize, Vec<T>)> = Vec::new();
+    let mut iter = items.into_iter();
+    let mut chunk_idx = 0usize;
+
+    loop {
+        let chunk: Vec<T> = iter.by_ref().take(chunk_size).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        chunked.push((chunk_idx, chunk));
+        chunk_idx += 1;
+    }
+
+    let mut joined: Vec<(usize, Result<Vec<R>, E>)> = Vec::with_capacity(chunked.len());
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(chunked.len());
+        for (idx, chunk) in chunked {
+            let pool = &pools[idx % pools.len()];
+            let f_ref = &f;
+            handles.push(scope.spawn(move || {
+                let out = pool.pool.install(|| {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for item in chunk {
+                        out.push(f_ref(item)?);
+                    }
+                    Ok::<Vec<R>, E>(out)
+                });
+                (idx, out)
+            }));
+        }
+        for handle in handles {
+            joined.push(
+                handle
+                    .join()
+                    .expect("numa worker thread panicked while processing chunk"),
+            );
+        }
+    });
+
+    joined.sort_by_key(|(idx, _)| *idx);
+    let mut out = Vec::new();
+    for (_, res) in joined {
+        out.extend(res?);
+    }
+    Ok(out)
+}
+
+fn fallback_parallel_map<T, R, E, F>(items: Vec<T>, f: F) -> Result<Vec<R>, E>
+where
+    T: Send,
+    R: Send,
+    E: Send,
+    F: Fn(T) -> Result<R, E> + Sync + Send,
+{
+    let block = static_block_size(items.len());
+    items
+        .into_par_iter()
+        .by_uniform_blocks(block)
+        .map(f)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn numa_pools() -> Option<&'static [NumaPool]> {
+    NUMA_POOLS.get_or_init(build_numa_pools).as_deref()
+}
+
+#[cfg(target_os = "linux")]
+fn build_numa_pools() -> Option<Vec<NumaPool>> {
+    if !numa_awareness_enabled() {
+        return None;
+    }
+
+    let all_cores = core_affinity::get_core_ids()?;
+    let mut nodes = linux_numa_node_cores(&all_cores)?;
+    if nodes.len() < 2 {
+        return None;
+    }
+
+    let total_threads = rayon_thread_count(all_cores.len());
+    if total_threads < 2 {
+        return None;
+    }
+
+    let node_count = nodes.len();
+    let base = total_threads / node_count;
+    let remainder = total_threads % node_count;
+
+    let mut pools = Vec::with_capacity(node_count);
+    for (idx, node_cores) in nodes.iter_mut().enumerate() {
+        let requested = base + usize::from(idx < remainder);
+        let threads = requested.min(node_cores.len());
+        if threads == 0 {
+            continue;
+        }
+
+        let pinned_cores = Arc::new(node_cores.clone());
+        let start_handler_cores = Arc::clone(&pinned_cores);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .start_handler(move |worker_idx| {
+                if let Some(core_id) =
+                    start_handler_cores.get(worker_idx % start_handler_cores.len())
+                {
+                    let _ = core_affinity::set_for_current(*core_id);
+                }
+            })
+            .build()
+            .ok()?;
+        pools.push(NumaPool { pool });
+    }
+
+    if pools.len() < 2 { None } else { Some(pools) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_numa_pools() -> Option<Vec<NumaPool>> {
+    None
+}
+
 fn static_block_size_with_threads(len: usize, threads: usize) -> usize {
     if len == 0 {
         return 1;
@@ -77,10 +218,37 @@ fn numa_awareness_enabled() -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_numa_interleaved_cores(available: &[CoreId]) -> Option<Vec<CoreId>> {
+    let mut per_node = linux_numa_node_cores(available)?;
+    if per_node.len() < 2 {
+        return None;
+    }
+
+    let mut interleaved = Vec::with_capacity(available.len());
+    let mut offsets = vec![0usize; per_node.len()];
+
+    loop {
+        let mut pushed = false;
+        for (node_idx, node_cpus) in per_node.iter().enumerate() {
+            if let Some(core_id) = node_cpus.get(offsets[node_idx]) {
+                interleaved.push(*core_id);
+                offsets[node_idx] += 1;
+                pushed = true;
+            }
+        }
+        if !pushed {
+            break;
+        }
+    }
+
+    Some(interleaved)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_numa_node_cores(available: &[CoreId]) -> Option<Vec<Vec<CoreId>>> {
     let available_map: HashMap<usize, CoreId> = available.iter().map(|c| (c.id, *c)).collect();
     let available_set: HashSet<usize> = available_map.keys().copied().collect();
 
-    let mut per_node: Vec<Vec<usize>> = std::fs::read_dir("/sys/devices/system/node")
+    let mut per_node: Vec<Vec<CoreId>> = std::fs::read_dir("/sys/devices/system/node")
         .ok()?
         .flatten()
         .filter_map(|entry| {
@@ -91,49 +259,21 @@ fn linux_numa_interleaved_cores(available: &[CoreId]) -> Option<Vec<CoreId>> {
             }
             let cpulist_path = entry.path().join("cpulist");
             let cpulist = std::fs::read_to_string(cpulist_path).ok()?;
-            let mut cpus: Vec<usize> = parse_linux_cpu_list(&cpulist)?
+            let mut cpus: Vec<CoreId> = parse_linux_cpu_list(&cpulist)?
                 .into_iter()
                 .filter(|cpu| available_set.contains(cpu))
+                .filter_map(|cpu| available_map.get(&cpu).copied())
                 .collect();
-            cpus.sort_unstable();
+            cpus.sort_unstable_by_key(|c| c.id);
             if cpus.is_empty() { None } else { Some(cpus) }
         })
         .collect();
 
-    if per_node.len() < 2 {
+    if per_node.is_empty() {
         return None;
     }
-    per_node.sort_by_key(|cpus| cpus[0]);
-
-    let mut interleaved = Vec::with_capacity(available.len());
-    let mut offsets = vec![0usize; per_node.len()];
-
-    loop {
-        let mut pushed = false;
-        for (node_idx, node_cpus) in per_node.iter().enumerate() {
-            if let Some(cpu_id) = node_cpus.get(offsets[node_idx]) {
-                interleaved.push(*cpu_id);
-                offsets[node_idx] += 1;
-                pushed = true;
-            }
-        }
-        if !pushed {
-            break;
-        }
-    }
-
-    let mut dedup = HashSet::with_capacity(interleaved.len());
-    let reordered: Vec<CoreId> = interleaved
-        .into_iter()
-        .filter(|cpu_id| dedup.insert(*cpu_id))
-        .filter_map(|cpu_id| available_map.get(&cpu_id).copied())
-        .collect();
-
-    if reordered.is_empty() {
-        None
-    } else {
-        Some(reordered)
-    }
+    per_node.sort_by_key(|cpus| cpus[0].id);
+    Some(per_node)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -175,6 +315,11 @@ mod tests {
     fn static_block_size_avoids_zero() {
         assert_eq!(super::static_block_size_with_threads(0, 12), 1);
         assert_eq!(super::static_block_size_with_threads(1, 144), 1);
+    }
+
+    #[test]
+    fn static_block_size_with_threads_cap() {
+        assert_eq!(super::static_block_size_with_threads(12, 144), 1);
     }
 
     #[cfg(target_os = "linux")]

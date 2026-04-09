@@ -18,7 +18,6 @@ use midnight_proofs::{
 use midnight_zk_stdlib::{self, MidnightPK, cost_model};
 use rand::{Rng, SeedableRng, rngs::OsRng};
 use rand_chacha::ChaCha8Rng;
-use rayon::prelude::*;
 
 use midnight_circuits::verifier::{Accumulator, AssignedAccumulator};
 
@@ -658,12 +657,9 @@ fn run() -> Result<(), AppError> {
             )));
         }
 
-        let proof_block = parallel::static_block_size(proof_jobs.len());
-        let mut indexed_client_proofs = proof_jobs
-            .into_par_iter()
-            .by_uniform_blocks(proof_block)
-            .map(|job| prove_prepared_tx(&srs, &pk, &relation, batch_idx, job))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut indexed_client_proofs = parallel::numa_parallel_map(proof_jobs, |job| {
+            prove_prepared_tx(&srs, &pk, &relation, batch_idx, job)
+        })?;
         indexed_client_proofs.sort_by_key(|(tx_idx, _)| *tx_idx);
         let client_proofs: Vec<ClientProof> = indexed_client_proofs
             .into_iter()

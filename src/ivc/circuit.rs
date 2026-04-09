@@ -4,14 +4,16 @@
 //! recursive partial verification and accumulator folding.  The user never
 //! constructs these directly — [`super::engine::IvcProver`] does.
 
-use midnight_circuits::instructions::PublicInputInstructions;
+use std::collections::BTreeMap;
+
+use midnight_circuits::instructions::{AssignmentInstructions, PublicInputInstructions};
 use midnight_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{Circuit, ConstraintSystem, Error},
 };
 
 use super::{
-    Acc, AssignedNative, DeciderStep, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep, VkData,
+    Acc, AssignedNative, C, DeciderStep, F, FoldStep, LEAF_CLIENT_ARITY, LeafStep, VkData,
     ctx::{
         AggCircuitConfig, IvcCtx, RpvInput, configure_ivc_circuit, expose_node_outputs,
         recursive_partial_verify,
@@ -302,6 +304,7 @@ pub struct IvcDeciderCircuit<D: DeciderStep, const K: u32> {
     pub left_child_state: Vec<Value<F>>,
     pub right_child_state: Vec<Value<F>>,
     pub witness: Value<D::Witness>,
+    pub fixed_bases: BTreeMap<String, C>,
     pub fw: FrameworkWitness,
 }
 
@@ -318,6 +321,7 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
             left_child_state: vec![Value::unknown(); full_width],
             right_child_state: vec![Value::unknown(); full_width],
             witness: Value::unknown(),
+            fixed_bases: self.fixed_bases.clone(),
             fw: self.fw.without_witnesses(),
         }
     }
@@ -378,8 +382,22 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
             },
         )?;
 
+        // Resolve fixed bases and fully collapse accumulator before exposure.
+        let assigned_fixed_bases: BTreeMap<_, _> = self
+            .fixed_bases
+            .iter()
+            .map(|(name, base)| {
+                let assigned = ctx.curve.assign_fixed(&mut layouter, *base)?;
+                Ok((name.clone(), assigned))
+            })
+            .collect::<Result<_, Error>>()?;
+
+        let mut final_acc = rpv.next_acc;
+        final_acc.resolve_fixed_bases(&assigned_fixed_bases);
+        final_acc.collapse(&mut layouter, &ctx.curve, &ctx.scalar)?;
+
         // Expose accumulator PI
-        let acc_pi = ctx.verifier.as_public_input(&mut layouter, &rpv.next_acc)?;
+        let acc_pi = ctx.verifier.as_public_input(&mut layouter, &final_acc)?;
         ctx.expose_native(&mut layouter, acc_pi)?;
 
         ctx.load(&mut layouter)

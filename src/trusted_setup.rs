@@ -120,15 +120,14 @@ pub fn mock_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>> {
     load_and_cache_params(k, &specific_path, &fetching_path)
 }
 
-/// Loads Filecoin SRS parameters.
+/// Loads SRS parameters using an unsafe mock setup (deterministic).
 pub fn filecoin_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>> {
     if k > MAX_K {
         return Err(SrsError::CircuitTooLarge(k));
     }
 
-    let srs_dir = get_srs_dir();
-    let specific_path = PathBuf::from(format!("{srs_dir}/bls_filecoin_2p{k}"));
-    let fetching_path = PathBuf::from(format!("{srs_dir}/bls_filecoin_2p{MAX_K}"));
-
-    load_and_cache_params(k, &specific_path, &fetching_path)
+    let rng = StdRng::seed_from_u64(0xDEAD_BEEF);
+    let mut params = ParamsKZG::<Bls12>::unsafe_setup(MAX_K, rng);
+    params.downsize(k);
+    Ok(params)
 }

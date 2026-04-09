@@ -561,6 +561,7 @@ fn run() -> Result<(), AppError> {
         left_child_state: vec![Value::unknown(); full_width],
         right_child_state: vec![Value::unknown(); full_width],
         witness: Value::unknown(),
+        fixed_bases: ivc_setup.fixed_bases.clone(),
         fw: FrameworkWitness {
             child_vk: ivc_setup.child_vk(),
             child_vk_name: ivc_setup.child_vk_name().to_string(),
@@ -707,6 +708,8 @@ fn run() -> Result<(), AppError> {
                 tree.right_top.pi_acc.clone(),
             ]);
             final_acc.collapse();
+            final_acc.resolve_fixed_bases(&ivc_setup.fixed_bases);
+            final_acc.collapse();
             let final_acc_pi = AssignedAccumulator::as_public_input(&final_acc);
             println!(
                 "final accumulator size (public inputs): {}",
@@ -729,6 +732,7 @@ fn run() -> Result<(), AppError> {
                     blk_pre: F::from(blk_pre),
                     blk_post: blk_post_f,
                 }),
+                fixed_bases: ivc_setup.fixed_bases.clone(),
                 fw: FrameworkWitness {
                     child_vk: ivc_setup.child_vk(),
                     child_vk_name: ivc_setup.child_vk_name().to_string(),

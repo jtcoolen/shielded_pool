@@ -672,6 +672,7 @@ fn run() -> Result<(), AppError> {
             blk_post_f,
         )?;
 
+        let full_agg_start = Instant::now();
         let now = Instant::now();
         let tree = IvcProver::prove_tree(
             &ivc_setup,
@@ -707,6 +708,10 @@ fn run() -> Result<(), AppError> {
             ]);
             final_acc.collapse();
             let final_acc_pi = AssignedAccumulator::as_public_input(&final_acc);
+            println!(
+                "final accumulator size (public inputs): {}",
+                final_acc_pi.len()
+            );
 
             let mut left_full = tree.left_top.app_state.clone();
             left_full.push(tree.left_top.merkle_digest);
@@ -780,6 +785,10 @@ fn run() -> Result<(), AppError> {
             };
 
             println!("final proof size (bytes): {}", final_proof_bytes.len());
+            println!(
+                "Batch {batch_idx} aggregated proof (recursion + decider) produced in {:?}",
+                full_agg_start.elapsed()
+            );
 
             let mut transcript =
                 CircuitTranscript::<keccak_transcript::KeccakTranscript>::init_from_bytes(

@@ -11,6 +11,7 @@ use thiserror::Error;
 
 const MAX_K: u32 = 27;
 const DEFAULT_SRS_DIR: &str = "./assets";
+const USE_REAL_SRS_ENV: &str = "USE_REAL_SRS";
 
 #[derive(Error, Debug)]
 pub enum SrsError {
@@ -40,6 +41,15 @@ type Result<T> = std::result::Result<T, SrsError>;
 
 fn get_srs_dir() -> String {
     env::var("SRS_DIR").unwrap_or_else(|_| DEFAULT_SRS_DIR.into())
+}
+
+fn use_real_srs() -> bool {
+    env::var(USE_REAL_SRS_ENV)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 fn get_srs_paths(srs_dir: &str, filename_prefix: &str, k: u32) -> (PathBuf, PathBuf) {
@@ -124,6 +134,12 @@ pub fn mock_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>> {
 pub fn filecoin_srs_agg(k: u32) -> Result<ParamsKZG<Bls12>> {
     if k > MAX_K {
         return Err(SrsError::CircuitTooLarge(k));
+    }
+
+    if use_real_srs() {
+        let srs_dir = get_srs_dir();
+        let (specific_path, fetching_path) = get_srs_paths(&srs_dir, "bls_filecoin", k);
+        return load_and_cache_params(k, &specific_path, &fetching_path);
     }
 
     let rng = StdRng::seed_from_u64(0xDEAD_BEEF);

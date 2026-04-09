@@ -25,7 +25,7 @@ use midnight_circuits::{
         ArithInstructions, AssertionInstructions, AssignmentInstructions, HashInstructions,
         PublicInputInstructions, map::MapInstructions,
     },
-    types::{AssignedNative, ComposableChip, InnerValue, Instantiable},
+    types::{AssignedNative, ComposableChip},
     verifier::{AssignedAccumulator, AssignedVk, VerifierGadget},
 };
 use midnight_proofs::{
@@ -364,48 +364,48 @@ pub(crate) fn recursive_partial_verify(
 
         let proof_acc =
             prepare_proof_acc(ctx, layouter, assigned_vk, id.clone(), &child_pi, proof)?;
-        if children_are_client_proofs {
-            let _ = proof_acc.value().map(|acc| {
-                let pi = AssignedAccumulator::as_public_input(&acc);
-                let keys = acc.rhs().fixed_base_scalars().keys().cloned().collect::<Vec<_>>();
-                let overlap = keys
-                    .iter()
-                    .filter(|k| fixed_base_names.contains(*k))
-                    .count();
-                let missing = keys
-                    .iter()
-                    .filter(|k| !fixed_base_names.contains(*k))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                eprintln!(
-                    "rpv leaf proof_acc debug: rhs_fixed_keys={}, overlap_with_fixed_names={}, missing={:?}, keys_head={:?}, pi_len={}, pi_head={:?}",
-                    acc.rhs().fixed_base_scalars().len(),
-                    overlap,
-                    missing,
-                    &keys[..keys.len().min(8)],
-                    pi.len(),
-                    &pi[..pi.len().min(6)]
-                );
-                acc
-            });
-        }
+        // if children_are_client_proofs {
+        //     let _ = proof_acc.value().map(|acc| {
+        //         let pi = AssignedAccumulator::as_public_input(&acc);
+        //         let keys = acc.rhs().fixed_base_scalars().keys().cloned().collect::<Vec<_>>();
+        //         let overlap = keys
+        //             .iter()
+        //             .filter(|k| fixed_base_names.contains(*k))
+        //             .count();
+        //         let missing = keys
+        //             .iter()
+        //             .filter(|k| !fixed_base_names.contains(*k))
+        //             .cloned()
+        //             .collect::<Vec<_>>();
+        //         eprintln!(
+        //             "rpv leaf proof_acc debug: rhs_fixed_keys={}, overlap_with_fixed_names={}, missing={:?}, keys_head={:?}, pi_len={}, pi_head={:?}",
+        //             acc.rhs().fixed_base_scalars().len(),
+        //             overlap,
+        //             missing,
+        //             &keys[..keys.len().min(8)],
+        //             pi.len(),
+        //             &pi[..pi.len().min(6)]
+        //         );
+        //         acc
+        //     });
+        // }
         to_fold.push(proof_acc);
         to_fold.push(child_pi_acc);
     }
 
     let next_acc = accumulate_many(ctx, layouter, &to_fold)?;
-    if children_are_client_proofs {
-        let _ = next_acc.value().map(|acc| {
-            let pi = AssignedAccumulator::as_public_input(&acc);
-            eprintln!(
-                "rpv leaf next_acc debug: rhs_fixed_keys={}, pi_len={}, pi_head={:?}",
-                acc.rhs().fixed_base_scalars().len(),
-                pi.len(),
-                &pi[..pi.len().min(6)]
-            );
-            acc
-        });
-    }
+    // if children_are_client_proofs {
+    //     let _ = next_acc.value().map(|acc| {
+    //         let pi = AssignedAccumulator::as_public_input(&acc);
+    //         eprintln!(
+    //             "rpv leaf next_acc debug: rhs_fixed_keys={}, pi_len={}, pi_head={:?}",
+    //             acc.rhs().fixed_base_scalars().len(),
+    //             pi.len(),
+    //             &pi[..pi.len().min(6)]
+    //         );
+    //         acc
+    //     });
+    // }
 
     Ok(RpvOutput { next_acc })
 }

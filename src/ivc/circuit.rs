@@ -305,8 +305,7 @@ impl<Fo: FoldStep, const K: u32> Circuit<F> for IvcNodeCircuit<Fo, K> {
 pub struct IvcDeciderCircuit<D: DeciderStep, const K: u32> {
     pub step: D,
     pub app_state_width: usize,
-    pub left_child_state: Vec<Value<F>>,
-    pub right_child_state: Vec<Value<F>>,
+    pub child_states: Vec<Vec<Value<F>>>,
     pub witness: Value<D::Witness>,
     pub fixed_bases: BTreeMap<String, C>,
     pub fw: FrameworkWitness,
@@ -322,8 +321,7 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
         Self {
             step: self.step.clone(),
             app_state_width: self.app_state_width,
-            left_child_state: vec![Value::unknown(); full_width],
-            right_child_state: vec![Value::unknown(); full_width],
+            child_states: vec![vec![Value::unknown(); full_width]; NODE_CHILD_ARITY],
             witness: Value::unknown(),
             fixed_bases: self.fixed_bases.clone(),
             fw: self.fw.without_witnesses(),
@@ -350,21 +348,37 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
 
         let w = self.app_state_width;
 
+        if self.child_states.len() != NODE_CHILD_ARITY {
+            return Err(Error::Synthesis("decider arity mismatch".to_string()));
+        }
         // Assign full child states
-        let left_full = assign_values(&ctx, &mut layouter, &self.left_child_state)?;
-        let right_full = assign_values(&ctx, &mut layouter, &self.right_child_state)?;
+        let child_full_states: Vec<Vec<AssignedNative<F>>> = self
+            .child_states
+            .iter()
+            .map(|vals| assign_values(&ctx, &mut layouter, vals))
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Compute the final Merkle root from children's digests
-        let left_digest = &left_full[w];
-        let right_digest = &right_full[w];
-        let merkle_root = ctx.hash2(&mut layouter, left_digest, right_digest)?;
+        let mut layer: Vec<AssignedNative<F>> = child_full_states
+            .iter()
+            .map(|full| full[w].clone())
+            .collect();
+        while layer.len() > 1 {
+            let mut next = Vec::with_capacity(layer.len() / 2);
+            for pair in layer.chunks_exact(2) {
+                next.push(ctx.hash2(&mut layouter, &pair[0], &pair[1])?);
+            }
+            layer = next;
+        }
+        let merkle_root = layer
+            .pop()
+            .ok_or_else(|| Error::Synthesis("missing decider merkle root".to_string()))?;
 
         // Run the decider step (gets full states + Merkle root)
         let final_pi = self.step.synthesize(
             &ctx,
             &mut layouter,
-            &left_full,
-            &right_full,
+            &child_full_states,
             &merkle_root,
             self.witness.clone(),
         )?;
@@ -380,7 +394,7 @@ impl<D: DeciderStep, const K: u32> Circuit<F> for IvcDeciderCircuit<D, K> {
                 assigned_vk: &assigned_vk,
                 children_are_client_proofs: false,
                 fixed_base_names: &self.fw.fixed_base_names,
-                child_base_pis: vec![left_full, right_full],
+                child_base_pis: child_full_states,
                 child_proofs: self.fw.child_proofs.clone(),
                 child_pi_accs: self.fw.child_pi_accs.clone(),
             },

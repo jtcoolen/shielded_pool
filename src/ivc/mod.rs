@@ -126,8 +126,7 @@ impl<S: HostState> NodeState<S> {
 /// Result of proving the full binary tree (everything except the decider).
 #[derive(Clone, Debug)]
 pub struct TreeResult<S> {
-    pub left_top: TreeNode<S>,
-    pub right_top: TreeNode<S>,
+    pub top_children: Vec<TreeNode<S>>,
     pub root_state: NodeState<S>,
 }
 
@@ -207,8 +206,7 @@ pub trait DeciderStep: Clone + Send + Sync {
         &self,
         ctx: &IvcCtx,
         layouter: &mut L,
-        left_full_state: &[AssignedNative<F>],
-        right_full_state: &[AssignedNative<F>],
+        child_full_states: &[Vec<AssignedNative<F>>],
         merkle_root: &AssignedNative<F>,
         witness: Value<Self::Witness>,
     ) -> Result<Vec<AssignedNative<F>>, Error>;

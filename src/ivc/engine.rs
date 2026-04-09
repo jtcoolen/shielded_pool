@@ -65,7 +65,9 @@ pub enum AggregationError {
     #[error("need at least one client proof")]
     Empty,
 
-    #[error("number of leaf aggregation nodes must be of the form 2*NODE_CHILD_ARITY^k (got {0})")]
+    #[error(
+        "number of leaf aggregation nodes must be of the form NODE_CHILD_ARITY^k (k>=1, got {0})"
+    )]
     NotPowerOfTwo(usize),
 
     #[error("client proofs length must be divisible by leaf arity {arity} (got {got})")]
@@ -74,7 +76,7 @@ pub enum AggregationError {
     #[error("length mismatch: expected {expected}, got {got}")]
     LenMismatch { expected: usize, got: usize },
 
-    #[error("need at least {min} client proofs for two leaves (got {got})")]
+    #[error("need at least {min} client proofs for decider arity (got {got})")]
     NeedAtLeastForTwoLeaves { min: usize, got: usize },
 
     #[error("host-side leaf validation failed: {0}")]
@@ -240,21 +242,24 @@ where
     }
 
     let num_leaves = num_client_proofs / LEAF_CLIENT_ARITY;
-    if num_leaves < 2 {
+    if num_leaves < NODE_CHILD_ARITY {
         return Err(AggregationError::NeedAtLeastForTwoLeaves {
-            min: LEAF_CLIENT_ARITY * 2,
+            min: LEAF_CLIENT_ARITY * NODE_CHILD_ARITY,
             got: num_client_proofs,
         });
     }
 
     let mut n = num_leaves;
     let mut internal_levels = 0usize;
-    while n > 2 {
+    while n > NODE_CHILD_ARITY {
         if n % NODE_CHILD_ARITY != 0 {
             return Err(AggregationError::NotPowerOfTwo(num_leaves));
         }
         n /= NODE_CHILD_ARITY;
         internal_levels += 1;
+    }
+    if n != NODE_CHILD_ARITY {
+        return Err(AggregationError::NotPowerOfTwo(num_leaves));
     }
     let max_agg_level = 1 + internal_levels;
 
@@ -376,7 +381,7 @@ pub struct LeafPlan<W> {
 impl IvcProver {
     /// Prove the full binary tree from `2^d` client proofs.
     ///
-    /// Returns the top two tree nodes (ready for the decider).
+    /// Returns the top decider child nodes (ready for the decider).
     /// `host_merge` computes the parent app state from two children
     /// on the host side (must match FoldStep circuit logic).
     pub fn prove_tree<L, Fo>(
@@ -405,23 +410,28 @@ impl IvcProver {
             .map(|plan| prove_leaf(setup, client_srs, client_vk, leaf_step, plan))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // 2. Build internal levels up to the top pair
-        let (_child_level, top_pair) =
-            build_to_top_pair(setup, fold_step, &host_merge, 1, leaf_nodes)?;
-
-        let (left, right) = top_pair;
+        // 2. Build internal levels up to the decider child arity
+        let (_child_level, top_children) =
+            build_to_decider_children(setup, fold_step, &host_merge, 1, leaf_nodes)?;
 
         // 3. Compute the root state
-        let root_digest = host_hash_pair(left.merkle_digest, right.merkle_digest);
-        let root_app = host_merge(&left.app_state, &right.app_state);
+        let mut root_app = top_children[0].app_state.clone();
+        for child in top_children.iter().skip(1) {
+            root_app = host_merge(&root_app, &child.app_state);
+        }
+        let root_digest = host_merkle_root(
+            &top_children
+                .iter()
+                .map(|n| n.merkle_digest)
+                .collect::<Vec<_>>(),
+        )?;
         let root_state = NodeState {
             app_state: root_app,
             merkle_digest: root_digest,
         };
 
         Ok(TreeResult {
-            left_top: left,
-            right_top: right,
+            top_children,
             root_state,
         })
     }
@@ -666,27 +676,25 @@ fn prove_node<Fo: FoldStep>(
 // Internal: tree construction
 ////////////////////////////////////////////////////////////////////////////////
 
-fn build_to_top_pair<Fo: FoldStep>(
+fn build_to_decider_children<Fo: FoldStep>(
     setup: &IvcSetup,
     fold_step: &Fo,
     host_merge: &(impl Fn(&[F], &[F]) -> Vec<F> + Send + Sync),
     child_level: usize,
     mut nodes: Vec<TreeNode<Vec<F>>>,
-) -> Result<(usize, (TreeNode<Vec<F>>, TreeNode<Vec<F>>)), AggregationError> {
+) -> Result<(usize, Vec<TreeNode<Vec<F>>>), AggregationError> {
     let mut level = child_level;
     loop {
         match nodes.len() {
             0 => return Err(AggregationError::Empty),
-            1 => {
+            n if n < NODE_CHILD_ARITY => {
                 return Err(AggregationError::NeedAtLeastForTwoLeaves {
-                    min: LEAF_CLIENT_ARITY * 2,
-                    got: LEAF_CLIENT_ARITY,
+                    min: LEAF_CLIENT_ARITY * NODE_CHILD_ARITY,
+                    got: n * LEAF_CLIENT_ARITY,
                 });
             }
-            2 => {
-                let right = nodes.pop().unwrap();
-                let left = nodes.pop().unwrap();
-                return Ok((level, (left, right)));
+            n if n == NODE_CHILD_ARITY => {
+                return Ok((level, nodes));
             }
             _ => {
                 if nodes.len() % NODE_CHILD_ARITY != 0 {

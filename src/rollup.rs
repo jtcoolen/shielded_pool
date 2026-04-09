@@ -14,7 +14,7 @@ use midnight_proofs::plonk::Error;
 
 use crate::ivc::{
     self, ClientProof, DeciderStep, F, FoldStep, HostLeafStep, HostState, IvcCtx,
-    LEAF_CLIENT_ARITY, LeafStep, Map, MapGadget, engine::AggregationError,
+    LEAF_CLIENT_ARITY, LeafStep, Map, MapGadget, NODE_CHILD_ARITY, engine::AggregationError,
 };
 
 use midnight_circuits::instructions::map::MapCPU;
@@ -228,33 +228,42 @@ impl DeciderStep for RollupDeciderStep {
         &self,
         ctx: &IvcCtx,
         layouter: &mut L,
-        left_full: &[AssignedNative<F>],
-        right_full: &[AssignedNative<F>],
+        child_full_states: &[Vec<AssignedNative<F>>],
         merkle_root: &AssignedNative<F>,
         witness: Value<Self::Witness>,
     ) -> Result<Vec<AssignedNative<F>>, Error> {
+        if child_full_states.len() != NODE_CHILD_ARITY {
+            return Err(Error::Synthesis("decider arity mismatch".to_string()));
+        }
         let w = APP_STATE_WIDTH;
-        let (left_app, _left_digest) = left_full.split_at(w);
-        let (right_app, _right_digest) = right_full.split_at(w);
+        let child_apps: Vec<&[AssignedNative<F>]> =
+            child_full_states.iter().map(|full| &full[..w]).collect();
 
         let one = ctx.one(layouter)?;
 
-        // Stitch children
-        ctx.assert_eq(layouter, &left_app[1], &right_app[0])?; // c_post == c_pre
-        ctx.assert_eq(layouter, &left_app[3], &right_app[2])?; // n_post == n_pre
+        // Stitch children in sequence.
+        for pair in child_apps.windows(2) {
+            let left = pair[0];
+            let right = pair[1];
+            ctx.assert_eq(layouter, &left[1], &right[0])?; // c_post == c_pre
+            ctx.assert_eq(layouter, &left[3], &right[2])?; // n_post == n_pre
+        }
 
-        let c_pre = &left_app[0];
-        let c_post = &right_app[1];
-        let n_pre = &left_app[2];
-        let n_post = &right_app[3];
+        let first = child_apps[0];
+        let last = child_apps[NODE_CHILD_ARITY - 1];
+        let c_pre = &first[0];
+        let c_post = &last[1];
+        let n_pre = &first[2];
+        let n_post = &last[3];
 
         // Block counter: blk_post = blk_pre + 1, agg.blk == blk_post
         let blk_pre = ctx.assign(layouter, witness.clone().map(|w| w.blk_pre))?;
         let blk_post = ctx.assign(layouter, witness.clone().map(|w| w.blk_post))?;
         let blk_pre_plus_one = ctx.add(layouter, &blk_pre, &one)?;
         ctx.assert_eq(layouter, &blk_post, &blk_pre_plus_one)?;
-        ctx.assert_eq(layouter, &left_app[5], &blk_post)?;
-        ctx.assert_eq(layouter, &right_app[5], &blk_post)?;
+        for app in &child_apps {
+            ctx.assert_eq(layouter, &app[5], &blk_post)?;
+        }
 
         // Historic roots-set: bind, check c_pre ∈ set, check c_post ∉ set, insert c_post
         let mut roots_set = ctx.init_map(
@@ -266,8 +275,9 @@ impl DeciderStep for RollupDeciderStep {
         let pre_roots_root = roots_set.succinct_repr();
         let zero = ctx.zero(layouter)?;
 
-        ctx.assert_eq(layouter, &left_app[4], &pre_roots_root)?;
-        ctx.assert_eq(layouter, &right_app[4], &pre_roots_root)?;
+        for app in &child_apps {
+            ctx.assert_eq(layouter, &app[4], &pre_roots_root)?;
+        }
 
         check_membership(ctx, layouter, &roots_set, c_pre, &one)?;
 

@@ -30,7 +30,7 @@ mod trusted_setup;
 
 use ivc::circuit::FrameworkWitness;
 use ivc::engine::{host_instance_hash, prepare_ivc_setup};
-use ivc::{ClientProof, E, F, IvcDeciderCircuit, IvcProver};
+use ivc::{ClientProof, E, F, IvcDeciderCircuit, IvcProver, NODE_CHILD_ARITY};
 use rollup::{
     APP_STATE_WIDTH, DeciderWitness, RollupDeciderStep, RollupFoldStep, RollupLeafStep,
     SendableMap, plan_rollup_leaves, rollup_host_merge,
@@ -38,7 +38,7 @@ use rollup::{
 
 type CommitmentMap = ivc::Map;
 
-const BATCH_SIZE: usize = 16;
+const BATCH_SIZE: usize = 64;
 const LAG_TX_PROB: f64 = 0.35;
 pub(crate) const K_LEAF: u32 = 21;
 pub(crate) const K_AGG: u32 = 21;
@@ -559,15 +559,14 @@ fn run() -> Result<(), AppError> {
     let default_decider = IvcDeciderCircuit::<RollupDeciderStep, K_DEC> {
         step: RollupDeciderStep,
         app_state_width: APP_STATE_WIDTH,
-        left_child_state: vec![Value::unknown(); full_width],
-        right_child_state: vec![Value::unknown(); full_width],
+        child_states: vec![vec![Value::unknown(); full_width]; NODE_CHILD_ARITY],
         witness: Value::unknown(),
         fixed_bases: ivc_setup.fixed_bases.clone(),
         fw: FrameworkWitness {
             child_vk: ivc_setup.child_vk(),
             child_vk_name: ivc_setup.child_vk_name().to_string(),
-            child_proofs: vec![Value::unknown(), Value::unknown()],
-            child_pi_accs: vec![Value::unknown(), Value::unknown()],
+            child_proofs: vec![Value::unknown(); NODE_CHILD_ARITY],
+            child_pi_accs: vec![Value::unknown(); NODE_CHILD_ARITY],
             fixed_base_names: ivc_setup.fixed_base_names().to_vec(),
         },
     };
@@ -702,27 +701,34 @@ fn run() -> Result<(), AppError> {
         {
             use midnight_proofs::transcript::CircuitTranscript;
 
-            let mut final_acc: Accumulator<ivc::S> = Accumulator::accumulate(&[
-                tree.left_top.proof_acc.clone(),
-                tree.left_top.pi_acc.clone(),
-                tree.right_top.proof_acc.clone(),
-                tree.right_top.pi_acc.clone(),
-            ]);
+            let mut final_acc_parts = Vec::with_capacity(NODE_CHILD_ARITY * 2);
+            for child in &tree.top_children {
+                final_acc_parts.push(child.proof_acc.clone());
+                final_acc_parts.push(child.pi_acc.clone());
+            }
+            let mut final_acc: Accumulator<ivc::S> = Accumulator::accumulate(&final_acc_parts);
             final_acc.collapse();
             final_acc.resolve_fixed_bases(&ivc_setup.fixed_bases);
             final_acc.collapse();
             let final_acc_pi = AssignedAccumulator::as_public_input(&final_acc);
 
-            let mut left_full = tree.left_top.app_state.clone();
-            left_full.push(tree.left_top.merkle_digest);
-            let mut right_full = tree.right_top.app_state.clone();
-            right_full.push(tree.right_top.merkle_digest);
+            let child_full_states: Vec<Vec<F>> = tree
+                .top_children
+                .iter()
+                .map(|child| {
+                    let mut full = child.app_state.clone();
+                    full.push(child.merkle_digest);
+                    full
+                })
+                .collect();
 
             let final_circuit = IvcDeciderCircuit::<RollupDeciderStep, K_DEC> {
                 step: RollupDeciderStep,
                 app_state_width: APP_STATE_WIDTH,
-                left_child_state: left_full.iter().map(|f| Value::known(*f)).collect(),
-                right_child_state: right_full.iter().map(|f| Value::known(*f)).collect(),
+                child_states: child_full_states
+                    .iter()
+                    .map(|full| full.iter().map(|f| Value::known(*f)).collect())
+                    .collect(),
                 witness: Value::known(DeciderWitness {
                     pre_commitment_roots_set_map: SendableMap(pre.pre_roots_set_map.clone()),
                     post_commitment_roots_set_root: post_roots_set_root,
@@ -733,22 +739,26 @@ fn run() -> Result<(), AppError> {
                 fw: FrameworkWitness {
                     child_vk: ivc_setup.child_vk(),
                     child_vk_name: ivc_setup.child_vk_name().to_string(),
-                    child_proofs: vec![
-                        Value::known(tree.left_top.proof.clone()),
-                        Value::known(tree.right_top.proof.clone()),
-                    ],
-                    child_pi_accs: vec![
-                        Value::known(tree.left_top.pi_acc.clone()),
-                        Value::known(tree.right_top.pi_acc.clone()),
-                    ],
+                    child_proofs: tree
+                        .top_children
+                        .iter()
+                        .map(|child| Value::known(child.proof.clone()))
+                        .collect(),
+                    child_pi_accs: tree
+                        .top_children
+                        .iter()
+                        .map(|child| Value::known(child.pi_acc.clone()))
+                        .collect(),
                     fixed_base_names: ivc_setup.fixed_base_names().to_vec(),
                 },
             };
 
-            let merkle_root = ivc::engine::host_instance_hash(&[
-                tree.left_top.merkle_digest,
-                tree.right_top.merkle_digest,
-            ]);
+            let child_digests: Vec<F> = tree
+                .top_children
+                .iter()
+                .map(|child| child.merkle_digest)
+                .collect();
+            let merkle_root = ivc::engine::host_instance_hash(&child_digests);
             let _ = merkle_root; // used only for logging
 
             let mut final_pi: Vec<F> = vec![
